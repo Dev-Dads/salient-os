@@ -19,7 +19,8 @@ Integrity scope: `verify_chain()` detects accidental corruption, truncation, and
 reordering of the durable record (the in-scope non-malicious-corruption case). It
 does NOT prove authentic history against an adversary who can rewrite every entry
 AND the head consistently — that requires a signed/anchored head under an audit
-key, which is deferred (out of scope, same boundary as the verifier's).
+key, which is deferred (out of scope, same boundary as the verifier's). This is a
+reviewed decision, not an oversight — see docs/adr/0001-verify-chain-integrity-scope.md.
 """
 
 import json
