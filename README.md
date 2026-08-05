@@ -16,9 +16,33 @@ The design docs live at the repository root:
 
 Building per the review's priority order:
 
-1. **Verifier** — in progress, spine complete (this repo)
-2. Salience bus + central interpreter — not started
+1. **Verifier** — built and red-teamed (`salienceos/verifier`)
+2. **Salience bus + central interpreter** — built and red-teamed (`salienceos/interpreter`)
 3. Everything else sits on the existing stack (Hermes, CDMS, Salient-Tuning, quorum_core)
+
+## The bus + interpreter
+
+`salienceos/interpreter` is the directive analog of the verifier's composer.
+Subsystems each compute salience their own way and publish a thin `SalienceSignal`
+(comparable influence + confidence + provenance + subsystem-id — structurally
+incapable of carrying authority) onto a `SalienceBus`. The pure, fail-closed
+`interpret()` reads them and issues one `Directive`, bounded by a signed
+`PolicyCaps`. It is the single choke point, under **salience influences; policy
+authorizes**:
+
+| Concern | Where |
+|---|---|
+| Thin bus contract (private per-subsystem scoring; bounded ref-shaped tokens) | `signal.py` (`SalienceSignal`, `valid_signal`), `scorers.py` (two heterogeneous example scorers) |
+| Authority envelope — capabilities and every knob bound come only from here | `policy.py` (signed `PolicyCaps`) |
+| The pure fail-closed choke point (the mutation target) | `interpreter.py` (`interpret()`; untrusted policy ⇒ hard-deny to empty capabilities) |
+| Directive — `allowed_capabilities` is a verbatim policy pass-through | `directive.py` (`grants_capability()`, no signal path to authority) |
+| Audit surface — append-only, hash-chained, structurally body-free | `bus.py` (`SalienceBus`, `verify_chain()`) |
+| P-01 leak-locks + fail-closed + adaptation gating | `tests/test_no_laundering.py`, `tests/test_interpret.py`, `tests/test_interp_review_fixes.py` |
+
+Adaptation reaches at most `CANDIDATE` (never live self-modification), and only
+with the policy switch plus sufficient applied verification and low-enough risk.
+Reconfiguration prefers **between-turn** (Finding F). Red-team (two internal
+subagent reviews + the five-model panel) in `red-team/interpreter/`.
 
 ## The verifier
 
@@ -43,7 +67,8 @@ Spec mandate → implementation:
 
 A five-model red-team (models outside the big three) found and I fixed six defects — one genuine
 false-`VERIFIED` from stale evidence plus five lesser gaps; see `red-team/00-REDTEAM-SYNTHESIS.md`
-and the regressions in `tests/test_redteam_fixes.py`.
+and the regressions in `tests/test_redteam_fixes.py`. The interpreter went through the same
+process (plus two internal subagent reviews) — see `red-team/interpreter/`.
 
 Threat model (binding, spec §1): the in-scope adversary is a wrong/misfiring
 model, buggy executor, or non-malicious corruption. This verifier detects bugs
