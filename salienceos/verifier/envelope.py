@@ -19,6 +19,28 @@ class Stakes(enum.Enum):
     CRITICAL = "critical"
 
 
+# Least- to most-demanding. Used only to take the STRONGER of two stakes.
+STAKES_ORDER = (Stakes.LOW, Stakes.NORMAL, Stakes.HIGH, Stakes.CRITICAL)
+
+
+def max_stakes(a, b):
+    """Return the stronger of two stakes. This is the ONLY way stakes is ever
+    combined: escalation is upward-only, so a salience-driven request can raise
+    scrutiny above the policy-signed floor but never lower it (spec M4 — "stakes
+    is a policy-signed input, not a mutable request field"; making verification
+    stricter is the allowed direction).
+
+    Fail-safe on malformed input: a value that is not a known Stakes (including
+    None or a stray string from a buggy caller) is treated as "absent" (rank -1),
+    so it is ignored rather than raising. It can therefore never lower a valid
+    stakes, and two malformed inputs yield None."""
+    ra = STAKES_ORDER.index(a) if a in STAKES_ORDER else -1
+    rb = STAKES_ORDER.index(b) if b in STAKES_ORDER else -1
+    if ra < 0 and rb < 0:
+        return None
+    return a if ra >= rb else b
+
+
 @dataclass(frozen=True)
 class ActionEnvelope:
     envelope_id: str

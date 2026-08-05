@@ -21,7 +21,14 @@ from salienceos.verifier.evidence import (
     ClaimStore,
     WorldStore,
 )
-from salienceos.verifier.envelope import Stakes, ActionEnvelope, issue_envelope, verify_envelope
+from salienceos.verifier.envelope import (
+    Stakes,
+    STAKES_ORDER,
+    ActionEnvelope,
+    issue_envelope,
+    verify_envelope,
+    max_stakes,
+)
 from salienceos.verifier.contract import Obligation, Contract, build_contract, FLOOR_KINDS
 from salienceos.verifier.composer import compose, COMPOSER_VERSION
 from salienceos.verifier.receipt import (
@@ -38,6 +45,8 @@ __all__ = [
     "Reason",
     "Verdict",
     "NotAttestedError",
+    "STAKES_ORDER",
+    "max_stakes",
     "ClaimEvidence",
     "WorldEvidence",
     "ClaimStore",

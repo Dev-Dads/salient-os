@@ -18,7 +18,29 @@ Building per the review's priority order:
 
 1. **Verifier** — built and red-teamed (`salienceos/verifier`)
 2. **Salience bus + central interpreter** — built and red-teamed (`salienceos/interpreter`)
-3. Everything else sits on the existing stack (Hermes, CDMS, Salient-Tuning, quorum_core)
+3. **Control seam** — the interpreter↔verifier integration, built and red-teamed (`salienceos/control`)
+4. Everything else sits on the existing stack (Hermes, CDMS, Salient-Tuning, quorum_core)
+
+## The control seam
+
+`salienceos/control` is where the two components meet: subsystems publish salience →
+`interpret()` issues a `Directive` → the directive's verification depth governs how hard
+the `Verifier` checks the executed action → a `GovernedOutcome` gates clearance and
+adaptation. It reconciles the two verification vocabularies (interpreter depth 0–3 ↔
+verifier `Stakes`) and holds three invariants at once:
+
+- **salience only escalates** verification (`max_stakes`, upward-only) — never weakens the
+  policy-signed floor;
+- **fail-closed clearance** — `required` is floored by both the directive depth and the
+  verdict's effective stakes; a conclusive failure never clears;
+- **adaptation is a sealed learning gate** — allowed only on a directive-eligible action
+  that the verifier returned a real `VERIFIED` for.
+
+`decide()` is the pure spine; `verify()` gained a small upward-only `escalate_to`, and the
+`Verdict` is self-describing (`envelope_id` + `effective_stakes` stamped by the pipeline)
+so the gate binds to and reads from it with no desyncable free parameters. Reviewed hardest
+of all the components — three internal subagent passes and two five-model panels; see
+`red-team/control/`.
 
 ## The bus + interpreter
 

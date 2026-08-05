@@ -46,6 +46,12 @@ class Verdict:
     reasons: tuple = field(default=())
     details: tuple = field(default=())
     composer_version: str = ""
+    # Provenance stamped by the pipeline (not the pure composer): which action the
+    # verdict is about, and the effective stakes it was actually composed at. These
+    # make the verdict self-describing so a downstream gate binds to and reads them
+    # rather than trusting free, desyncable parameters.
+    envelope_id: str = ""
+    effective_stakes: object = None
 
     @property
     def is_verified(self) -> bool:
