@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "salienceos"
+version = "0.1.0"
+description = "SalienceOS — a salience-based AI control plane. Verifier first."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+# Zero runtime dependencies, by design and by test (tests/test_discipline.py).
+dependencies = []
+
+[tool.setuptools.packages.find]
+include = ["salienceos*"]
