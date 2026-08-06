@@ -4,3 +4,4 @@ __pycache__/
 build/
 dist/
 .blender-toolkit/
+red-team/consumers/bundle_consumers.txt
