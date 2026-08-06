@@ -1,0 +1,1555 @@
+
+
+########## CONTEXT ##########
+
+PR-H1 wires the SalienceOS judgment system into quorum-agent (a fork of hermes) as a
+TEST RIG. It is PRODUCE-ONLY: a first-party observer watches real lifecycle hooks and
+records bounded salience signals + one directive/turn on a per-session, hash-named
+audit bus under <hermes_home>/salience/. Consuming a directive (the compute budget) is
+a LATER PR. The guarantees under review:
+
+1. PRODUCE-ONLY / NEVER BREAKS THE HOST. Never changes what the agent does; never lets
+   an exception (including a BaseException like SystemExit) reach the host. Contained by
+   _safe_observe at the seam plus the observer's own try/except. (The author already
+   caught and fixed one such path: get_config_value() calls sys.exit() on a missing key,
+   a SystemExit that would sail past `except Exception` — now uses the programmatic read.)
+2. FAIL-CLOSED ATTRIBUTION. A signal is recorded ONLY against an open window whose
+   turn_id matches. No / empty / mismatched session_id or turn_id => dropped, never guessed.
+3. HASHED IDENTITY (A11 / ADR 0002). The raw session_id must never reach the durable
+   record — both the subject token and the bus filename hash it.
+4. AUDIT FENCE (Finding G). Only bounded ref tokens reach the bus — never prompts, tool
+   args, results, or chain-of-thought. salienceos valid_signal() / the directive payload
+   fence enforce it structurally; a signal that FAILS valid_signal (noise) is also a bug.
+5. GATING. Quorum Edition + config salience.enabled; default ON with a kill switch;
+   absent config => ON, explicit false => OFF, unreadable config => OFF (fail-closed).
+6. SEAM SAFETY. Adding the observer to observe_lifecycle / handles_hook must NOT change
+   invoke_hook's return value, the dispatch to relay_shared_metrics, or the EFFECT of any
+   hook. Enabling salience flips has_hook True only for the observational post_tool_call
+   and api_request_error emitters (previously dead by default); pre_verify and
+   transform_tool_result stay unhandled; pre_llm_call's context-injecting return is
+   consumed from PLUGINS only, never from the observer.
+7. A3. Turn N's window is finalized (its directive emitted) before turn N+1 accumulates.
+8. A4. The policy's min_budget is bound to the operator's resolved budget; in v0 the
+   directive.compute_budget is inert (nothing consumes it — that is PR-H2). min==max in v0.
+9. SINGLE-THREADED BUS CONTRACT. All bus + registry (_WINDOWS/_BUSES) access is serialized
+   under _LOCK; no per-session leak on a long-lived host (freed on session close).
+
+ALREADY INTERNALLY REVIEWED TWICE (correctness/fail-closed + design/test-honesty).
+Accepted findings ALREADY FIXED, do not re-report: a per-session memory leak (now freed
+on session close, not on turn rollover), a double config read for the budget (memoized),
+and missing directive-content test coverage (added). YOUR VALUE is what those missed.
+
+VENDORED CODE NOTE: salienceos/ inside quorum-agent is a VERBATIM vendored copy of
+already-reviewed code — do NOT red-team its internals. signal.py / policy.py / bus.py are
+included ONLY so you can verify the OBSERVER calls those APIs correctly. Flag the vendored
+code only if the observer misuses it.
+
+
+########## hermes_cli/observability/salience_observer.py ##########
+
+"""Salience producer — the Stage-2 watch-only observer.
+
+This first-party observer plugs into the host's existing lifecycle dispatch and
+turns real agent activity (tool calls, API errors, approvals) into **bounded
+salience signals** recorded on a per-session audit bus, plus one **directive per
+turn** (the judgment system's recorded decision for that turn). It is the
+"produce" half of wiring SalienceOS into quorum-agent as a TEST RIG.
+
+Hard guarantees, by construction:
+
+* **Produce-only / no decision-path change.** Nothing here feeds back into what the
+  agent does. Signals and a directive are *recorded*; consuming the directive (the
+  compute-budget knob) is a separate, later change. The dispatch site wraps every
+  call in ``_safe_observe`` (see ``observability/__init__.py``), and this module
+  additionally swallows its own errors — a broken observer goes dark, it never
+  breaks the turn.
+* **Fail-closed attribution.** A signal is recorded only against an *open window
+  with a matching turn id*. No resolvable ``session_id``/``turn_id`` ⇒ no window,
+  no signal. Activity that can't be correlated to a turn is dropped, never guessed.
+* **Audit fence (Finding G).** Only bounded, ref-shaped tokens reach the bus — the
+  ``salienceos`` signal/directive validators reject anything prompt-sized. We never
+  put tool args, results, or prose on the bus; only the *fact* of what happened.
+* **Hashed session identity (ADR 0002 / A11).** The per-session bus file and the
+  durable subject carry a one-way hash of ``session_id``, never the raw id, so the
+  durable record can't be trivially re-linked to the ephemeral quorum_dispatch feed
+  it complements.
+* **Single-threaded bus contract.** ``SalienceBus`` is single-threaded by contract;
+  all bus and window-registry access is serialized under ``_LOCK``.
+
+Gating: active only when this is the Quorum Edition *and* config ``salience.enabled``
+is not turned off (**default ON**, kill switch ``salience.enabled: false``). When
+off — or if the vendored package is unavailable — ``handles_hook`` returns ``False``
+for every hook, so the emitters (which gate on ``has_hook``) stay on their existing
+zero-cost path and this observer is completely inert.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import logging
+import os
+import threading
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+# The vendored judgment system. If it is somehow unavailable, the observer stays
+# permanently dark rather than breaking the host's observability dispatch.
+try:
+    from salienceos.interpreter import Facet, SalienceSignal, interpret, issue_policy
+    from salienceos.interpreter.bus import SalienceBus
+
+    _IMPORT_OK = True
+except Exception:  # pragma: no cover - defensive; a vendoring error must not crash the host
+    _IMPORT_OK = False
+    logger.warning("salience observer: vendored salienceos unavailable; staying dark", exc_info=True)
+
+# --- what we watch -----------------------------------------------------------
+
+# Window-open signal carries the full (session_id, task_id, turn_id) triple;
+# post_tool_call / api_request_error are the produce events; the session-lifecycle
+# events flush the final open window. pre_verify is deliberately absent (plugin-only
+# hook; not part of the produce map).
+SALIENCE_HANDLED_HOOKS = frozenset({
+    "pre_llm_call",
+    "post_tool_call",
+    "api_request_error",
+    "on_session_end",
+    "on_session_finalize",
+    "on_session_reset",
+})
+
+SUBSYSTEM_ID = "quorum.observer"
+
+# v0 signal map (Part 4 #4 / plan): approvals -> RISK, tool/api errors ->
+# VERIFICATION, file mutations -> MEMORY. ADAPTATION is never produced (the
+# inhibitor path is product-dormant under allow_adaptation=False — ADR 0002).
+# These name heuristics are deliberately coarse for v0 and are the one place a
+# real tool taxonomy will refine later; being wrong here only mis-*files* a signal,
+# it can never grant anything (P-01).
+_APPROVAL_MARKERS = ("approv", "permission", "consent", "escalat", "authoriz")
+_MUTATION_MARKERS = ("write", "edit", "create_file", "apply_patch", "str_replace",
+                     "delete", "remove", "move", "rename", "mkdir", "patch")
+
+MAX_TOKEN_LEN = 128  # mirrors salienceos.interpreter.signal.MAX_TOKEN_LEN
+
+# Process-local policy key. Policies are issued and interpreted entirely in-process
+# and the bus stores unsigned directive payloads, so this is a transient HMAC secret
+# for the issue/interpret round-trip, NOT a durable trust anchor (ADR 0002 claims no
+# cross-process authenticity). Regenerated each process — honest about its scope.
+_POLICY_KEY = os.urandom(32)
+
+# Fallback compute budget baked into the produce policy. In v0 the directive's
+# compute_budget is inert (nothing consumes it yet); PR-H2 binds this to the
+# operator's resolved max_iterations (A4) when it wires the consumer.
+_DEFAULT_BUDGET = 25
+
+# Operator budget resolved once per process by _operator_budget() (only ever
+# called under _LOCK); None until first resolved, cleared by _reset_for_tests.
+_OPERATOR_BUDGET_CACHE = None
+
+_LOCK = threading.Lock()
+
+
+class _Window:
+    """One open turn. Signals recorded against it must match its turn id."""
+
+    __slots__ = ("session_id", "turn_id", "task_id", "subject", "signals", "closed")
+
+    def __init__(self, session_id: str, turn_id: str, task_id: str, subject: str) -> None:
+        self.session_id = session_id
+        self.turn_id = turn_id
+        self.task_id = task_id
+        self.subject = subject
+        self.signals: list[Any] = []
+        self.closed = False
+
+
+_WINDOWS: dict[str, _Window] = {}   # session_id -> current open window
+_BUSES: dict[str, Any] = {}         # session_id -> SalienceBus
+
+
+# --- gating ------------------------------------------------------------------
+
+_OFF_VALUES = frozenset({"false", "0", "no", "off", "n", ""})
+
+
+def _looks_off(value) -> bool:
+    """A kill switch must honor any clearly-off value, not only bool ``False``: an
+    operator who writes ``enabled: "false"`` / ``0`` / ``off`` means OFF. Anything
+    not recognizably off is treated as on (the block/key was present on purpose)."""
+    if value is False or value is None:
+        return True
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value == 0
+    if isinstance(value, str):
+        return value.strip().lower() in _OFF_VALUES
+    return False
+
+
+def _config_flag(key: str, default: bool) -> bool:
+    """Read a boolean under the top-level ``salience`` config block. Missing key ⇒
+    ``default``; a recognizably-off value ⇒ off; unreadable config ⇒ fail-closed."""
+    try:
+        from hermes_cli.config import read_raw_config_readonly
+
+        cfg = read_raw_config_readonly() or {}
+    except Exception:
+        return False
+    salience = cfg.get("salience") if isinstance(cfg, dict) else None
+    if not isinstance(salience, dict) or key not in salience:
+        return default
+    return not _looks_off(salience.get(key))
+
+
+def salience_enabled() -> bool:
+    """Quorum Edition AND not explicitly disabled (default ON)."""
+    if not _IMPORT_OK:
+        return False
+    try:
+        from product_identity import IS_QUORUM_EDITION
+    except Exception:
+        return False
+    if not IS_QUORUM_EDITION:
+        return False
+    return _config_flag("enabled", True)
+
+
+def handles_hook(hook_name: str) -> bool:
+    return hook_name in SALIENCE_HANDLED_HOOKS and salience_enabled()
+
+
+def observe_lifecycle(hook_name: str, **kwargs: Any) -> None:
+    """Dispatch one lifecycle event into the produce path.
+
+    Never propagates: catches Exception AND SystemExit — a host API the observer
+    calls could raise SystemExit (e.g. a CLI-shaped config helper that sys.exit()s),
+    which would otherwise sail past ``except Exception`` and take down the host.
+    KeyboardInterrupt is deliberately NOT caught: the user's interrupt must reach
+    the host."""
+    # Session-close events run REGARDLESS of the gate so an already-open window is
+    # finalized and freed even if the kill switch was flipped off mid-session (no
+    # registry leak). They are cheap no-ops when nothing is open for the session.
+    close = hook_name in ("on_session_end", "on_session_finalize", "on_session_reset")
+    if not close and not handles_hook(hook_name):
+        return
+    try:
+        if hook_name == "pre_llm_call":
+            _open_window(kwargs)
+        elif hook_name == "post_tool_call":
+            _record(kwargs, _map_tool_call)
+        elif hook_name == "api_request_error":
+            _record(kwargs, _map_api_error)
+        elif close:
+            _close_session(kwargs)
+    except (Exception, SystemExit):  # never let a host-API failure reach the host
+        logger.warning("salience observer hook failed: %s", hook_name, exc_info=True)
+
+
+# --- identity helpers --------------------------------------------------------
+
+def _ids(kwargs: dict) -> tuple[str, str]:
+    return str(kwargs.get("session_id") or ""), str(kwargs.get("turn_id") or "")
+
+
+def _session_hash(session_id: str) -> str:
+    return hashlib.sha256(session_id.encode("utf-8")).hexdigest()
+
+
+def _subject(session_id: str, turn_id: str) -> str:
+    """Durable arbitration key: hashed session component + turn id, bounded to a
+    ref token. Same value for the window's signals and its policy (interpret needs
+    them to share a subject).
+
+    When turn_id is too long to fit intact, it is HASHED rather than truncated:
+    plain truncation would alias two distinct turns that share a long prefix onto
+    the same durable subject, cross-contaminating them in the persisted record."""
+    head = _session_hash(session_id)[:16] + ":"
+    room = MAX_TOKEN_LEN - len(head)
+    tail = turn_id if len(turn_id) <= room else _session_hash(turn_id)
+    return (head + tail)[:MAX_TOKEN_LEN]
+
+
+# --- window lifecycle --------------------------------------------------------
+
+def _open_window(kwargs: dict) -> None:
+    session_id, turn_id = _ids(kwargs)
+    if not session_id or not turn_id:
+        return  # fail-closed attribution: no correlation id ⇒ no window
+    task_id = str(kwargs.get("task_id") or "")
+    with _LOCK:
+        current = _WINDOWS.get(session_id)
+        # A new turn finalizes the previous one first, so turn N truly governs
+        # turn N+1 (A3): its directive is emitted before N+1 accumulates.
+        if current is not None and not current.closed and current.turn_id != turn_id:
+            _close_locked(current)
+        if current is None or current.closed or current.turn_id != turn_id:
+            _WINDOWS[session_id] = _Window(
+                session_id, turn_id, task_id, _subject(session_id, turn_id)
+            )
+
+
+def _record(kwargs: dict, mapper) -> None:
+    session_id, turn_id = _ids(kwargs)
+    if not session_id or not turn_id:
+        return
+    with _LOCK:
+        window = _WINDOWS.get(session_id)
+        if window is None or window.closed or window.turn_id != turn_id:
+            return  # no matching open window ⇒ drop (fail-closed)
+        for signal in mapper(kwargs, window.subject):
+            try:
+                self_bus = _bus_for(session_id)
+                self_bus.publish(signal)
+                window.signals.append(signal)
+            except Exception:
+                logger.warning("salience observer: publish failed", exc_info=True)
+
+
+def _close_session(kwargs: dict) -> None:
+    session_id = str(kwargs.get("session_id") or "")
+    if not session_id:
+        return
+    with _LOCK:
+        window = _WINDOWS.pop(session_id, None)
+        if window is not None and not window.closed:
+            _close_locked(window)          # emit the final directive first
+        # Session is over: free its window AND its bus. Without this, a
+        # long-lived host (gateway/daemon serving many distinct sessions)
+        # accumulates one fully-materialized SalienceBus per session forever —
+        # the one way a produce-only observer could eventually OOM the host.
+        # A late hook for this session now hits _record's "no window" guard
+        # and is dropped, so freeing here is safe.
+        _BUSES.pop(session_id, None)
+
+
+def _close_locked(window: _Window) -> None:
+    """Finalize a turn: interpret its accumulated signals against the produce
+    policy and emit the resulting directive to the bus. Idempotent."""
+    if window.closed:
+        return
+    window.closed = True
+    try:
+        budget = _operator_budget()   # once: no min>max skew, no repeated I/O
+        policy = issue_policy(
+            "salience.observer.v0",   # policy_id
+            window.subject,           # subject (matches the signals)
+            (),                       # granted_capabilities: NONE (P-01)
+            budget,                   # min_budget (A4: operator floor)
+            budget,                   # max_budget (v0: pinned; PR-H2 widens)
+            0,                        # min_verification
+            3,                        # max_verification (FULL ceiling/default)
+            "semantic",               # max_retention salience may buy
+            False,                    # allow_adaptation: OFF (inhibitor dormant)
+            2,                        # adaptation_min_verification (moot when off)
+            0.5,                      # adaptation_max_risk (moot when off)
+            False,                    # allow_immediate_reconfigure: between-turn only
+            _POLICY_KEY,
+        )
+        directive = interpret(policy, tuple(window.signals), _POLICY_KEY)
+        _bus_for(window.session_id).emit(directive)
+    except Exception:
+        logger.warning("salience observer: window finalize failed", exc_info=True)
+
+
+# --- bus ---------------------------------------------------------------------
+
+def _bus_for(session_id: str):
+    """Lazily open the per-session bus (replays + verifies an existing JSONL on
+    open — survives resume/restart). One file per session, named by the *hash* of
+    the session id, under the host home."""
+    bus = _BUSES.get(session_id)
+    if bus is None:
+        from pathlib import Path
+
+        from hermes_constants import get_hermes_home
+
+        directory = Path(get_hermes_home()) / "salience"
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / (_session_hash(session_id) + ".jsonl")
+        bus = SalienceBus(str(path))
+        _BUSES[session_id] = bus
+    return bus
+
+
+def _operator_budget() -> int:
+    """The operator's resolved compute budget, used as the policy's min_budget
+    floor (A4). Best-effort read of the configured iteration budget via the
+    programmatic read path (NOT get_config_value — that is a CLI helper that
+    sys.exit()s on a missing key); falls back to a safe constant.
+
+    Memoized: resolved once per process. It is only ever called from
+    _close_locked while _LOCK is held, so the module-global cache needs no extra
+    synchronization; reading once also removes any min>max skew from a config
+    change landing between two reads, and keeps config disk-I/O off the hot path
+    after the first finalize. PR-H2 owns getting this exactly right (it is the
+    consumer of the budget)."""
+    global _OPERATOR_BUDGET_CACHE
+    if _OPERATOR_BUDGET_CACHE is not None:
+        return _OPERATOR_BUDGET_CACHE
+    budget = _DEFAULT_BUDGET
+    try:
+        from hermes_cli.config import read_raw_config_readonly
+
+        cfg = read_raw_config_readonly() or {}
+    except Exception:
+        cfg = {}
+    for path in (("agent", "max_iterations"), ("max_iterations",), ("agent", "iteration_budget")):
+        node: Any = cfg
+        for part in path:
+            if isinstance(node, dict) and part in node:
+                node = node[part]
+            else:
+                node = None
+                break
+        if isinstance(node, int) and not isinstance(node, bool) and node > 0:
+            budget = node
+            break
+    _OPERATOR_BUDGET_CACHE = budget
+    return budget
+
+
+# --- signal mapping (bounded, ref-shaped) ------------------------------------
+
+def _ref(*parts: str) -> tuple:
+    """Bounded, non-empty ref tokens for provenance (audit fence)."""
+    out = []
+    for part in parts:
+        token = str(part)[:MAX_TOKEN_LEN]
+        if token:
+            out.append(token)
+    return tuple(out[:16])
+
+
+def _signal(subject: str, facet: str, influence: float, provenance: tuple):
+    return SalienceSignal(SUBSYSTEM_ID, subject, facet, influence, 1.0, provenance)
+
+
+def _map_tool_call(kwargs: dict, subject: str) -> list:
+    tool_name = str(kwargs.get("tool_name") or "")
+    status = str(kwargs.get("status") or "")
+    error_type = str(kwargs.get("error_type") or "")
+    is_error = bool(error_type) or status.lower() in ("error", "failed", "failure")
+    lowered = tool_name.lower()
+    provenance = _ref("tool:" + tool_name, "status:" + status)
+    if is_error:
+        # something did not do what it claimed -> wants verification
+        return [_signal(subject, Facet.VERIFICATION, 0.7, provenance)]
+    if any(marker in lowered for marker in _APPROVAL_MARKERS):
+        return [_signal(subject, Facet.RISK, 0.6, provenance)]
+    if any(marker in lowered for marker in _MUTATION_MARKERS):
+        return [_signal(subject, Facet.MEMORY, 0.4, provenance)]
+    return []
+
+
+def _map_api_error(kwargs: dict, subject: str) -> list:
+    # A non-retryable API failure is more salient than a transient one.
+    retryable = kwargs.get("retryable")
+    influence = 0.5 if retryable is True else 0.8
+    provenance = _ref("api_error", "provider:" + str(kwargs.get("provider") or ""))
+    return [_signal(subject, Facet.VERIFICATION, influence, provenance)]
+
+
+def _reset_for_tests() -> None:
+    """Drop all in-memory windows/buses and the budget cache. Test-only; never
+    called in production."""
+    global _OPERATOR_BUDGET_CACHE
+    with _LOCK:
+        _WINDOWS.clear()
+        _BUSES.clear()
+        _OPERATOR_BUDGET_CACHE = None
+
+
+########## hermes_cli/observability/__init__.py ##########
+
+"""First-party Hermes observability integrations."""
+
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+
+def observe_lifecycle(hook_name: str, **kwargs: Any) -> None:
+    """Dispatch a Hermes lifecycle event to built-in observability features."""
+    from . import relay_shared_metrics
+
+    _safe_observe(relay_shared_metrics.observe_lifecycle, hook_name, kwargs)
+    # Import the salience observer independently so a failure to import it can
+    # never starve the relay dispatch above (which must always run first).
+    try:
+        from . import salience_observer
+    except Exception:
+        logger.warning("Salience observer unavailable", exc_info=True)
+        return
+    _safe_observe(salience_observer.observe_lifecycle, hook_name, kwargs)
+
+
+def handles_hook(hook_name: str) -> bool:
+    """Return whether any built-in observability feature handles a hook."""
+    from . import relay_shared_metrics
+
+    if relay_shared_metrics.handles_hook(hook_name):
+        return True
+    # Independent import for the same reason: a salience import failure must not
+    # mask the relay answer computed above.
+    try:
+        from . import salience_observer
+    except Exception:
+        return False
+    return salience_observer.handles_hook(hook_name)
+
+
+def _safe_observe(callback: Any, hook_name: str, kwargs: dict[str, Any]) -> None:
+    try:
+        callback(hook_name, **kwargs)
+    except Exception:
+        logger.warning(
+            "Built-in observability hook failed: %s", hook_name, exc_info=True
+        )
+
+
+########## tests/hermes_cli/test_salience_observer.py ##########
+
+"""Tests for the Stage-2 salience producer (hermes_cli/observability/salience_observer.py).
+
+Covers the things that make it safe: (1) it only produces against an open window
+with a matching turn id (fail-closed attribution); (2) it is gated (Quorum Edition +
+config, default ON, kill switch) and otherwise completely inert; (3) the durable
+record hashes the session id and verifies as a chain; (4) the emitted directive binds
+the operator budget; (5) a finished session frees its in-memory state (no per-session
+leak on a long-lived host). The E2E drives a REAL tool-dispatch emitter (which
+self-gates on ``has_hook``) rather than calling the hook directly — calling the hook
+directly would enter below the gate and prove nothing about the wiring.
+
+Note: the shared conftest disables the observer's gate suite-wide (it is default-ON
+in the product and must be inert in unrelated tests). These tests opt back in — the
+gate-logic tests restore the real ``salience_enabled`` and drive its inputs; the
+produce tests force the gate open or call the produce internals directly.
+"""
+
+from pathlib import Path
+
+import pytest
+
+import hermes_constants
+import product_identity
+from hermes_cli import config as hermes_config
+from hermes_cli.observability import salience_observer as so
+from salienceos.interpreter.bus import SalienceBus
+
+# The genuine gate function, captured before the conftest fixture patches it.
+_REAL_SALIENCE_ENABLED = so.salience_enabled
+
+
+@pytest.fixture(autouse=True)
+def _reset_state():
+    so._reset_for_tests()
+    yield
+    so._reset_for_tests()
+
+
+def _force_gate(monkeypatch, tmp_path, open_gate):
+    """Opt in: force the gate open/closed and point the bus at a temp home."""
+    monkeypatch.setattr(so, "salience_enabled", (lambda: open_gate), raising=False)
+    monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: tmp_path, raising=False)
+    monkeypatch.setattr(
+        hermes_config, "read_raw_config_readonly",
+        lambda: {"salience": {"enabled": open_gate}}, raising=False,
+    )
+
+
+@pytest.fixture
+def home(monkeypatch, tmp_path):
+    _force_gate(monkeypatch, tmp_path, True)
+    return tmp_path
+
+
+def _real_gate(monkeypatch):
+    """Restore the real gate so its own logic can be exercised."""
+    monkeypatch.setattr(so, "salience_enabled", _REAL_SALIENCE_ENABLED, raising=False)
+
+
+def _bus_file(tmp_path, session_id):
+    return Path(tmp_path) / "salience" / (so._session_hash(session_id) + ".jsonl")
+
+
+# --- gating ------------------------------------------------------------------
+
+def test_enabled_by_default_when_config_absent(monkeypatch):
+    _real_gate(monkeypatch)
+    monkeypatch.setattr(product_identity, "IS_QUORUM_EDITION", True, raising=False)
+    monkeypatch.setattr(hermes_config, "read_raw_config_readonly", lambda: {}, raising=False)
+    assert so.salience_enabled() is True  # default ON
+
+
+def test_kill_switch_disables(monkeypatch):
+    _real_gate(monkeypatch)
+    monkeypatch.setattr(product_identity, "IS_QUORUM_EDITION", True, raising=False)
+    monkeypatch.setattr(
+        hermes_config, "read_raw_config_readonly",
+        lambda: {"salience": {"enabled": False}}, raising=False,
+    )
+    assert so.salience_enabled() is False
+    assert so.handles_hook("post_tool_call") is False
+
+
+def test_not_quorum_edition_is_dark(monkeypatch):
+    _real_gate(monkeypatch)
+    monkeypatch.setattr(product_identity, "IS_QUORUM_EDITION", False, raising=False)
+    monkeypatch.setattr(hermes_config, "read_raw_config_readonly", lambda: {}, raising=False)
+    assert so.salience_enabled() is False
+
+
+def test_unreadable_config_fails_closed(monkeypatch):
+    _real_gate(monkeypatch)
+    monkeypatch.setattr(product_identity, "IS_QUORUM_EDITION", True, raising=False)
+
+    def _boom():
+        raise RuntimeError("config unreadable")
+
+    monkeypatch.setattr(hermes_config, "read_raw_config_readonly", _boom, raising=False)
+    assert so.salience_enabled() is False  # can't read config ⇒ stay dark
+
+
+def test_only_mapped_hooks_are_handled(home):
+    # `home` forces the gate open; handles_hook then reflects the hook allowlist.
+    assert so.handles_hook("post_tool_call") is True
+    assert so.handles_hook("pre_llm_call") is True
+    assert so.handles_hook("api_request_error") is True
+    # not in the produce map — must stay False even when enabled
+    assert so.handles_hook("pre_verify") is False
+    assert so.handles_hook("transform_tool_result") is False
+
+
+# --- signal mapping ----------------------------------------------------------
+
+def test_mapping_by_facet():
+    subject = "subj"
+    err = so._map_tool_call({"tool_name": "run_shell", "status": "error",
+                             "error_type": "tool_error"}, subject)
+    approval = so._map_tool_call({"tool_name": "request_approval", "status": "ok"}, subject)
+    mutation = so._map_tool_call({"tool_name": "write_file", "status": "success"}, subject)
+    read = so._map_tool_call({"tool_name": "read_file", "status": "success"}, subject)
+
+    assert [s.facet for s in err] == ["verification"]
+    assert [s.facet for s in approval] == ["risk"]
+    assert [s.facet for s in mutation] == ["memory"]
+    assert read == []  # a plain read is not salient in the v0 map
+
+    api = so._map_api_error({"retryable": False, "provider": "anthropic"}, subject)
+    assert [s.facet for s in api] == ["verification"]
+    # provenance carries only bounded ref tokens, never bodies/args
+    assert all(len(p) <= so.MAX_TOKEN_LEN for p in api[0].provenance)
+
+
+# --- fail-closed attribution -------------------------------------------------
+
+def test_records_only_against_matching_open_window(home):
+    subject = so._subject("s", "u")
+
+    # no window open yet -> dropped
+    so._record({"session_id": "s", "turn_id": "u", "tool_name": "write_file",
+                "status": "ok"}, so._map_tool_call)
+    assert so._bus_for("s").signals_for(subject) == ()
+
+    so._open_window({"session_id": "s", "task_id": "t", "turn_id": "u"})
+    # wrong turn id -> dropped (the load-bearing attribution guard: deleting the
+    # turn_id check in _record makes the final count 2 and reds this test)
+    so._record({"session_id": "s", "turn_id": "WRONG", "tool_name": "write_file",
+                "status": "ok"}, so._map_tool_call)
+    # matching -> recorded
+    so._record({"session_id": "s", "turn_id": "u", "tool_name": "write_file",
+                "status": "ok"}, so._map_tool_call)
+
+    assert len(so._bus_for("s").signals_for(subject)) == 1
+    # (empty session/turn ids are covered by test_no_ids_no_window.)
+
+
+def test_no_ids_no_window(home):
+    so._open_window({"session_id": "", "task_id": "t", "turn_id": "u"})
+    so._open_window({"session_id": "s", "task_id": "t", "turn_id": ""})
+    assert so._WINDOWS == {}  # neither opened
+
+
+# --- subject hashing ---------------------------------------------------------
+
+def test_subject_hashes_session_and_is_bounded():
+    subject = so._subject("super-secret-session", "turn-9")
+    assert "super-secret-session" not in subject
+    assert subject.endswith(":turn-9")
+    assert 0 < len(subject) <= so.MAX_TOKEN_LEN
+    assert so._subject("super-secret-session", "turn-9") == subject  # deterministic
+
+
+# --- window finalize + directive content -------------------------------------
+
+def test_close_emits_one_directive_and_is_idempotent(home):
+    subject = so._subject("s", "u")
+    so._open_window({"session_id": "s", "task_id": "t", "turn_id": "u"})
+    so._record({"session_id": "s", "turn_id": "u", "tool_name": "write_file",
+                "status": "ok"}, so._map_tool_call)
+    so._close_session({"session_id": "s"})
+    so._close_session({"session_id": "s"})  # idempotent
+
+    dirs = so._bus_for("s").directives_for(subject)
+    assert len(dirs) == 1
+    # v0 is product-dormant: adaptation disallowed, never an inhibitor
+    assert dirs[0]["adaptation_rationale"] == "policy_disallowed"
+
+
+def test_new_turn_finalizes_previous(home):
+    so._open_window({"session_id": "s", "task_id": "t", "turn_id": "u1"})
+    so._record({"session_id": "s", "turn_id": "u1", "tool_name": "write_file",
+                "status": "ok"}, so._map_tool_call)
+    # opening u2 must finalize u1 first (turn N governs N+1)
+    so._open_window({"session_id": "s", "task_id": "t", "turn_id": "u2"})
+    assert len(so._bus_for("s").directives_for(so._subject("s", "u1"))) == 1
+
+
+def test_emitted_directive_binds_operator_budget(monkeypatch, tmp_path):
+    # A4: the operator's configured iteration budget is bound into the directive
+    # (min==max==operator budget in v0). Reverting the A4 binding or a broken
+    # _operator_budget read would change this value.
+    monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: tmp_path, raising=False)
+    monkeypatch.setattr(hermes_config, "read_raw_config_readonly",
+                        lambda: {"agent": {"max_iterations": 7}}, raising=False)
+    subject = so._subject("s", "u")
+    so._open_window({"session_id": "s", "task_id": "t", "turn_id": "u"})
+    so._record({"session_id": "s", "turn_id": "u", "tool_name": "write_file",
+                "status": "ok"}, so._map_tool_call)
+    so._close_session({"session_id": "s"})
+
+    directive = SalienceBus(str(_bus_file(tmp_path, "s"))).directives_for(subject)[0]
+    assert directive["compute_budget"] == 7
+
+
+def test_emitted_directive_defaults_budget_when_unconfigured(monkeypatch, tmp_path):
+    monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: tmp_path, raising=False)
+    monkeypatch.setattr(hermes_config, "read_raw_config_readonly", lambda: {}, raising=False)
+    subject = so._subject("s", "u")
+    so._open_window({"session_id": "s", "task_id": "t", "turn_id": "u"})
+    so._record({"session_id": "s", "turn_id": "u", "tool_name": "write_file",
+                "status": "ok"}, so._map_tool_call)
+    so._close_session({"session_id": "s"})
+
+    directive = SalienceBus(str(_bus_file(tmp_path, "s"))).directives_for(subject)[0]
+    assert directive["compute_budget"] == so._DEFAULT_BUDGET
+
+
+def test_session_close_frees_registries(home):
+    so._open_window({"session_id": "s", "task_id": "t", "turn_id": "u"})
+    so._record({"session_id": "s", "turn_id": "u", "tool_name": "write_file",
+                "status": "ok"}, so._map_tool_call)
+    assert "s" in so._WINDOWS and "s" in so._BUSES
+
+    so._close_session({"session_id": "s"})
+    # session over: both registries release it, so a long-lived host doesn't
+    # accumulate one materialized bus per session. Reverting the _BUSES pop reds this.
+    assert "s" not in so._WINDOWS
+    assert "s" not in so._BUSES
+
+    # a late hook for the closed session is dropped, not recorded
+    so._record({"session_id": "s", "turn_id": "u", "tool_name": "write_file",
+                "status": "ok"}, so._map_tool_call)
+    assert "s" not in so._WINDOWS
+
+
+# --- real-dispatch E2E -------------------------------------------------------
+
+def test_e2e_through_real_tool_dispatch(home):
+    from hermes_cli import lifecycle
+    import model_tools
+
+    session_id, task_id, turn_id = "sess-e2e", "task-1", "turn-1"
+
+    # window opens through the real dispatch chain (invoke_hook -> seam -> observer)
+    lifecycle.invoke_hook("pre_llm_call", session_id=session_id, task_id=task_id,
+                          turn_id=turn_id)
+    # the emitter's gate is genuinely open (this is the A1 point)
+    assert lifecycle.has_hook("post_tool_call") is True
+
+    # real emitter: self-gates on has_hook, then invoke_hook -> seam -> observer
+    model_tools._emit_post_tool_call_hook(
+        function_name="write_file", function_args={"path": "x"},
+        result={"ok": True}, session_id=session_id, task_id=task_id,
+        turn_id=turn_id, tool_call_id="c1", status="success",
+    )
+    model_tools._emit_post_tool_call_hook(
+        function_name="run_shell", function_args={}, result={"error": "boom"},
+        session_id=session_id, task_id=task_id, turn_id=turn_id, tool_call_id="c2",
+        status="error", error_type="tool_error", error_message="boom",
+    )
+
+    # finalize -> directive
+    lifecycle.invoke_hook("on_session_finalize", session_id=session_id)
+
+    subject = so._subject(session_id, turn_id)
+    path = _bus_file(home, session_id)
+    assert path.exists()
+
+    bus = SalienceBus(str(path))
+    facets = sorted(s.facet for s in bus.signals_for(subject))
+    assert facets == ["memory", "verification"]        # mutation + tool error
+    assert len(bus.directives_for(subject)) == 1
+    # replay-on-open raises on a broken chain, so reaching here already means the
+    # observer wrote a well-formed multi-entry chain; the assert documents intent.
+    assert bus.verify_chain() is True
+    assert session_id not in subject                   # hashed on disk
+
+
+def test_closed_gate_produces_nothing_through_dispatch(monkeypatch, tmp_path):
+    # Proves a closed gate ⇒ no window, has_hook False, nothing written. The
+    # config-parse side of the kill switch is covered by test_kill_switch_disables.
+    _force_gate(monkeypatch, tmp_path, False)
+    from hermes_cli import lifecycle
+    import model_tools
+
+    lifecycle.invoke_hook("pre_llm_call", session_id="s", task_id="t", turn_id="u")
+    assert lifecycle.has_hook("post_tool_call") is False
+    model_tools._emit_post_tool_call_hook(
+        function_name="write_file", function_args={}, result={"ok": True},
+        session_id="s", task_id="t", turn_id="u", status="success",
+    )
+    lifecycle.invoke_hook("on_session_finalize", session_id="s")
+
+    # nothing opened, nothing written
+    assert so._WINDOWS == {}
+    assert not (Path(tmp_path) / "salience").exists()
+
+
+# --- pass-1 external-panel regression tests ----------------------------------
+
+def test_subject_hashes_long_turn_id_without_aliasing():
+    # Two distinct turn ids sharing a long prefix must NOT collapse to the same
+    # durable subject (plain truncation would alias them — grok F1).
+    sa = so._subject("s", "x" * 200 + "A")
+    sb = so._subject("s", "x" * 200 + "B")
+    assert sa != sb
+    assert len(sa) <= so.MAX_TOKEN_LEN and len(sb) <= so.MAX_TOKEN_LEN
+    # short turn ids stay readable (not hashed)
+    assert so._subject("s", "turn-1").endswith(":turn-1")
+
+
+def test_systemexit_from_host_api_is_contained(home, monkeypatch):
+    so._open_window({"session_id": "s", "task_id": "t", "turn_id": "u"})
+
+    def _boom():
+        raise SystemExit(1)  # a host API that sys.exit()s, like the fixed get_config_value
+
+    monkeypatch.setattr(hermes_constants, "get_hermes_home", _boom, raising=False)
+    # must NOT propagate — a produce-only observer may never crash the host
+    so.observe_lifecycle("post_tool_call", session_id="s", turn_id="u",
+                         tool_name="write_file", status="ok")
+
+
+def test_records_drop_across_sessions(home):
+    so._open_window({"session_id": "s1", "task_id": "t", "turn_id": "u"})
+    # a record for a DIFFERENT session (no open window) must be dropped, never
+    # recorded against s1's window (a single global window would fail this).
+    so._record({"session_id": "s2", "turn_id": "u", "tool_name": "write_file",
+                "status": "ok"}, so._map_tool_call)
+    assert "s2" not in so._BUSES
+    assert so._bus_for("s1").signals_for(so._subject("s1", "u")) == ()
+
+
+@pytest.mark.parametrize("value", ["false", "off", "no", "0", 0, None, ""])
+def test_kill_switch_honors_falsey_values(monkeypatch, value):
+    _real_gate(monkeypatch)
+    monkeypatch.setattr(product_identity, "IS_QUORUM_EDITION", True, raising=False)
+    monkeypatch.setattr(hermes_config, "read_raw_config_readonly",
+                        lambda: {"salience": {"enabled": value}}, raising=False)
+    assert so.salience_enabled() is False
+
+
+def test_close_frees_even_when_gate_flips_off(monkeypatch, tmp_path):
+    _force_gate(monkeypatch, tmp_path, True)
+    so._open_window({"session_id": "s", "task_id": "t", "turn_id": "u"})
+    assert "s" in so._WINDOWS
+    # operator flips the kill switch mid-session
+    monkeypatch.setattr(so, "salience_enabled", lambda: False, raising=False)
+    # a session-close event still finalizes + frees (cleanup is not gated)
+    so.observe_lifecycle("on_session_finalize", session_id="s")
+    assert "s" not in so._WINDOWS
+    assert "s" not in so._BUSES
+
+
+def test_close_locked_is_idempotent(home):
+    so._open_window({"session_id": "s", "task_id": "t", "turn_id": "u"})
+    window = so._WINDOWS["s"]
+    so._close_locked(window)
+    so._close_locked(window)  # second call is a no-op (window.closed guard)
+    assert len(so._bus_for("s").directives_for(so._subject("s", "u"))) == 1
+
+
+########## [vendored api] salienceos/interpreter/signal.py ##########
+
+"""The thin bus contract — the normalized edge where subsystems publish salience.
+
+Per the design review (Part 1, Finding A): each subsystem computes its own
+salience however suits it — routing, memory, and expert-promotion salience can be
+entirely different functions over different inputs. What they share is the *bus*,
+and the bus contract is deliberately **thin but real**: enough for the interpreter
+to compare and combine, not enough to constrain how anyone scores. A publisher
+emits a comparable influence magnitude + confidence + provenance + subsystem-id,
+keeping its rich internal scoring private (the "thin normalization at the bus
+edge" fork).
+
+The P-01 fence is structural: a `SalienceSignal` carries influence, NEVER
+authority. There is no capability, grant, or scope field — a signal can say
+"X matters this much", never "allow X". Salience influences; policy authorizes.
+
+The audit fence (Finding G) is also structural: every string field is a bounded,
+ref-shaped token (`MAX_TOKEN_LEN`), and provenance is a short list of such refs
+(`MAX_PROVENANCE_REFS`). A signal therefore cannot carry a prompt, body, tool
+args, or chain-of-thought into the durable bus record — not because no field is
+*named* "body", but because nothing large enough to *be* one validates.
+"""
+
+from dataclasses import dataclass, field
+
+# Ref-shaped means: an id, a content hash, or a rationale code — never prose.
+MAX_TOKEN_LEN = 128
+MAX_PROVENANCE_REFS = 16
+
+
+class Facet:
+    """The concerns the interpreter knows how to map to directive knobs.
+
+    Facets are open strings — a publisher may emit any facet — but only the
+    known ones move a knob. An unknown facet is recorded on the bus and ignored
+    by arbitration (fail-safe: an unrecognized signal grants nothing).
+    """
+
+    ATTENTION = "attention"        # -> compute budget
+    VERIFICATION = "verification"  # -> verification depth (safety; scales up)
+    RISK = "risk"                  # -> raises verification, gates adaptation
+    MEMORY = "memory"              # -> retention class
+    ROUTING = "routing"            # -> routing hint (advisory only)
+    ADAPTATION = "adaptation"      # -> adaptation request (gated by policy)
+
+
+@dataclass(frozen=True)
+class SalienceSignal:
+    subsystem_id: str
+    subject: str            # arbitration key — what this signal is about (e.g. request id)
+    facet: str              # which concern it bears on
+    influence: float        # [0,1] comparable magnitude
+    confidence: float       # [0,1]
+    provenance: tuple = field(default=())  # source refs / rationale codes; NO prompts/bodies/CoT
+
+
+def _unit(x) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and 0.0 <= float(x) <= 1.0
+
+
+def _ref_token(x) -> bool:
+    return isinstance(x, str) and 0 < len(x) <= MAX_TOKEN_LEN
+
+
+def valid_signal(s) -> bool:
+    """A signal is usable only if it is exactly a SalienceSignal with non-empty,
+    bounded ref-shaped string identity and unit-interval influence/confidence.
+    Anything else is dropped at the interpreter boundary (fail-closed). The
+    length bounds are what make the audit fence structural (Finding G)."""
+    return (
+        type(s) is SalienceSignal
+        and _ref_token(s.subsystem_id)
+        and _ref_token(s.subject)
+        and _ref_token(s.facet)
+        and _unit(s.influence)
+        and _unit(s.confidence)
+        and isinstance(s.provenance, tuple)
+        and len(s.provenance) <= MAX_PROVENANCE_REFS
+        and all(_ref_token(p) for p in s.provenance)
+    )
+
+
+########## [vendored api] salienceos/interpreter/policy.py ##########
+
+"""The signed authority envelope — where capability and the bounds on every knob
+come from (P-01). Analogous to the verifier's policy-signed action envelope.
+
+Signals set scalar knobs *within* these caps; they can never widen them, add a
+capability, or flip the adaptation switch. The interpreter verifies this
+envelope's signature itself, so an unsigned or forged policy yields the hardest
+fail-closed directive (no capabilities at all), not a trusted one.
+"""
+
+import enum
+from dataclasses import dataclass, field
+
+from salienceos.verifier.signing import sign, signature_valid
+
+# Retention classes, least- to most-durable. Salience may buy UP to the policy's
+# ceiling; the default (no memory signal) is the least-durable — a total durable
+# record is itself a liability (Finding G).
+RETENTION_ORDER = ("ephemeral", "working", "episodic", "semantic")
+
+
+class VerificationDepth(enum.IntEnum):
+    NONE = 0
+    RECEIPT = 1
+    INDEPENDENT = 2
+    FULL = 3
+
+
+class AdaptationEligibility(enum.Enum):
+    NONE = "none"
+    CANDIDATE = "candidate"  # offline review only; never auto-promoted (no live self-modification)
+
+
+@dataclass(frozen=True)
+class PolicyCaps:
+    policy_id: str
+    subject: str
+    granted_capabilities: tuple   # the ONLY source of capability in a directive
+    min_budget: int
+    max_budget: int
+    min_verification: int         # VerificationDepth floor
+    max_verification: int         # ceiling AND the fail-closed default depth
+    max_retention: str            # highest retention salience may buy
+    allow_adaptation: bool        # policy switch; salience cannot flip it
+    adaptation_min_verification: int
+    adaptation_max_risk: float
+    allow_immediate_reconfigure: bool  # else all reconfiguration defers to between-turn
+    signature: str = field(default="")
+
+    def signed_payload(self) -> dict:
+        return {
+            "policy_id": self.policy_id,
+            "subject": self.subject,
+            "granted_capabilities": list(self.granted_capabilities),
+            "min_budget": self.min_budget,
+            "max_budget": self.max_budget,
+            "min_verification": self.min_verification,
+            "max_verification": self.max_verification,
+            "max_retention": self.max_retention,
+            "allow_adaptation": self.allow_adaptation,
+            "adaptation_min_verification": self.adaptation_min_verification,
+            "adaptation_max_risk": self.adaptation_max_risk,
+            "allow_immediate_reconfigure": self.allow_immediate_reconfigure,
+        }
+
+
+def issue_policy(
+    policy_id: str,
+    subject: str,
+    granted_capabilities,
+    min_budget: int,
+    max_budget: int,
+    min_verification: int,
+    max_verification: int,
+    max_retention: str,
+    allow_adaptation: bool,
+    adaptation_min_verification: int,
+    adaptation_max_risk: float,
+    allow_immediate_reconfigure: bool,
+    policy_key: bytes,
+) -> PolicyCaps:
+    caps = PolicyCaps(
+        policy_id=policy_id,
+        subject=subject,
+        granted_capabilities=tuple(granted_capabilities),
+        min_budget=min_budget,
+        max_budget=max_budget,
+        min_verification=min_verification,
+        max_verification=max_verification,
+        max_retention=max_retention,
+        allow_adaptation=allow_adaptation,
+        adaptation_min_verification=adaptation_min_verification,
+        adaptation_max_risk=adaptation_max_risk,
+        allow_immediate_reconfigure=allow_immediate_reconfigure,
+    )
+    return PolicyCaps(**{**caps.__dict__, "signature": sign(caps.signed_payload(), policy_key)})
+
+
+def _is_int(x) -> bool:
+    return isinstance(x, int) and not isinstance(x, bool)
+
+
+def _is_num(x) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool)
+
+
+def verify_policy(policy, policy_key: bytes) -> bool:
+    if type(policy) is not PolicyCaps:
+        return False
+    try:
+        ok = signature_valid(policy.signed_payload(), policy.signature, policy_key)
+    except (TypeError, ValueError):
+        return False  # e.g. a non-bytes policy_key — fail closed, never raise
+    if not ok:
+        return False
+    # A signed-but-incoherent envelope must be rejected here (the trust boundary):
+    # the `: bool` / `: int` annotations are not enforced by issue_policy, and a
+    # truthy non-bool switch (e.g. the string "false", or 1) would otherwise slip
+    # past the adaptation/reconfigure gates.
+    return (
+        _is_int(policy.min_budget)
+        and _is_int(policy.max_budget)
+        and _is_int(policy.min_verification)
+        and _is_int(policy.max_verification)
+        and _is_int(policy.adaptation_min_verification)
+        and isinstance(policy.allow_adaptation, bool)
+        and isinstance(policy.allow_immediate_reconfigure, bool)
+        and _is_num(policy.adaptation_max_risk)
+        and isinstance(policy.granted_capabilities, tuple)
+        and all(isinstance(c, str) for c in policy.granted_capabilities)
+        and 0 <= policy.min_budget <= policy.max_budget
+        and 0 <= policy.min_verification <= policy.max_verification <= int(VerificationDepth.FULL)
+        # adaptation gate must be reachable: a floor above the ceiling would
+        # silently make adaptation impossible without saying allow_adaptation=False.
+        and 0 <= policy.adaptation_min_verification <= policy.max_verification
+        and policy.max_retention in RETENTION_ORDER
+        and 0.0 <= policy.adaptation_max_risk <= 1.0
+    )
+
+
+########## [vendored api] salienceos/interpreter/bus.py ##########
+
+"""The salience bus — the auditable contract and the audit surface (Finding G).
+
+Append-only and hash-chained, like the verifier's evidence log. It holds the
+durable record: which subsystems published what influence about a subject, and
+which directive the interpreter emitted. It is deliberately incapable of holding
+the ephemeral inputs — a `SalienceSignal` carries only bounded, ref-shaped tokens
+(enforced by `valid_signal`, which every `publish` requires), never prompts,
+bodies, args, or chain-of-thought — so "a total durable record is itself a
+liability" is handled by construction, not policy. The chain is verifiable end to
+end via `verify_chain()`.
+
+The bus does not decide or authorize anything: enforcement is the interpreter's.
+Recording a directive here is NOT proof it was authorized — a directive's
+authority comes from having been produced by `interpret()` against a signed
+policy, never from its presence on the bus. The bus only records and serves
+signals for arbitration, keeping the choke point single.
+
+Integrity scope: `verify_chain()` detects accidental corruption, truncation, and
+reordering of the durable record (the in-scope non-malicious-corruption case). It
+does NOT prove authentic history against an adversary who can rewrite every entry
+AND the head consistently — that requires a signed/anchored head under an audit
+key, which is deferred (out of scope, same boundary as the verifier's). This is a
+reviewed decision, not an oversight — see docs/adr/0001-verify-chain-integrity-scope.md.
+"""
+
+import json
+import os
+from dataclasses import asdict
+
+from salienceos.interpreter.directive import Directive
+from salienceos.interpreter.signal import MAX_TOKEN_LEN, SalienceSignal, valid_signal
+from salienceos.verifier.signing import digest
+
+# The directive half of the audit fence (Finding G). Signals are body-free via
+# valid_signal; directive entries are the OTHER durable kind and get the same
+# structural guarantee: every string bounded, every collection bounded, and on
+# replay an exact payload key set — nothing prompt-sized can become durable.
+DIRECTIVE_PAYLOAD_KEYS = frozenset({
+    "subject", "policy_id", "compute_budget", "verification_depth",
+    "retention_class", "routing_hint", "adaptation_eligibility",
+    "adaptation_rationale", "allowed_capabilities", "reconfigure",
+    "interpreter_version", "reasons",
+})
+MAX_DIRECTIVE_REASONS = 32
+MAX_DIRECTIVE_CAPABILITIES = 64
+
+
+def _bounded_str(x) -> bool:
+    return isinstance(x, str) and len(x) <= MAX_TOKEN_LEN
+
+
+def _valid_directive_shape(d) -> bool:
+    """Ref-shaped bounds for the durable directive record — the emit-side
+    fence. Enum fields are checked by emit's own .value access on the real
+    enum types (Directive construction already requires them)."""
+    return (
+        _bounded_str(d.subject) and _bounded_str(d.policy_id)
+        and _bounded_str(d.retention_class) and _bounded_str(d.routing_hint)
+        and _bounded_str(d.interpreter_version)
+        and isinstance(d.compute_budget, int) and not isinstance(d.compute_budget, bool)
+        and isinstance(d.verification_depth, int) and not isinstance(d.verification_depth, bool)
+        and isinstance(d.allowed_capabilities, tuple)
+        and len(d.allowed_capabilities) <= MAX_DIRECTIVE_CAPABILITIES
+        and all(_bounded_str(c) for c in d.allowed_capabilities)
+        and isinstance(d.reasons, tuple)
+        and len(d.reasons) <= MAX_DIRECTIVE_REASONS
+        and all(_bounded_str(r) for r in d.reasons)
+    )
+
+
+def _valid_directive_payload(p) -> bool:
+    """The replay-side fence: exact key set and the same ref-shaped bounds,
+    applied to the parsed dict (enum fields arrive as their .value strings)."""
+    if not isinstance(p, dict) or set(p) != DIRECTIVE_PAYLOAD_KEYS:
+        return False
+    strings = ("subject", "policy_id", "retention_class", "routing_hint",
+               "adaptation_eligibility", "adaptation_rationale", "reconfigure",
+               "interpreter_version")
+    return (
+        all(_bounded_str(p[k]) for k in strings)
+        and isinstance(p["compute_budget"], int) and not isinstance(p["compute_budget"], bool)
+        and isinstance(p["verification_depth"], int) and not isinstance(p["verification_depth"], bool)
+        and isinstance(p["allowed_capabilities"], list)
+        and len(p["allowed_capabilities"]) <= MAX_DIRECTIVE_CAPABILITIES
+        and all(_bounded_str(c) for c in p["allowed_capabilities"])
+        and isinstance(p["reasons"], list)
+        and len(p["reasons"]) <= MAX_DIRECTIVE_REASONS
+        and all(_bounded_str(r) for r in p["reasons"])
+    )
+
+
+class SalienceBus:
+    """Single-threaded by contract: callers that share a bus across threads
+    must serialize access themselves (this package imports no threading — the
+    discipline allowlist has none)."""
+
+    def __init__(self, path=None):
+        self._signals = []          # (hash, SalienceSignal)
+        self._directives = []       # (hash, directive dict)
+        self._entries = []          # ordered full entries, for chain verification
+        self._head = ""
+        self._path = path
+        if path is not None and os.path.exists(path):
+            self._replay(path)
+
+    def _replay(self, path) -> None:
+        """Rebuild state from an existing JSONL so a REOPENED bus continues its
+        own chain. Without this, a second process (session resume, host
+        restart) would append an entry with prev="" after the existing lines
+        and permanently break `verify_chain()` at the junction.
+
+        Verifies while loading and fails CLOSED: a corrupt, tampered,
+        discontinuous, or key-smuggling record raises rather than silently
+        appending after garbage — a bus you cannot trust to extend is a bus
+        you must not extend.
+
+        Scope limit (ADR 0001, unchanged): the head is derived FROM the file,
+        so deletion of trailing lines (tail truncation) is indistinguishable
+        from a shorter honest history and is accepted. Detecting it requires
+        the externally-anchored head (`verify_chain(trusted_head)`) that ADR
+        0001 defers."""
+        with open(path, encoding="utf-8") as fh:
+            lines = [ln for ln in (raw.strip() for raw in fh) if ln]
+        prev = ""
+        for i, line in enumerate(lines):
+            try:
+                e = json.loads(line)
+                base = {"kind": e["kind"], "payload": e["payload"], "prev": e["prev"]}
+                intact = (
+                    # Exactly these keys: unknown keys sit OUTSIDE the digest
+                    # base and would otherwise ride along unverified — a
+                    # smuggling channel through the audit fence (Finding G).
+                    set(e) == {"kind", "payload", "prev", "hash"}
+                    and isinstance(e["payload"], dict)
+                    and e["prev"] == prev
+                    and digest(base) == e["hash"]
+                )
+            except Exception:  # noqa: BLE001 — any malformed line is corruption
+                intact = False
+            if not intact:
+                raise ValueError(
+                    f"corrupt or discontinuous bus record at line {i + 1}: {path}"
+                )
+            if e["kind"] == "signal":
+                p = dict(e["payload"])
+                # Validate the value the FILE carried, not a coerced view of
+                # it: coercing before validation would accept shapes publish()
+                # could never produce (a string split into char refs, dict
+                # keys harvested as refs) and let a non-list escape as a
+                # TypeError instead of the ValueError this loop guarantees.
+                prov = p.get("provenance", [])
+                if not isinstance(prov, list):
+                    raise ValueError(
+                        f"persisted signal fails validation at line {i + 1}: {path}"
+                    )
+                p["provenance"] = tuple(prov)
+                try:
+                    signal = SalienceSignal(**p)
+                except TypeError:
+                    signal = None
+                if signal is None or not valid_signal(signal):
+                    raise ValueError(
+                        f"persisted signal fails validation at line {i + 1}: {path}"
+                    )
+                self._signals.append((e["hash"], signal))
+            elif e["kind"] == "directive":
+                if not _valid_directive_payload(e["payload"]):
+                    raise ValueError(
+                        f"persisted directive fails the audit fence at line {i + 1}: {path}"
+                    )
+                self._directives.append((e["hash"], e["payload"]))
+            else:
+                raise ValueError(
+                    f"unknown entry kind at line {i + 1}: {path}"
+                )
+            self._entries.append(e)
+            prev = e["hash"]
+        self._head = prev
+
+    def publish(self, signal) -> str:
+        if not valid_signal(signal):
+            raise TypeError("SalienceBus.publish accepts only a valid SalienceSignal")
+        entry = {"kind": "signal", "payload": asdict(signal), "prev": self._head}
+        return self._append(entry, ("signal", signal))
+
+    def emit(self, directive) -> str:
+        """Record a directive decision for a subject (the audit trail). Requires a
+        Directive whose every string is ref-shaped and bounded — the directive
+        half of the audit fence, so nothing prompt-sized can enter the durable
+        record through this kind either. A well-formedness check, NOT an
+        authorization check (see module docstring)."""
+        if type(directive) is not Directive or not _valid_directive_shape(directive):
+            raise TypeError("SalienceBus.emit accepts only a bounded, ref-shaped Directive")
+        payload = {
+            "subject": directive.subject,
+            "policy_id": directive.policy_id,
+            "compute_budget": directive.compute_budget,
+            "verification_depth": directive.verification_depth,
+            "retention_class": directive.retention_class,
+            "routing_hint": directive.routing_hint,
+            "adaptation_eligibility": directive.adaptation_eligibility.value,
+            "adaptation_rationale": directive.adaptation_rationale.value,
+            "allowed_capabilities": list(directive.allowed_capabilities),
+            "reconfigure": directive.reconfigure.value,
+            "interpreter_version": directive.interpreter_version,
+            "reasons": list(directive.reasons),
+        }
+        entry = {"kind": "directive", "payload": payload, "prev": self._head}
+        return self._append(entry, ("directive", payload))
+
+    def signals_for(self, subject: str) -> tuple:
+        return tuple(s for _, s in self._signals if isinstance(s, SalienceSignal) and s.subject == subject)
+
+    def directives_for(self, subject: str) -> tuple:
+        """Recorded directive payloads for a subject, oldest first, as
+        json-round-trip COPIES — reading the audit record must not be able to
+        mutate it (a shallow copy would alias the nested lists). Deliberately
+        dicts, not reconstructed Directive objects: presence on the bus is NOT
+        authorization (module docstring), and dicts are all a JSONL-loaded
+        record could ever faithfully serve."""
+        return tuple(json.loads(json.dumps(p)) for _, p in self._directives
+                     if p.get("subject") == subject)
+
+    def head(self) -> str:
+        return self._head
+
+    def verify_chain(self) -> bool:
+        """Recompute the hash chain end to end: every entry's hash must match its
+        content, its `prev` must be the previous entry's hash, and the last hash
+        must be the head. Catches accidental corruption, reordering, and — for a
+        bus whose head predates the damage (same process) — truncation of the
+        durable record; "append-only" is then a checkable property, not merely
+        the absence of a mutator method. Across a REOPEN the head is derived
+        from the file, so tail truncation needs the externally-anchored head
+        ADR 0001 defers. See the module docstring for the other exclusion
+        (consistent malicious rewrite)."""
+        prev = ""
+        for e in self._entries:
+            base = {"kind": e["kind"], "payload": e["payload"], "prev": e["prev"]}
+            if e["prev"] != prev or digest(base) != e["hash"]:
+                return False
+            prev = e["hash"]
+        return prev == self._head
+
+    def _append(self, entry: dict, stored) -> str:
+        entry_hash = digest(entry)
+        entry = {**entry, "hash": entry_hash}
+        kind, obj = stored
+        (self._signals if kind == "signal" else self._directives).append((entry_hash, obj))
+        self._entries.append(entry)
+        self._head = entry_hash
+        if self._path is not None:
+            with open(self._path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(entry, sort_keys=True) + "\n")
+        return entry_hash
+
+
+########## hermes_cli/lifecycle.py (lines 1-45 — has_hook / invoke_hook (the gate + dispatch)) ##########
+
+"""Hermes lifecycle dispatch for first-party observers and plugins."""
+
+from __future__ import annotations
+
+import logging
+from typing import Any, List
+
+logger = logging.getLogger(__name__)
+
+
+def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
+    """Notify first-party observers, then invoke compatibility plugin hooks."""
+    try:
+        from hermes_cli.observability import observe_lifecycle
+
+        observe_lifecycle(hook_name, **kwargs)
+    except Exception:
+        logger.warning("Built-in observability hook failed", exc_info=True)
+
+    from hermes_cli import plugins
+
+    return plugins.invoke_hook(hook_name, **kwargs)
+
+
+def has_hook(hook_name: str) -> bool:
+    """Return whether a first-party observer or plugin consumes a hook."""
+    try:
+        from hermes_cli.observability import handles_hook
+
+        if handles_hook(hook_name):
+            return True
+    except Exception:
+        logger.warning("Unable to inspect built-in observability hooks", exc_info=True)
+
+    from hermes_cli import plugins
+
+    return plugins.has_hook(hook_name)
+
+
+def finalize_session(**kwargs: Any) -> List[Any]:
+    """Notify observers and hard-close one core-owned Relay conversation."""
+    try:
+        from hermes_cli.observability import observe_lifecycle
+
+        observe_lifecycle("on_session_finalize", **kwargs)
+
+########## model_tools.py (lines 1045-1094 — _emit_post_tool_call_hook (emitter; self-gates on has_hook)) ##########
+
+def _emit_post_tool_call_hook(
+    *,
+    function_name: str,
+    function_args: Dict[str, Any],
+    result: Any,
+    task_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+    tool_call_id: Optional[str] = None,
+    turn_id: Optional[str] = None,
+    api_request_id: Optional[str] = None,
+    duration_ms: int = 0,
+    status: Optional[str] = None,
+    error_type: Optional[str] = None,
+    error_message: Optional[str] = None,
+    middleware_trace: Optional[List[Dict[str, Any]]] = None,
+) -> None:
+    """Emit the ``post_tool_call`` observer hook.
+
+    No-ops cheaply when no plugin has registered for ``post_tool_call`` —
+    the ``has_hook`` gate skips both the result-field derivation and the
+    payload dispatch so the no-listener path costs one dict lookup.  When
+    ``status`` is not supplied, the ok/error fields are derived from the
+    result *after* the gate (parsing the result is only worth it when a
+    listener will actually consume it).
+    """
+    try:
+        from hermes_cli.lifecycle import has_hook, invoke_hook
+        if not has_hook("post_tool_call"):
+            return
+        if status is None:
+            status, error_type, error_message = _tool_result_observer_fields(result)
+        invoke_hook(
+            "post_tool_call",
+            tool_name=function_name,
+            args=function_args,
+            result=result,
+            task_id=task_id or "",
+            session_id=session_id or "",
+            tool_call_id=tool_call_id or "",
+            turn_id=turn_id or "",
+            api_request_id=api_request_id or "",
+            duration_ms=duration_ms,
+            status=status,
+            error_type=error_type,
+            error_message=error_message,
+            middleware_trace=list(middleware_trace or []),
+        )
+    except Exception as _hook_err:
+        logger.debug("post_tool_call hook error: %s", _hook_err)
+
+
+########## run_agent.py (lines 2810-2840 — api_request_error emit site) ##########
+
+        error_message: str,
+        status_code: Optional[int] = None,
+        retry_count: Optional[int] = None,
+        max_retries: Optional[int] = None,
+        retryable: Optional[bool] = None,
+        reason: Optional[str] = None,
+    ) -> None:
+        # Lazy module import (not from-import) so tests can replace lifecycle
+        # dispatch at this call site. After first call the import is a
+        # ``sys.modules`` dict lookup, so retries don't repay any real cost.
+        try:
+            from hermes_cli import lifecycle as _lifecycle
+
+            if not _lifecycle.has_hook("api_request_error"):
+                return
+            ended_at = time.time()
+            _lifecycle.invoke_hook(
+                "api_request_error",
+                task_id=task_id,
+                turn_id=turn_id,
+                api_request_id=api_request_id,
+                session_id=self.session_id or "",
+                platform=self.platform or "",
+                model=self.model,
+                provider=self.provider,
+                base_url=self.base_url,
+                api_mode=self.api_mode,
+                api_call_count=api_call_count,
+                api_duration=ended_at - api_start_time,
+                started_at=api_start_time,
+                ended_at=ended_at,
+
+########## agent/turn_context.py (lines 1050-1067 — pre_llm_call emit site (window-open)) ##########
+
+    # Plugin hook: pre_llm_call (context injected into user message, not system prompt).
+    plugin_user_context = ""
+    try:
+        from hermes_cli.lifecycle import invoke_hook as _invoke_hook
+        _pre_results = _invoke_hook(
+            "pre_llm_call",
+            session_id=agent.session_id,
+            task_id=effective_task_id,
+            turn_id=turn_id,
+            user_message=original_user_message,
+            conversation_history=list(messages),
+            is_first_turn=(not bool(conversation_history)),
+            model=agent.model,
+            platform=getattr(agent, "platform", None) or "",
+            parent_session_id=getattr(agent, "_parent_session_id", None) or "",
+            sender_id=getattr(agent, "_user_id", None) or "",
+        )
+        _ctx_parts: list[str] = []
+
+########## tests/conftest.py (lines 443-470 — suite-wide observer disable/reset guard) ##########
+
+    # 3b. hermes_state computes ``DEFAULT_DB_PATH = get_hermes_home() / "state.db"``
+    #     at import time. When the module is first imported at collection (any
+    #     test file with a top-level ``from hermes_state import ...``) that
+    #     happens BEFORE this fixture ever runs, so every argless
+    #     ``SessionDB()`` in every test opens the developer's REAL state.db —
+    #     reading real sessions into assertions and writing test rows into the
+    #     real profile. Re-pin the constant to this test's home. (Several test
+    #     files already do this locally; this makes it an invariant.)
+    hermes_state_mod = sys.modules.get("hermes_state")
+    if hermes_state_mod is not None and hasattr(hermes_state_mod, "DEFAULT_DB_PATH"):
+        monkeypatch.setattr(
+            hermes_state_mod, "DEFAULT_DB_PATH", fake_hermes_home / "state.db"
+        )
+
+    # 3c. The salience observer is default-ON in the product (Stage-2 producer),
+    #     but must be INERT across the suite unless a test opts in: reset its
+    #     module-global window/bus registries per test (no cross-test leakage)
+    #     and disable its gate by default. Its own tests re-enable it explicitly.
+    #     The import is _IMPORT_OK-guarded, so this can never fail even if the
+    #     vendored salienceos package is broken.
+    from hermes_cli.observability import salience_observer as _salience_observer
+
+    _salience_observer._reset_for_tests()
+    monkeypatch.setattr(
+        _salience_observer, "salience_enabled", lambda: False, raising=False
+    )
+
+    # 4. Deterministic locale / timezone / hashseed. CI runs in UTC with

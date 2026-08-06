@@ -1,0 +1,8 @@
+pass=coding  models=['qwen/qwen3-coder-plus', 'kwaipilot/kat-coder-pro-v2.5', 'moonshotai/kimi-k2.7-code', 'poolside/laguna-s-2.1', 'x-ai/grok-4.5']
+[ OK ] qwen/qwen3-coder-plus  15.8s  finish=stop  out_tokens=949  chars=4269
+[ OK ] poolside/laguna-s-2.1  28.7s  finish=stop  out_tokens=3009  chars=11737
+[FAIL] kwaipilot/kat-coder-pro-v2.5: empty content (finish=length, keys=['content', 'reasoning', 'refusal', 'role'])
+[ OK ] moonshotai/kimi-k2.7-code  399.5s  finish=length  out_tokens=12000  chars=53405
+[ OK ] x-ai/grok-4.5  472.9s  finish=stop  out_tokens=27004  chars=7920
+
+Done (coding): 4/5 succeeded.
