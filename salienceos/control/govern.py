@@ -20,7 +20,7 @@ that refer to different actions, or any non-VERIFIED verdict, deny clearance.
 """
 
 from salienceos.control.outcome import FULL, INDEPENDENT, NONE, RECEIPT, GovernedOutcome
-from salienceos.interpreter import AdaptationEligibility, Directive
+from salienceos.interpreter import AdaptationEligibility, AdaptationRationale, Directive
 from salienceos.verifier import Reason, Stakes, Status, Verdict, max_stakes
 
 GOVERNOR_VERSION = "governor/0.1.0"
@@ -122,6 +122,16 @@ def _valid_directive(directive) -> bool:
         type(directive) is Directive
         and isinstance(directive.verification_depth, int)
         and not isinstance(directive.verification_depth, bool)
+        # The rationale rides through to the consumer gates (self-describing
+        # outcome), so the seam validates it at the boundary: it must be a real
+        # AdaptationRationale AND cohere with eligibility (ELIGIBLE iff
+        # CANDIDATE — interpret() maintains this; a directive that desyncs the
+        # pair is malformed, and a crash downstream is not a deny).
+        and isinstance(directive.adaptation_rationale, AdaptationRationale)
+        and (
+            (directive.adaptation_rationale is AdaptationRationale.ELIGIBLE)
+            == (directive.adaptation_eligibility is AdaptationEligibility.CANDIDATE)
+        )
     )
 
 

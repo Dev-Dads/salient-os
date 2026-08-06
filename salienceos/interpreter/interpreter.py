@@ -108,14 +108,15 @@ def interpret(policy, signals, policy_key: bytes) -> Directive:
     # the eligibility PREDICATE is unchanged — only the recorded reason is
     # refined (a behavior-preserving refactor, pinned by tests).
     adaptation = AdaptationEligibility.NONE
-    risk_val = agg.get(Facet.RISK, 1.0)  # unknown risk (absent) => 1.0 => blocked
+    # `risk` (from the verification block above) is agg.get(RISK, 1.0):
+    # unknown risk (absent) => 1.0 => blocked.
     if not policy.allow_adaptation:
         rationale = AdaptationRationale.POLICY_DISALLOWED
     elif not agg.get(Facet.ADAPTATION, 0.0) > 0.0:
         rationale = AdaptationRationale.NOT_REQUESTED
     elif v_depth < policy.adaptation_min_verification:
         rationale = AdaptationRationale.UNDER_VERIFIED
-    elif risk_val > policy.adaptation_max_risk:
+    elif risk > policy.adaptation_max_risk:
         # An ASSERTED over-cap risk is an incident (inhibitor hand-off trigger,
         # consumed downstream); an ABSENT risk signal is mere ignorance and is
         # recorded as such — blocked, but never an inhibitor.

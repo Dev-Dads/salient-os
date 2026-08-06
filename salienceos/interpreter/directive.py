@@ -24,10 +24,11 @@ class AdaptationRationale(enum.Enum):
     re-deriving it from raw salience (Finding D).
 
     RISK_EXCEEDED requires an ASSERTED risk signal over the policy cap and is
-    the only inhibitor hand-off trigger; RISK_UNKNOWN (no risk signal at all)
-    blocks eligibility but is deliberately NOT a trigger — ignorance is not an
-    incident, and pinning unattributed content forever would pollute the
-    inhibitor tier."""
+    the only inhibitor hand-off trigger; RISK_UNKNOWN (no INFORMATIVE risk
+    signal — absent entirely, or present only at zero confidence, which the
+    aggregator omits) blocks eligibility but is deliberately NOT a trigger —
+    ignorance is not an incident, and pinning unattributed content forever
+    would pollute the inhibitor tier."""
 
     ELIGIBLE = "eligible"                    # iff eligibility is CANDIDATE
     POLICY_DISALLOWED = "policy_disallowed"  # allow_adaptation False, or untrusted policy

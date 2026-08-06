@@ -192,6 +192,23 @@ class AdaptationRationaleRecord(unittest.TestCase):
         d = interpret(policy(allow_adapt=False), [], KEY)
         self.assertIs(d.adaptation_rationale, AdaptationRationale.POLICY_DISALLOWED)
 
+    def test_under_verified_wins_over_an_over_cap_risk(self):
+        # BOTH the verification clause and the risk clause fail (RISK 0.5 gives
+        # depth 2 < adapt_min_v=3 AND 0.5 > cap 0.4). The chain must record
+        # UNDER_VERIFIED — a reorder that records RISK_EXCEEDED here would
+        # MANUFACTURE an inhibitor for a merely under-verified request.
+        sigs = self._sigs([("evo", Facet.ADAPTATION, 1.0), ("risk", Facet.RISK, 0.5)])
+        d = interpret(policy(adapt_min_v=3), sigs, KEY)
+        self.assertLess(d.verification_depth, 3)
+        self.assertIs(d.adaptation_rationale, AdaptationRationale.UNDER_VERIFIED)
+
+    def test_not_requested_wins_over_an_over_cap_risk(self):
+        # High risk, nothing requested: NOT_REQUESTED, never RISK_EXCEEDED —
+        # "no request" must not become an incident (the worst manufacture).
+        sigs = self._sigs([("risk", Facet.RISK, 0.9), ("v", Facet.VERIFICATION, 1.0)])
+        d = interpret(policy(), sigs, KEY)
+        self.assertIs(d.adaptation_rationale, AdaptationRationale.NOT_REQUESTED)
+
     def test_max_risk_one_with_absent_risk_stays_eligible(self):
         # Behavior-preservation edge of the refactor: absent risk aggregates to
         # 1.0 and `1.0 > 1.0` is False, so with cap 1.0 the original predicate

@@ -93,9 +93,21 @@ class DirectiveReader(unittest.TestCase):
         return bus
 
     def test_reads_filter_by_subject_oldest_first(self):
-        bus = self._bus_with_two_subjects()
+        # The two req-1 directives carry DIFFERENT budgets, so the order is
+        # actually observable (identical payloads could not pin "oldest
+        # first" — a reversed reader would pass).
+        bus = SalienceBus()
+        budgets = []
+        for subject, infl in (("req-1", 0.2), ("req-2", 0.5), ("req-1", 0.9)):
+            pol = issue_policy("pol-1", subject, (), 10, 1000, 0, 3,
+                               "semantic", False, 2, 0.4, False, KEY)
+            d = interpret(pol, [sig(subject, Facet.ATTENTION, infl)], KEY)
+            bus.emit(d)
+            if subject == "req-1":
+                budgets.append(d.compute_budget)
+        self.assertNotEqual(budgets[0], budgets[1])
         got = bus.directives_for("req-1")
-        self.assertEqual(len(got), 2)
+        self.assertEqual([p["compute_budget"] for p in got], budgets)
         self.assertTrue(all(p["subject"] == "req-1" for p in got))
         self.assertEqual(len(bus.directives_for("req-2")), 1)
         self.assertEqual(bus.directives_for("req-none"), ())
@@ -178,6 +190,75 @@ class ReplayOnOpen(unittest.TestCase):
             lines[0] = _json.dumps(e, sort_keys=True) + "\n"
             with open(path, "w", encoding="utf-8") as fh:
                 fh.writelines(lines)
+            with self.assertRaises(ValueError):
+                SalienceBus(path=path)
+
+    def test_spliced_intact_lines_refuse_to_open(self):
+        # Both lines individually hash-correct, but reordered: only the prev
+        # continuity clause can catch this — pinned here so it stays.
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            path = td + "/bus.jsonl"
+            bus = SalienceBus(path=path)
+            bus.publish(sig("req-1", Facet.ATTENTION, 0.5))
+            bus.publish(sig("req-1", Facet.MEMORY, 0.9))
+            with open(path, encoding="utf-8") as fh:
+                lines = fh.readlines()
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.writelines([lines[1], lines[0]])
+            with self.assertRaises(ValueError):
+                SalienceBus(path=path)
+
+    def _crafted_line(self, kind, payload, prev):
+        # Mirror _append's encoding exactly, with a CORRECT hash — these tests
+        # attack the semantic fences, not the digest.
+        import json as _json
+        from salienceos.verifier.signing import digest
+        base = {"kind": kind, "payload": payload, "prev": prev}
+        return _json.dumps({**base, "hash": digest(base)}, sort_keys=True) + "\n", digest(base)
+
+    def test_persisted_invalid_signal_refuses_to_open(self):
+        # A hash-correct line whose signal fails valid_signal (influence 5.0)
+        # must not be served by signals_for on a reopened bus — pin the
+        # re-validation fence in _replay.
+        import tempfile
+        payload = {"subsystem_id": "s", "subject": "req-1", "facet": "attention",
+                   "influence": 5.0, "confidence": 1.0, "provenance": []}
+        line, _ = self._crafted_line("signal", payload, "")
+        with tempfile.TemporaryDirectory() as td:
+            path = td + "/bus.jsonl"
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(line)
+            with self.assertRaises(ValueError):
+                SalienceBus(path=path)
+
+    def test_smuggled_key_refuses_to_open(self):
+        # Unknown top-level keys sit outside the digest base; without the
+        # exact-key-set fence the JSONL would be a smuggling channel through
+        # the audit fence (Finding G).
+        import json as _json
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            path = td + "/bus.jsonl"
+            bus = SalienceBus(path=path)
+            bus.publish(sig("req-1", Facet.ATTENTION, 0.5))
+            with open(path, encoding="utf-8") as fh:
+                e = _json.loads(fh.readline())
+            e["smuggled"] = "x" * 10000  # rides outside the hash
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(_json.dumps(e, sort_keys=True) + "\n")
+            with self.assertRaises(ValueError):
+                SalienceBus(path=path)
+
+    def test_non_dict_payload_refuses_to_open(self):
+        # A hash-correct directive line with a non-dict payload must fail at
+        # the door, not later inside directives_for.
+        import tempfile
+        line, _ = self._crafted_line("directive", "not-a-dict", "")
+        with tempfile.TemporaryDirectory() as td:
+            path = td + "/bus.jsonl"
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(line)
             with self.assertRaises(ValueError):
                 SalienceBus(path=path)
 

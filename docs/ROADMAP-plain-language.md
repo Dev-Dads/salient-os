@@ -29,10 +29,11 @@ more compute, longer memory — never more permission), what actually happened
 (verification against the real world, not the model's say-so), and what the
 system is allowed to learn from (only verified successes; risky material gets
 quarantined as a warning, never learned as a skill).
-**Status: mostly built.** Four of its five stages are done and tested. The fifth
-— the two "obedience" gates that make memory and learning actually follow its
-decisions — is designed, externally red-teamed by a five-model panel, and ready
-to build. This is real kernel work for the OS no matter what else changes.
+**Status: built.** Complete and tested — the final piece, the two "obedience"
+gates that make memory and learning actually follow its decisions, lands with
+the same pull request that carries this document, externally red-teamed at the
+design stage and twice internally reviewed as code. Real kernel work for the OS
+no matter what else changes.
 
 **2. The hands** *(the agent host — quorum-agent, your fork).*
 The part that does things: runs programs, edits files, uses tools, holds
@@ -73,12 +74,12 @@ four; building it first would be building a doorway to an empty room.
 Each stage ends with something you can *see working*, described here in advance.
 No stage requires Sparky.
 
-**Stage 1 — Finish the judgment system.** Build the two obedience gates (memory
-and learning). The proof at the end: a demonstration where the *same* risky,
-important event is **kept** by the memory channel as a permanent warning and
-simultaneously **refused** by the learning channel — the two channels disagreeing
-on purpose, which is the safety property the whole design turns on.
-*This is the already-reviewed plan's first half, unchanged.*
+**Stage 1 — Finish the judgment system. (DONE — this pull request.)** The two
+obedience gates (memory and learning) are built, and the promised proof passes:
+a real end-to-end test where the *same* risky, important event is **kept** by
+the memory channel as a permanent warning and simultaneously **refused** by the
+learning channel — the two channels disagreeing on purpose, which is the safety
+property the whole design turns on.
 
 **Stage 2 — Put it in the test body.** Wire the judgment system into
 quorum-agent so real activity (tool use, errors, approvals) feeds it, and one
@@ -127,9 +128,10 @@ brought to you in plain language when their stage arrives.
 
 ---
 
-## What's being asked of you right now
+## Where this stands
 
-One thing: permission to start **Stage 1** — the two obedience gates. It's the
-part of the already-reviewed plan that is pure OS work, unchanged by everything
-we just clarified. Stage 2 waits until stage 1 is done and lands with its new
-"test rig" label; every later stage waits for its own plain-language plan.
+Stage 1 was approved and is delivered in the pull request that carries this
+document. The next thing you'll be asked to approve is **Stage 2** — wiring the
+judgment system into the test body — which arrives with its own plain-language
+plan and its correct label: test rig, not destination. Every later stage waits
+for its own plan in this same format.

@@ -73,6 +73,15 @@ def nominate(outcome) -> AdaptationDecision:
         )
 
     rationale = d.adaptation_rationale
+    if not isinstance(rationale, AdaptationRationale):
+        # Belt on top of the seam's boundary check (_valid_directive rejects
+        # this upstream): a malformed rationale refuses, never crashes — a
+        # crash is not a deny.
+        return AdaptationDecision(
+            subject=outcome.subject, nominated=False, rationale=None,
+            handoff=None, gate_version=ADAPTATION_GATE_VERSION,
+            reasons=("invalid_rationale",),
+        )
     handoff = None
     if rationale is AdaptationRationale.RISK_EXCEEDED:
         # The recorded incident: asserted over-cap risk. Preserve, don't learn.

@@ -114,9 +114,11 @@ def retain(outcome, now_days, handoff=None) -> MemoryRetention:
     if bound and d.retention_class in RETENTION_ORDER:
         retention_class = d.retention_class
     else:
-        # Unbound, invalid, or out-of-ladder: floor durability, and say so.
+        # Floor durability, and say WHICH failure floored it — the audit token
+        # must not call a bound record "unbound".
         retention_class = RETENTION_ORDER[0]
-        reasons.append("unbound_or_invalid_retention_floored")
+        reasons.append("retention_class_off_ladder_floored" if bound
+                       else "unbound_or_invalid_retention_floored")
 
     inhibitor = handoff is not None
     if inhibitor:
@@ -140,6 +142,11 @@ def effective_weight(retention, now_days, reinforcement_sum=0.0) -> float:
 
     Decay touches only this derived number; the retention record (and any
     event ledger behind it) is never modified.
+
+    The "never above base + reinforcement" bound holds for records `retain()`
+    produced (base_weight 1.0, finite recorded_at_days). A hand-built
+    `MemoryRetention` with fabricated numerics is the caller's problem — the
+    same stance the seam takes on hand-forged verdicts.
     """
     if type(retention) is not MemoryRetention:
         raise TypeError("effective_weight accepts only a MemoryRetention")

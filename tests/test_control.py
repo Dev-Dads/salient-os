@@ -284,6 +284,34 @@ class SelfDescribingOutcome(unittest.TestCase):
             self.assertEqual(o.subject, "")
             self.assertFalse(o.cleared)
 
+    def test_malformed_rationale_is_denied_at_the_boundary(self):
+        # The rationale rides through to the consumer gates, so the seam
+        # validates it: a non-AdaptationRationale value is a malformed
+        # directive and must DENY (a crash downstream is not a deny).
+        # (Injected via __dict__, not the factory — the factory coherently
+        # defaults a None rationale, which is exactly what we must bypass.)
+        good = directive()
+        for bad in (None, "risk_exceeded", 3):
+            d = Directive(**{**good.__dict__, "adaptation_rationale": bad})
+            o = decide(d, VERIFIED_TWO)
+            self.assertFalse(o.cleared)
+            self.assertIsNone(o.directive)
+            self.assertEqual(o.subject, "")
+
+    def test_desynced_rationale_eligibility_pair_is_denied(self):
+        # ELIGIBLE iff CANDIDATE — interpret() maintains the pair; a directive
+        # that desyncs it is malformed (no free parameters to desync).
+        incoherent = [
+            directive(elig=AdaptationEligibility.CANDIDATE,
+                      rationale=AdaptationRationale.RISK_EXCEEDED),
+            directive(elig=AdaptationEligibility.NONE,
+                      rationale=AdaptationRationale.ELIGIBLE),
+        ]
+        for d in incoherent:
+            o = decide(d, VERIFIED_TWO)
+            self.assertFalse(o.cleared)
+            self.assertIsNone(o.directive)
+
 
 if __name__ == "__main__":
     unittest.main()

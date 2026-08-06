@@ -131,6 +131,19 @@ class NominationPredicate(unittest.TestCase):
             self.assertEqual(dec.subject, "")
             self.assertIn("invalid_or_unbound_outcome", dec.reasons)
 
+    def test_malformed_rationale_refuses_never_crashes(self):
+        # The seam's boundary check denies this upstream; the gate keeps a
+        # belt for hand-built outcomes: refuse with a record, never raise.
+        good = allowed_outcome()
+        bad_d = type(good.directive)(**{**good.directive.__dict__,
+                                        "adaptation_rationale": None})
+        forged = type(good)(**{**good.__dict__, "directive": bad_d,
+                               "adaptation_allowed": False})
+        dec = nominate(forged)
+        self.assertFalse(dec.nominated)
+        self.assertIsNone(dec.handoff)
+        self.assertIn("invalid_rationale", dec.reasons)
+
 
 class RiskRejectHandoff(unittest.TestCase):
     def test_risk_exceeded_originates_the_handoff(self):
@@ -146,6 +159,20 @@ class RiskRejectHandoff(unittest.TestCase):
         self.assertFalse(dec.nominated)
         self.assertIsNone(dec.handoff)  # ignorance never pins an inhibitor
         self.assertIn("risk_unknown", dec.reasons)
+
+    def test_bound_denials_carry_their_recorded_reason_and_no_handoff(self):
+        # The non-incident denials — including POLICY_DISALLOWED, the only
+        # rationale a host with allow_adaptation=False ever produces: refusal
+        # record with the recorded code, and never an inhibitor.
+        for rationale in (AdaptationRationale.POLICY_DISALLOWED,
+                          AdaptationRationale.NOT_REQUESTED,
+                          AdaptationRationale.UNDER_VERIFIED):
+            o = decide(directive(depth=FULL, rationale=rationale),
+                       verdict(Status.VERIFIED, effective_stakes=Stakes.HIGH))
+            dec = nominate(o)
+            self.assertFalse(dec.nominated)
+            self.assertIsNone(dec.handoff)
+            self.assertEqual(dec.reasons, (rationale.value,))
 
 
 class ConsumeSeam(unittest.TestCase):
@@ -190,10 +217,13 @@ class RetentionRecord(unittest.TestCase):
             self.assertIn("unbound_or_invalid_retention_floored", ret.reasons)
 
     def test_out_of_ladder_class_floors_with_reason(self):
+        # A BOUND record with a bad class gets its own token — the audit
+        # trail must not call it "unbound".
         o = decide(directive(retention="exotic-tier"), verdict())
         ret = retain(o, NOW)
         self.assertEqual(ret.retention_class, "ephemeral")
-        self.assertIn("unbound_or_invalid_retention_floored", ret.reasons)
+        self.assertIn("retention_class_off_ladder_floored", ret.reasons)
+        self.assertNotIn("unbound_or_invalid_retention_floored", ret.reasons)
 
     def test_record_stamps_injected_clock(self):
         ret = retain(allowed_outcome(), 42.5)
