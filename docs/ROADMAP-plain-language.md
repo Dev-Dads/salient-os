@@ -16,6 +16,11 @@ Linux, the same way Ubuntu and Red Hat are adapted Linux. On top, it's yours.
 
 Built for you first; built so it *could* be for everyone if it works.
 
+**The one-line version — a machine that safely grows alongside you.** Not a tool you
+operate, not a servant that waits on you: a system that learns what matters to *you*,
+extends its own reach over time, and keeps every step of that growth governed enough to
+trust. "Grows alongside you" is the promise; "safely" is the entire architecture.
+
 ---
 
 ## What a machine like that is made of
@@ -94,15 +99,55 @@ moment, in miniature: a virtual machine (or any spare box) that boots to a
 minimal screen where the whole stack — a small resident model, the hands, the
 judgment system — comes up by itself and talks to you. Ugly, small, and real.
 The proof: a cold boot, no keyboard intervention, ending in a working session.
+*Reference point for this stage: **Fable-OS** (github.com/robiot/fable-os) — the
+bare-kernel project that inspired this one. It proves an agent really can boot a
+machine and run it from a sentence, so it's a north star for the "front door" and a
+useful boot-harness reference. It's also our foil: it hands the model the keys
+("everything runs in Ring 0, and the agent has access to everything"), which is the
+exact thing our judgment system exists to forbid — so it's a contrast and a demo
+target, not a source of code (and by its own record it has only ever run in a VM,
+never on real metal).*
 
 **Stage 4 — Move onto real metal.** When Sparky (or a sibling machine) is free:
 same system, serious model, real performance numbers — including the review's
 open question of what the hardware can genuinely sustain. The proof: Sparky
-boots into SalienceOS instead of DGX Linux, and it's *usable*.
+boots into SalienceOS instead of DGX Linux, and it's *usable*. **This is also where
+the system first grows _itself_ on real hardware** — the Fable-style feat of noticing a
+missing driver, writing it, and using it, but done the governed way (see "growing,
+safely," below).
 
 **Stage 5 — Make it installable.** Only if stages 3–4 prove out, and only if
 "everyone-if-it-works" still feels right: turn the hand-built system into an
 installable image someone else could put on their machine.
+
+---
+
+## The thread through all of it: growing, safely
+
+Two kinds of growth run through every stage, and the second is the one most systems get
+dangerously wrong.
+
+It grows *with* you — learning what you care about, what counts as important, how you
+work. That's the salience-and-memory machinery already being built.
+
+And eventually it grows *itself* — noticing a gap in what it can do and closing it. The
+vivid version is Fable-OS's demo: no sound driver, so it found the hardware, wrote the
+driver, and played a sound. That capability is real. What Fable left out is the only
+thing that makes it safe to *own* — and it's exactly what this system leads with:
+
+- A self-made fix is a **high-stakes action**, so it is *verified against the real world*,
+  not taken on the model's word.
+- The system may **keep and learn from** only a fix that genuinely worked; a risky or
+  unproven one is quarantined as a standing warning, never absorbed as a skill.
+- Noticing a gap earns the *scrutiny and compute to attempt* a fix — never the *authority
+  to install* it. That stays with policy. (The core rule, again: importance buys effort,
+  never permission.)
+
+So here "autonomous" means the machine can *propose a proven improvement on its own*,
+while the choice to actually apply it stays governed. Fully unattended self-application is
+the far end of the road — reached only by a deliberate policy decision once trust is
+earned, never grabbed automatically. **Parked as a later-phase destination on purpose;
+this is the intent, recorded, so we build toward it rather than stumble into it.**
 
 ---
 
@@ -125,6 +170,15 @@ brought to you in plain language when their stage arrives.
 5. **The name on the door** (any time): whether the assembled system carries
    the SalienceOS name from stage 3 onward, and what happens to the separate
    repo identities. Cosmetic technically; not cosmetic for a product.
+6. **The character** (stage 3, and growing): what personality the system has — its tone,
+   how much it volunteers versus waits, how it pushes back when you're about to do
+   something risky. Because it *grows alongside you*, this splits in two: traits that are
+   **fixed forever** because they *are* the governance (honesty, verifying before trusting,
+   keeping its warnings even when unwelcome, never faking a result), and traits that
+   **adapt to you** over time (how talkative, how proactive, how formal). The rule mirrors
+   the whole system: personality may shape *how* things are said, never *how much* they're
+   trusted — a warm voice must never make an unproven claim feel certain or talk you into
+   granting authority. **Personality is influence, not authority.**
 
 ---
 
