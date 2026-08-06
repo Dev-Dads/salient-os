@@ -20,7 +20,7 @@ Fail-closed defaults (safe = cautious):
     when uninformed), ephemeral retention, between-turn reconfiguration.
 """
 
-from salienceos.interpreter.directive import Directive, Reconfigure
+from salienceos.interpreter.directive import AdaptationRationale, Directive, Reconfigure
 from salienceos.interpreter.policy import (
     RETENTION_ORDER,
     AdaptationEligibility,
@@ -104,14 +104,27 @@ def interpret(policy, signals, policy_key: bytes) -> Directive:
 
     # Adaptation eligibility: gated by policy switch + applied verification + risk.
     # Salience alone can NEVER make it eligible; it never exceeds CANDIDATE.
+    # The priority chain mirrors the original conjunction's condition order, so
+    # the eligibility PREDICATE is unchanged — only the recorded reason is
+    # refined (a behavior-preserving refactor, pinned by tests).
     adaptation = AdaptationEligibility.NONE
-    if (
-        policy.allow_adaptation
-        and agg.get(Facet.ADAPTATION, 0.0) > 0.0
-        and v_depth >= policy.adaptation_min_verification
-        and agg.get(Facet.RISK, 1.0) <= policy.adaptation_max_risk  # unknown risk (absent) => blocked
-    ):
+    # `risk` (from the verification block above) is agg.get(RISK, 1.0):
+    # unknown risk (absent) => 1.0 => blocked.
+    if not policy.allow_adaptation:
+        rationale = AdaptationRationale.POLICY_DISALLOWED
+    elif not agg.get(Facet.ADAPTATION, 0.0) > 0.0:
+        rationale = AdaptationRationale.NOT_REQUESTED
+    elif v_depth < policy.adaptation_min_verification:
+        rationale = AdaptationRationale.UNDER_VERIFIED
+    elif risk > policy.adaptation_max_risk:
+        # An ASSERTED over-cap risk is an incident (inhibitor hand-off trigger,
+        # consumed downstream); an ABSENT risk signal is mere ignorance and is
+        # recorded as such — blocked, but never an inhibitor.
+        rationale = (AdaptationRationale.RISK_EXCEEDED if Facet.RISK in agg
+                     else AdaptationRationale.RISK_UNKNOWN)
+    else:
         adaptation = AdaptationEligibility.CANDIDATE
+        rationale = AdaptationRationale.ELIGIBLE
 
     # Reconfiguration timing: between-turn by default (Finding F).
     reconfigure = Reconfigure.BETWEEN_TURN
@@ -129,6 +142,7 @@ def interpret(policy, signals, policy_key: bytes) -> Directive:
         retention_class=retention,
         routing_hint=routing_hint,
         adaptation_eligibility=adaptation,
+        adaptation_rationale=rationale,
         allowed_capabilities=tuple(policy.granted_capabilities),  # pass-through ONLY
         reconfigure=reconfigure,
         interpreter_version=INTERPRETER_VERSION,
@@ -152,6 +166,9 @@ def _hard_deny(policy, reasons) -> Directive:
         retention_class=RETENTION_ORDER[0],
         routing_hint="",
         adaptation_eligibility=AdaptationEligibility.NONE,
+        # No trustworthy policy IS "policy does not allow" (reasons already
+        # carry policy_unsigned_or_invalid alongside).
+        adaptation_rationale=AdaptationRationale.POLICY_DISALLOWED,
         allowed_capabilities=(),
         reconfigure=Reconfigure.BETWEEN_TURN,
         interpreter_version=INTERPRETER_VERSION,

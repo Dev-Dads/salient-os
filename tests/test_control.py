@@ -20,14 +20,27 @@ from salienceos.control import (
     stakes_for,
 )
 from salienceos.control.govern import govern
-from salienceos.interpreter import AdaptationEligibility, Directive, Reconfigure
+from salienceos.interpreter import (
+    AdaptationEligibility,
+    AdaptationRationale,
+    Directive,
+    Reconfigure,
+)
 from salienceos.verifier import STAKES_ORDER, Reason, Stakes, Status, Verdict, max_stakes
 
 
-def directive(subject="act-1", depth=INDEPENDENT, elig=AdaptationEligibility.NONE):
+def directive(subject="act-1", depth=INDEPENDENT, elig=AdaptationEligibility.NONE,
+              rationale=None):
+    # Default rationale coheres with eligibility (CANDIDATE <=> ELIGIBLE); tests
+    # that need a specific denial reason pass it explicitly.
+    if rationale is None:
+        rationale = (AdaptationRationale.ELIGIBLE
+                     if elig is AdaptationEligibility.CANDIDATE
+                     else AdaptationRationale.NOT_REQUESTED)
     return Directive(
         subject=subject, policy_id="p", compute_budget=100, verification_depth=depth,
         retention_class="working", routing_hint="", adaptation_eligibility=elig,
+        adaptation_rationale=rationale,
         allowed_capabilities=(), reconfigure=Reconfigure.BETWEEN_TURN,
         interpreter_version="test", reasons=(),
     )
@@ -238,6 +251,103 @@ class AdaptationSealedGate(unittest.TestCase):
     def test_failed_blocks_adaptation(self):
         o = decide(directive(depth=NONE, elig=AdaptationEligibility.CANDIDATE), FAILED)
         self.assertFalse(o.adaptation_allowed)
+
+
+class SelfDescribingOutcome(unittest.TestCase):
+    """decide() stamps the bound directive + subject onto the outcome (the
+    Verdict-stamping precedent one level up) and WITHHOLDS both on every
+    unbound or invalid path — consumers key on `outcome.subject` and must
+    never re-check binding themselves."""
+
+    def test_bound_outcome_carries_the_identical_directive(self):
+        d = directive(subject="act-1")
+        o = decide(d, VERIFIED_TWO)
+        self.assertEqual(o.subject, "act-1")
+        # assertIs, not assertEqual: reverting the stamp to a default or a
+        # copy must red this line.
+        self.assertIs(o.directive, d)
+
+    def test_unbound_outcome_withholds_directive_and_subject(self):
+        o = decide(directive(subject="act-OTHER"), VERIFIED_TWO)
+        self.assertFalse(o.cleared)
+        self.assertIsNone(o.directive)
+        self.assertEqual(o.subject, "")
+
+    def test_blank_subject_directive_is_unbound(self):
+        o = decide(directive(subject=""), VERIFIED_TWO)
+        self.assertIsNone(o.directive)
+        self.assertEqual(o.subject, "")
+
+    def test_invalid_inputs_withhold(self):
+        for o in (decide(None, VERIFIED_TWO), decide(directive(), "not-a-verdict")):
+            self.assertIsNone(o.directive)
+            self.assertEqual(o.subject, "")
+            self.assertFalse(o.cleared)
+
+    def test_malformed_rationale_is_denied_at_the_boundary(self):
+        # The rationale rides through to the consumer gates, so the seam
+        # validates it: a non-AdaptationRationale value is a malformed
+        # directive and must DENY (a crash downstream is not a deny).
+        # (Injected via __dict__, not the factory — the factory coherently
+        # defaults a None rationale, which is exactly what we must bypass.)
+        good = directive()
+        for bad in (None, "risk_exceeded", 3):
+            d = Directive(**{**good.__dict__, "adaptation_rationale": bad})
+            o = decide(d, VERIFIED_TWO)
+            self.assertFalse(o.cleared)
+            self.assertIsNone(o.directive)
+            self.assertEqual(o.subject, "")
+
+    def test_non_string_subject_cannot_bind(self):
+        # The binding key is attacker-supplied and drives an == against the
+        # verdict's envelope_id. A non-str subject (always-equal object, or one
+        # whose __bool__/__eq__ raises) must NOT bind to a verdict for another
+        # action, and must never crash the gate (a crash is not a deny).
+        class AlwaysEq:
+            def __eq__(self, other):
+                return True
+            def __bool__(self):
+                return True
+
+        class Raises:
+            def __eq__(self, other):
+                raise RuntimeError("boom")
+            def __bool__(self):
+                raise RuntimeError("boom")
+
+        good = directive(subject="act-1")
+        v_other = verdict(Status.VERIFIED, envelope_id="act-innocent",
+                          effective_stakes=Stakes.HIGH)
+        for bad in (AlwaysEq(), Raises(), 3, b"act-1"):
+            d = Directive(**{**good.__dict__, "subject": bad})
+            o = decide(d, v_other)
+            self.assertFalse(o.cleared)
+            self.assertFalse(o.adaptation_allowed)
+            self.assertIsNone(o.directive)
+            self.assertEqual(o.subject, "")
+
+    def test_malformed_eligibility_is_denied_at_the_boundary(self):
+        # Both halves of the pair are validated symmetrically: a non-enum
+        # eligibility is a malformed directive, denied the same way.
+        good = directive()
+        d = Directive(**{**good.__dict__, "adaptation_eligibility": "candidate"})
+        o = decide(d, VERIFIED_TWO)
+        self.assertFalse(o.cleared)
+        self.assertIsNone(o.directive)
+
+    def test_desynced_rationale_eligibility_pair_is_denied(self):
+        # ELIGIBLE iff CANDIDATE — interpret() maintains the pair; a directive
+        # that desyncs it is malformed (no free parameters to desync).
+        incoherent = [
+            directive(elig=AdaptationEligibility.CANDIDATE,
+                      rationale=AdaptationRationale.RISK_EXCEEDED),
+            directive(elig=AdaptationEligibility.NONE,
+                      rationale=AdaptationRationale.ELIGIBLE),
+        ]
+        for d in incoherent:
+            o = decide(d, VERIFIED_TWO)
+            self.assertFalse(o.cleared)
+            self.assertIsNone(o.directive)
 
 
 if __name__ == "__main__":

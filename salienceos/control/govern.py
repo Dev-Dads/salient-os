@@ -20,7 +20,7 @@ that refer to different actions, or any non-VERIFIED verdict, deny clearance.
 """
 
 from salienceos.control.outcome import FULL, INDEPENDENT, NONE, RECEIPT, GovernedOutcome
-from salienceos.interpreter import AdaptationEligibility, Directive
+from salienceos.interpreter import AdaptationEligibility, AdaptationRationale, Directive
 from salienceos.verifier import Reason, Stakes, Status, Verdict, max_stakes
 
 GOVERNOR_VERSION = "governor/0.1.0"
@@ -120,8 +120,26 @@ def _denied(reasons, verdict=None) -> GovernedOutcome:
 def _valid_directive(directive) -> bool:
     return (
         type(directive) is Directive
+        # `subject` is the binding key: `bound` tests `directive.subject ==
+        # verdict.envelope_id`, an operator that dispatches to this
+        # attacker-supplied operand. A non-str subject (e.g. an always-equal
+        # object, or one whose __bool__/__eq__ raises) could bind to a verdict
+        # for a DIFFERENT action, or crash the gate — a crash is not a deny.
+        # Matches the emit-side fence, which already requires a bounded str.
+        and isinstance(directive.subject, str)
         and isinstance(directive.verification_depth, int)
         and not isinstance(directive.verification_depth, bool)
+        # The rationale rides through to the consumer gates (self-describing
+        # outcome), so the seam validates it at the boundary: it must be a real
+        # AdaptationRationale AND cohere with eligibility (ELIGIBLE iff
+        # CANDIDATE — interpret() maintains this; a directive that desyncs the
+        # pair is malformed, and a crash downstream is not a deny).
+        and isinstance(directive.adaptation_eligibility, AdaptationEligibility)
+        and isinstance(directive.adaptation_rationale, AdaptationRationale)
+        and (
+            (directive.adaptation_rationale is AdaptationRationale.ELIGIBLE)
+            == (directive.adaptation_eligibility is AdaptationEligibility.CANDIDATE)
+        )
     )
 
 
@@ -186,6 +204,11 @@ def decide(directive, verdict) -> GovernedOutcome:
         cleared=cleared,
         adaptation_allowed=adaptation_allowed,
         reasons=tuple(reasons),
+        # Self-description, stamped ONLY when bound: an unbound directive's
+        # identity is withheld from the outcome (the _hard_deny precedent), so
+        # no consumer can act on a directive that governed a different action.
+        directive=directive if bound else None,
+        subject=directive.subject if bound else "",
     )
 
 
