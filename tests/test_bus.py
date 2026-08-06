@@ -262,6 +262,77 @@ class ReplayOnOpen(unittest.TestCase):
             with self.assertRaises(ValueError):
                 SalienceBus(path=path)
 
+    def _directive_payload(self, **overrides):
+        p = {"subject": "req-1", "policy_id": "p", "compute_budget": 10,
+             "verification_depth": 3, "retention_class": "ephemeral",
+             "routing_hint": "", "adaptation_eligibility": "none",
+             "adaptation_rationale": "policy_disallowed",
+             "allowed_capabilities": [], "reconfigure": "between_turn",
+             "interpreter_version": "x", "reasons": []}
+        p.update(overrides)
+        return p
+
+    def _open_with_directive_payload(self, payload):
+        import tempfile
+        line, _ = self._crafted_line("directive", payload, "")
+        with tempfile.TemporaryDirectory() as td:
+            path = td + "/bus.jsonl"
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(line)
+            return SalienceBus(path=path)
+
+    def test_directive_payload_fence_on_replay(self):
+        # The DIRECTIVE half of the audit fence: hash-correct lines whose
+        # payload smuggles content (prompt-sized values, or keys INSIDE the
+        # payload where the top-level key-set fence cannot see them) refuse
+        # to open. Nothing prompt-sized can become durable through either
+        # entry kind.
+        good = self._directive_payload()
+        self.assertTrue(self._open_with_directive_payload(good).verify_chain())
+        bad_payloads = [
+            self._directive_payload(prompt="H" * 50_000),          # smuggled key
+            self._directive_payload(subject="H" * 50_000),         # oversized field
+            self._directive_payload(reasons=["H" * 50_000]),       # oversized item
+            self._directive_payload(allowed_capabilities=["c"] * 65),  # unbounded list
+            {k: v for k, v in good.items() if k != "subject"},     # missing key
+        ]
+        for payload in bad_payloads:
+            with self.assertRaises(ValueError):
+                self._open_with_directive_payload(payload)
+
+    def test_unknown_entry_kind_refuses_to_open(self):
+        import tempfile
+        line, _ = self._crafted_line("blob", {"x": "y"}, "")
+        with tempfile.TemporaryDirectory() as td:
+            path = td + "/bus.jsonl"
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(line)
+            with self.assertRaises(ValueError):
+                SalienceBus(path=path)
+
+    def test_emit_refuses_prompt_sized_directives(self):
+        # The emit-side fence: a hand-built Directive with prompt-sized
+        # strings must be rejected exactly like an invalid signal.
+        from salienceos.interpreter import (
+            AdaptationEligibility, AdaptationRationale, Directive, Reconfigure,
+        )
+        base = dict(
+            subject="req-1", policy_id="p", compute_budget=10,
+            verification_depth=3, retention_class="ephemeral", routing_hint="",
+            adaptation_eligibility=AdaptationEligibility.NONE,
+            adaptation_rationale=AdaptationRationale.POLICY_DISALLOWED,
+            allowed_capabilities=(), reconfigure=Reconfigure.BETWEEN_TURN,
+            interpreter_version="x", reasons=(),
+        )
+        bus = SalienceBus()
+        bus.emit(Directive(**base))  # the bounded shape is accepted
+        for field, value in (("subject", "H" * 50_000),
+                             ("routing_hint", "H" * 50_000),
+                             ("reasons", ("H" * 50_000,)),
+                             ("allowed_capabilities", ("c",) * 65)):
+            with self.assertRaises(TypeError):
+                bus.emit(Directive(**{**base, field: value}))
+
 
 if __name__ == "__main__":
     unittest.main()

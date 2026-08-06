@@ -127,6 +127,7 @@ def _valid_directive(directive) -> bool:
         # AdaptationRationale AND cohere with eligibility (ELIGIBLE iff
         # CANDIDATE — interpret() maintains this; a directive that desyncs the
         # pair is malformed, and a crash downstream is not a deny).
+        and isinstance(directive.adaptation_eligibility, AdaptationEligibility)
         and isinstance(directive.adaptation_rationale, AdaptationRationale)
         and (
             (directive.adaptation_rationale is AdaptationRationale.ELIGIBLE)

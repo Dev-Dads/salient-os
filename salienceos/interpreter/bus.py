@@ -28,8 +28,65 @@ import os
 from dataclasses import asdict
 
 from salienceos.interpreter.directive import Directive
-from salienceos.interpreter.signal import SalienceSignal, valid_signal
+from salienceos.interpreter.signal import MAX_TOKEN_LEN, SalienceSignal, valid_signal
 from salienceos.verifier.signing import digest
+
+# The directive half of the audit fence (Finding G). Signals are body-free via
+# valid_signal; directive entries are the OTHER durable kind and get the same
+# structural guarantee: every string bounded, every collection bounded, and on
+# replay an exact payload key set — nothing prompt-sized can become durable.
+DIRECTIVE_PAYLOAD_KEYS = frozenset({
+    "subject", "policy_id", "compute_budget", "verification_depth",
+    "retention_class", "routing_hint", "adaptation_eligibility",
+    "adaptation_rationale", "allowed_capabilities", "reconfigure",
+    "interpreter_version", "reasons",
+})
+MAX_DIRECTIVE_REASONS = 32
+MAX_DIRECTIVE_CAPABILITIES = 64
+
+
+def _bounded_str(x) -> bool:
+    return isinstance(x, str) and len(x) <= MAX_TOKEN_LEN
+
+
+def _valid_directive_shape(d) -> bool:
+    """Ref-shaped bounds for the durable directive record — the emit-side
+    fence. Enum fields are checked by emit's own .value access on the real
+    enum types (Directive construction already requires them)."""
+    return (
+        _bounded_str(d.subject) and _bounded_str(d.policy_id)
+        and _bounded_str(d.retention_class) and _bounded_str(d.routing_hint)
+        and _bounded_str(d.interpreter_version)
+        and isinstance(d.compute_budget, int) and not isinstance(d.compute_budget, bool)
+        and isinstance(d.verification_depth, int) and not isinstance(d.verification_depth, bool)
+        and isinstance(d.allowed_capabilities, tuple)
+        and len(d.allowed_capabilities) <= MAX_DIRECTIVE_CAPABILITIES
+        and all(_bounded_str(c) for c in d.allowed_capabilities)
+        and isinstance(d.reasons, tuple)
+        and len(d.reasons) <= MAX_DIRECTIVE_REASONS
+        and all(_bounded_str(r) for r in d.reasons)
+    )
+
+
+def _valid_directive_payload(p) -> bool:
+    """The replay-side fence: exact key set and the same ref-shaped bounds,
+    applied to the parsed dict (enum fields arrive as their .value strings)."""
+    if not isinstance(p, dict) or set(p) != DIRECTIVE_PAYLOAD_KEYS:
+        return False
+    strings = ("subject", "policy_id", "retention_class", "routing_hint",
+               "adaptation_eligibility", "adaptation_rationale", "reconfigure",
+               "interpreter_version")
+    return (
+        all(_bounded_str(p[k]) for k in strings)
+        and isinstance(p["compute_budget"], int) and not isinstance(p["compute_budget"], bool)
+        and isinstance(p["verification_depth"], int) and not isinstance(p["verification_depth"], bool)
+        and isinstance(p["allowed_capabilities"], list)
+        and len(p["allowed_capabilities"]) <= MAX_DIRECTIVE_CAPABILITIES
+        and all(_bounded_str(c) for c in p["allowed_capabilities"])
+        and isinstance(p["reasons"], list)
+        and len(p["reasons"]) <= MAX_DIRECTIVE_REASONS
+        and all(_bounded_str(r) for r in p["reasons"])
+    )
 
 
 class SalienceBus:
@@ -96,8 +153,16 @@ class SalienceBus:
                         f"persisted signal fails validation at line {i + 1}: {path}"
                     )
                 self._signals.append((e["hash"], signal))
-            else:
+            elif e["kind"] == "directive":
+                if not _valid_directive_payload(e["payload"]):
+                    raise ValueError(
+                        f"persisted directive fails the audit fence at line {i + 1}: {path}"
+                    )
                 self._directives.append((e["hash"], e["payload"]))
+            else:
+                raise ValueError(
+                    f"unknown entry kind at line {i + 1}: {path}"
+                )
             self._entries.append(e)
             prev = e["hash"]
         self._head = prev
@@ -110,10 +175,12 @@ class SalienceBus:
 
     def emit(self, directive) -> str:
         """Record a directive decision for a subject (the audit trail). Requires a
-        Directive so malformed entries cannot corrupt the record; note this is a
-        well-formedness check, NOT an authorization check (see module docstring)."""
-        if type(directive) is not Directive:
-            raise TypeError("SalienceBus.emit accepts only a Directive")
+        Directive whose every string is ref-shaped and bounded — the directive
+        half of the audit fence, so nothing prompt-sized can enter the durable
+        record through this kind either. A well-formedness check, NOT an
+        authorization check (see module docstring)."""
+        if type(directive) is not Directive or not _valid_directive_shape(directive):
+            raise TypeError("SalienceBus.emit accepts only a bounded, ref-shaped Directive")
         payload = {
             "subject": directive.subject,
             "policy_id": directive.policy_id,

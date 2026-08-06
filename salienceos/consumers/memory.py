@@ -152,8 +152,11 @@ def effective_weight(retention, now_days, reinforcement_sum=0.0) -> float:
         raise TypeError("effective_weight accepts only a MemoryRetention")
     if not _real_number(now_days) or now_days < 0:
         raise TypeError("now_days must be a finite non-negative number")
-    if not _real_number(reinforcement_sum):
-        raise TypeError("reinforcement_sum must be a finite number")
+    if not _real_number(reinforcement_sum) or reinforcement_sum < 0:
+        # Non-negative by definition: reinforcement is additive support, and a
+        # negative term would be a decay-shaped side door that could null an
+        # inhibitor's pin through the only weight API.
+        raise TypeError("reinforcement_sum must be a finite non-negative number")
 
     if retention.inhibitor:
         return retention.base_weight + reinforcement_sum

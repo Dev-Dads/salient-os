@@ -298,6 +298,15 @@ class SelfDescribingOutcome(unittest.TestCase):
             self.assertIsNone(o.directive)
             self.assertEqual(o.subject, "")
 
+    def test_malformed_eligibility_is_denied_at_the_boundary(self):
+        # Both halves of the pair are validated symmetrically: a non-enum
+        # eligibility is a malformed directive, denied the same way.
+        good = directive()
+        d = Directive(**{**good.__dict__, "adaptation_eligibility": "candidate"})
+        o = decide(d, VERIFIED_TWO)
+        self.assertFalse(o.cleared)
+        self.assertIsNone(o.directive)
+
     def test_desynced_rationale_eligibility_pair_is_denied(self):
         # ELIGIBLE iff CANDIDATE — interpret() maintains the pair; a directive
         # that desyncs it is malformed (no free parameters to desync).

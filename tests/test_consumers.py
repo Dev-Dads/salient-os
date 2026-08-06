@@ -323,6 +323,18 @@ class RaisingGates(unittest.TestCase):
         ret = retain(rr, NOW, handoff=nominate(rr).handoff)
         self.assertTrue(ret.inhibitor)
 
+    def test_no_handoff_means_no_inhibitor_even_for_incident_outcomes(self):
+        # The hand-off is the SOLE trigger: a RISK_EXCEEDED outcome retained
+        # without one does not pin (memory never re-derives the incident from
+        # the rationale — that would collapse the channel boundary).
+        self.assertFalse(retain(risk_reject_outcome(), NOW).inhibitor)
+
+    def test_negative_reinforcement_cannot_null_the_pin(self):
+        rr = risk_reject_outcome()
+        ret = retain(rr, NOW, handoff=nominate(rr).handoff)
+        with self.assertRaises(TypeError):
+            effective_weight(ret, NOW, reinforcement_sum=-1.0)
+
 
 class SchemaPins(unittest.TestCase):
     """Exact-allowlist fences: ANY added field reds these — including a future
