@@ -8,6 +8,7 @@ import unittest
 
 from salienceos.interpreter import (
     AdaptationEligibility,
+    AdaptationRationale,
     Directive,
     Facet,
     Reconfigure,
@@ -132,6 +133,79 @@ class AdaptationGate(unittest.TestCase):
                 sig("v", Facet.VERIFICATION, 1.0)]
         d = interpret(policy(), sigs, KEY)
         self.assertIs(d.adaptation_eligibility, AdaptationEligibility.NONE)
+
+
+class AdaptationRationaleRecord(unittest.TestCase):
+    """The rationale is the decider's machine-readable WHY (Finding D: the
+    weight gate consumes this record instead of re-deriving from raw salience).
+    Each denial branch is pinned by a minimal signal set that fails exactly it;
+    the eligibility PREDICATE itself must be unchanged by the refactor."""
+
+    ELIGIBLE_SIGS = [  # the AdaptationGate fixture that reaches CANDIDATE
+        ("evo", Facet.ADAPTATION, 1.0), ("risk", Facet.RISK, 0.1),
+        ("v", Facet.VERIFICATION, 1.0)]
+
+    def _sigs(self, triples):
+        return [sig(s, f, i) for s, f, i in triples]
+
+    def test_candidate_iff_eligible_both_directions(self):
+        d = interpret(policy(), self._sigs(self.ELIGIBLE_SIGS), KEY)
+        self.assertIs(d.adaptation_eligibility, AdaptationEligibility.CANDIDATE)
+        self.assertIs(d.adaptation_rationale, AdaptationRationale.ELIGIBLE)
+        # And the converse: every non-CANDIDATE carries a non-ELIGIBLE rationale.
+        d2 = interpret(policy(allow_adapt=False), self._sigs(self.ELIGIBLE_SIGS), KEY)
+        self.assertIs(d2.adaptation_eligibility, AdaptationEligibility.NONE)
+        self.assertIsNot(d2.adaptation_rationale, AdaptationRationale.ELIGIBLE)
+
+    def test_policy_disallowed(self):
+        d = interpret(policy(allow_adapt=False), self._sigs(self.ELIGIBLE_SIGS), KEY)
+        self.assertIs(d.adaptation_rationale, AdaptationRationale.POLICY_DISALLOWED)
+
+    def test_not_requested(self):
+        sigs = self._sigs([("risk", Facet.RISK, 0.1), ("v", Facet.VERIFICATION, 1.0)])
+        d = interpret(policy(), sigs, KEY)
+        self.assertIs(d.adaptation_rationale, AdaptationRationale.NOT_REQUESTED)
+
+    def test_under_verified(self):
+        # Low asserted risk keeps depth below adapt_min_v=2 and passes the risk cap,
+        # so the verification clause is the one that fails.
+        sigs = self._sigs([("evo", Facet.ADAPTATION, 1.0), ("risk", Facet.RISK, 0.1)])
+        d = interpret(policy(), sigs, KEY)
+        self.assertLess(d.verification_depth, 2)
+        self.assertIs(d.adaptation_rationale, AdaptationRationale.UNDER_VERIFIED)
+
+    def test_risk_exceeded_vs_risk_unknown(self):
+        # Same policy (cap 0.4): an ASSERTED 0.9 is an incident; an ABSENT risk
+        # is ignorance. Both deny; only the assertion is an inhibitor trigger.
+        asserted = self._sigs([("evo", Facet.ADAPTATION, 1.0),
+                               ("risk", Facet.RISK, 0.9),
+                               ("v", Facet.VERIFICATION, 1.0)])
+        absent = self._sigs([("evo", Facet.ADAPTATION, 1.0),
+                             ("v", Facet.VERIFICATION, 1.0)])
+        self.assertIs(interpret(policy(), asserted, KEY).adaptation_rationale,
+                      AdaptationRationale.RISK_EXCEEDED)
+        self.assertIs(interpret(policy(), absent, KEY).adaptation_rationale,
+                      AdaptationRationale.RISK_UNKNOWN)
+
+    def test_priority_is_deterministic_under_multiple_failures(self):
+        # Policy off AND nothing requested: the chain records the first clause.
+        d = interpret(policy(allow_adapt=False), [], KEY)
+        self.assertIs(d.adaptation_rationale, AdaptationRationale.POLICY_DISALLOWED)
+
+    def test_max_risk_one_with_absent_risk_stays_eligible(self):
+        # Behavior-preservation edge of the refactor: absent risk aggregates to
+        # 1.0 and `1.0 > 1.0` is False, so with cap 1.0 the original predicate
+        # reached CANDIDATE — the chain must too. Goes red if the predicate
+        # changed (e.g. to `>=` or to blocking on absence explicitly).
+        sigs = self._sigs([("evo", Facet.ADAPTATION, 1.0), ("v", Facet.VERIFICATION, 1.0)])
+        d = interpret(policy(adapt_max_risk=1.0), sigs, KEY)
+        self.assertIs(d.adaptation_eligibility, AdaptationEligibility.CANDIDATE)
+        self.assertIs(d.adaptation_rationale, AdaptationRationale.ELIGIBLE)
+
+    def test_hard_deny_stamps_policy_disallowed(self):
+        d = interpret(policy(), [], b"wrong-key")
+        self.assertIs(d.adaptation_rationale, AdaptationRationale.POLICY_DISALLOWED)
+        self.assertIn("policy_unsigned_or_invalid", d.reasons)
 
 
 if __name__ == "__main__":

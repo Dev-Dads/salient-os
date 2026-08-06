@@ -60,6 +60,24 @@ class BusAudit(unittest.TestCase):
         self.assertTrue(isinstance(h, str) and h)
         self.assertEqual(bus.head(), h)
 
+    def test_emit_payload_carries_adaptation_rationale(self):
+        # The durable record must carry the decider's rationale code so a
+        # downstream consumer can act on the recorded reason (Finding D).
+        import json as _json
+        import tempfile
+        pol = issue_policy("pol-1", "req-1", (), 10, 1000, 0, 3,
+                           "semantic", False, 2, 0.4, False, KEY)
+        d = interpret(pol, [], KEY)
+        with tempfile.TemporaryDirectory() as td:
+            path = td + "/bus.jsonl"
+            bus = SalienceBus(path=path)
+            bus.emit(d)
+            with open(path, encoding="utf-8") as fh:
+                entry = _json.loads(fh.readlines()[-1])
+        self.assertEqual(entry["payload"]["adaptation_rationale"],
+                         d.adaptation_rationale.value)
+        self.assertEqual(entry["payload"]["adaptation_rationale"], "policy_disallowed")
+
 
 if __name__ == "__main__":
     unittest.main()

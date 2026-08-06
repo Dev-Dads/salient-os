@@ -17,6 +17,26 @@ class Reconfigure(enum.Enum):
     IMMEDIATE = "immediate"
 
 
+class AdaptationRationale(enum.Enum):
+    """Structured record of WHY the interpreter granted or denied adaptation
+    eligibility (docx §9.3: rationale codes, never prose). Stamped by the
+    decider so a downstream consumer can act on the recorded reason without
+    re-deriving it from raw salience (Finding D).
+
+    RISK_EXCEEDED requires an ASSERTED risk signal over the policy cap and is
+    the only inhibitor hand-off trigger; RISK_UNKNOWN (no risk signal at all)
+    blocks eligibility but is deliberately NOT a trigger — ignorance is not an
+    incident, and pinning unattributed content forever would pollute the
+    inhibitor tier."""
+
+    ELIGIBLE = "eligible"                    # iff eligibility is CANDIDATE
+    POLICY_DISALLOWED = "policy_disallowed"  # allow_adaptation False, or untrusted policy
+    NOT_REQUESTED = "not_requested"          # no positive ADAPTATION salience
+    UNDER_VERIFIED = "under_verified"        # v_depth < adaptation_min_verification
+    RISK_UNKNOWN = "risk_unknown"            # no RISK signal; blocked, NOT an inhibitor trigger
+    RISK_EXCEEDED = "risk_exceeded"          # asserted risk > adaptation_max_risk — inhibitor trigger
+
+
 @dataclass(frozen=True)
 class Directive:
     subject: str
@@ -26,6 +46,7 @@ class Directive:
     retention_class: str
     routing_hint: str                       # advisory only
     adaptation_eligibility: AdaptationEligibility
+    adaptation_rationale: AdaptationRationale  # no default: forgetting it is a construction error
     allowed_capabilities: tuple             # copied from policy; never signal-derived
     reconfigure: Reconfigure
     interpreter_version: str

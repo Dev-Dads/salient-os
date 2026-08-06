@@ -20,14 +20,27 @@ from salienceos.control import (
     stakes_for,
 )
 from salienceos.control.govern import govern
-from salienceos.interpreter import AdaptationEligibility, Directive, Reconfigure
+from salienceos.interpreter import (
+    AdaptationEligibility,
+    AdaptationRationale,
+    Directive,
+    Reconfigure,
+)
 from salienceos.verifier import STAKES_ORDER, Reason, Stakes, Status, Verdict, max_stakes
 
 
-def directive(subject="act-1", depth=INDEPENDENT, elig=AdaptationEligibility.NONE):
+def directive(subject="act-1", depth=INDEPENDENT, elig=AdaptationEligibility.NONE,
+              rationale=None):
+    # Default rationale coheres with eligibility (CANDIDATE <=> ELIGIBLE); tests
+    # that need a specific denial reason pass it explicitly.
+    if rationale is None:
+        rationale = (AdaptationRationale.ELIGIBLE
+                     if elig is AdaptationEligibility.CANDIDATE
+                     else AdaptationRationale.NOT_REQUESTED)
     return Directive(
         subject=subject, policy_id="p", compute_budget=100, verification_depth=depth,
         retention_class="working", routing_hint="", adaptation_eligibility=elig,
+        adaptation_rationale=rationale,
         allowed_capabilities=(), reconfigure=Reconfigure.BETWEEN_TURN,
         interpreter_version="test", reasons=(),
     )

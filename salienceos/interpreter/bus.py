@@ -59,6 +59,7 @@ class SalienceBus:
             "retention_class": directive.retention_class,
             "routing_hint": directive.routing_hint,
             "adaptation_eligibility": directive.adaptation_eligibility.value,
+            "adaptation_rationale": directive.adaptation_rationale.value,
             "allowed_capabilities": list(directive.allowed_capabilities),
             "reconfigure": directive.reconfigure.value,
             "interpreter_version": directive.interpreter_version,

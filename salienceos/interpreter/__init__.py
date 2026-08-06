@@ -21,7 +21,7 @@ from salienceos.interpreter.policy import (
     issue_policy,
     verify_policy,
 )
-from salienceos.interpreter.directive import Directive, Reconfigure
+from salienceos.interpreter.directive import AdaptationRationale, Directive, Reconfigure
 from salienceos.interpreter.interpreter import (
     INTERPRETER_VERSION,
     IMMEDIATE_RECONFIGURE_THRESHOLD,
@@ -40,6 +40,7 @@ __all__ = [
     "VerificationDepth",
     "issue_policy",
     "verify_policy",
+    "AdaptationRationale",
     "Directive",
     "Reconfigure",
     "INTERPRETER_VERSION",
