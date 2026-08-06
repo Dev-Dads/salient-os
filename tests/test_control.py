@@ -253,5 +253,37 @@ class AdaptationSealedGate(unittest.TestCase):
         self.assertFalse(o.adaptation_allowed)
 
 
+class SelfDescribingOutcome(unittest.TestCase):
+    """decide() stamps the bound directive + subject onto the outcome (the
+    Verdict-stamping precedent one level up) and WITHHOLDS both on every
+    unbound or invalid path — consumers key on `outcome.subject` and must
+    never re-check binding themselves."""
+
+    def test_bound_outcome_carries_the_identical_directive(self):
+        d = directive(subject="act-1")
+        o = decide(d, VERIFIED_TWO)
+        self.assertEqual(o.subject, "act-1")
+        # assertIs, not assertEqual: reverting the stamp to a default or a
+        # copy must red this line.
+        self.assertIs(o.directive, d)
+
+    def test_unbound_outcome_withholds_directive_and_subject(self):
+        o = decide(directive(subject="act-OTHER"), VERIFIED_TWO)
+        self.assertFalse(o.cleared)
+        self.assertIsNone(o.directive)
+        self.assertEqual(o.subject, "")
+
+    def test_blank_subject_directive_is_unbound(self):
+        o = decide(directive(subject=""), VERIFIED_TWO)
+        self.assertIsNone(o.directive)
+        self.assertEqual(o.subject, "")
+
+    def test_invalid_inputs_withhold(self):
+        for o in (decide(None, VERIFIED_TWO), decide(directive(), "not-a-verdict")):
+            self.assertIsNone(o.directive)
+            self.assertEqual(o.subject, "")
+            self.assertFalse(o.cleared)
+
+
 if __name__ == "__main__":
     unittest.main()

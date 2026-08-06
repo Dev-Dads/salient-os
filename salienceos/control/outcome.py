@@ -13,7 +13,7 @@ verifier) can confirm the action actually succeeded before anything is learned.
 
 from dataclasses import dataclass, field
 
-from salienceos.interpreter import VerificationDepth
+from salienceos.interpreter import Directive, VerificationDepth
 from salienceos.verifier import Stakes, Verdict
 
 # Re-exported names for the unified scale (aliases of VerificationDepth).
@@ -25,6 +25,14 @@ FULL = int(VerificationDepth.FULL)
 
 @dataclass(frozen=True)
 class GovernedOutcome:
+    """Self-describing (the Verdict-stamping precedent, one level up): decide()
+    stamps the directive it actually decided over — but ONLY when the directive
+    binds to the verdict's action. Unbound or invalid paths withhold both fields
+    (directive=None, subject=""), the same untrusted-identity withhold as
+    `_hard_deny`. Downstream gates therefore take ONE argument and never
+    re-check binding; `subject == ""` is the fail-closed marker every consumer
+    must treat as "act on nothing"."""
+
     verdict: Verdict
     required_level: int          # from the directive (salience-driven, policy-bounded)
     achieved_level: int          # from the verdict (what the world corroborated)
@@ -32,3 +40,5 @@ class GovernedOutcome:
     cleared: bool                # achieved >= required AND not a conclusive failure
     adaptation_allowed: bool     # directive-eligible AND verdict VERIFIED
     reasons: tuple = field(default=())
+    directive: Directive | None = field(default=None)  # the BOUND directive; None when unbound/invalid
+    subject: str = field(default="")                   # bound subject; "" when unbound/denied

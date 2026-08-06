@@ -186,6 +186,11 @@ def decide(directive, verdict) -> GovernedOutcome:
         cleared=cleared,
         adaptation_allowed=adaptation_allowed,
         reasons=tuple(reasons),
+        # Self-description, stamped ONLY when bound: an unbound directive's
+        # identity is withheld from the outcome (the _hard_deny precedent), so
+        # no consumer can act on a directive that governed a different action.
+        directive=directive if bound else None,
+        subject=directive.subject if bound else "",
     )
 
 
