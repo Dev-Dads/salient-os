@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "salienceos"
 version = "0.1.0"
-description = "SalienceOS — a salience-based AI control plane. Verifier first."
+description = "SalienceOS — the salience-based control plane of an AI-governed operating system."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }

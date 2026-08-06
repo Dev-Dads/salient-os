@@ -24,6 +24,7 @@ reviewed decision, not an oversight — see docs/adr/0001-verify-chain-integrity
 """
 
 import json
+import os
 from dataclasses import asdict
 
 from salienceos.interpreter.directive import Directive
@@ -32,12 +33,60 @@ from salienceos.verifier.signing import digest
 
 
 class SalienceBus:
+    """Single-threaded by contract: callers that share a bus across threads
+    must serialize access themselves (this package imports no threading — the
+    discipline allowlist has none)."""
+
     def __init__(self, path=None):
         self._signals = []          # (hash, SalienceSignal)
         self._directives = []       # (hash, directive dict)
         self._entries = []          # ordered full entries, for chain verification
         self._head = ""
         self._path = path
+        if path is not None and os.path.exists(path):
+            self._replay(path)
+
+    def _replay(self, path) -> None:
+        """Rebuild state from an existing JSONL so a REOPENED bus continues its
+        own chain. Without this, a second process (session resume, host
+        restart) would append an entry with prev="" after the existing lines
+        and permanently break `verify_chain()` at the junction.
+
+        Verifies while loading and fails CLOSED: a corrupt, tampered, or
+        discontinuous record raises rather than silently appending after
+        garbage — a bus you cannot trust to extend is a bus you must not
+        extend."""
+        with open(path, encoding="utf-8") as fh:
+            lines = [ln for ln in (raw.strip() for raw in fh) if ln]
+        prev = ""
+        for i, line in enumerate(lines):
+            try:
+                e = json.loads(line)
+                base = {"kind": e["kind"], "payload": e["payload"], "prev": e["prev"]}
+                intact = e["prev"] == prev and digest(base) == e["hash"]
+            except Exception:  # noqa: BLE001 — any malformed line is corruption
+                intact = False
+            if not intact:
+                raise ValueError(
+                    f"corrupt or discontinuous bus record at line {i + 1}: {path}"
+                )
+            if e["kind"] == "signal":
+                p = dict(e["payload"])
+                p["provenance"] = tuple(p.get("provenance", ()))
+                try:
+                    signal = SalienceSignal(**p)
+                except TypeError:
+                    signal = None
+                if signal is None or not valid_signal(signal):
+                    raise ValueError(
+                        f"persisted signal fails validation at line {i + 1}: {path}"
+                    )
+                self._signals.append((e["hash"], signal))
+            else:
+                self._directives.append((e["hash"], e["payload"]))
+            self._entries.append(e)
+            prev = e["hash"]
+        self._head = prev
 
     def publish(self, signal) -> str:
         if not valid_signal(signal):
@@ -70,6 +119,16 @@ class SalienceBus:
 
     def signals_for(self, subject: str) -> tuple:
         return tuple(s for _, s in self._signals if isinstance(s, SalienceSignal) and s.subject == subject)
+
+    def directives_for(self, subject: str) -> tuple:
+        """Recorded directive payloads for a subject, oldest first, as
+        json-round-trip COPIES — reading the audit record must not be able to
+        mutate it (a shallow copy would alias the nested lists). Deliberately
+        dicts, not reconstructed Directive objects: presence on the bus is NOT
+        authorization (module docstring), and dicts are all a JSONL-loaded
+        record could ever faithfully serve."""
+        return tuple(json.loads(json.dumps(p)) for _, p in self._directives
+                     if p.get("subject") == subject)
 
     def head(self) -> str:
         return self._head

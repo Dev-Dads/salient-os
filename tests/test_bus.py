@@ -79,5 +79,108 @@ class BusAudit(unittest.TestCase):
         self.assertEqual(entry["payload"]["adaptation_rationale"], "policy_disallowed")
 
 
+class DirectiveReader(unittest.TestCase):
+    """directives_for closes the write-only gap: emitted directives are
+    readable, filtered by subject, oldest first, as copies that cannot reach
+    back into the audit record."""
+
+    def _bus_with_two_subjects(self):
+        bus = SalienceBus()
+        for subject in ("req-1", "req-2", "req-1"):
+            pol = issue_policy("pol-1", subject, (), 10, 1000, 0, 3,
+                               "semantic", False, 2, 0.4, False, KEY)
+            bus.emit(interpret(pol, [sig(subject, Facet.ATTENTION, 0.7)], KEY))
+        return bus
+
+    def test_reads_filter_by_subject_oldest_first(self):
+        bus = self._bus_with_two_subjects()
+        got = bus.directives_for("req-1")
+        self.assertEqual(len(got), 2)
+        self.assertTrue(all(p["subject"] == "req-1" for p in got))
+        self.assertEqual(len(bus.directives_for("req-2")), 1)
+        self.assertEqual(bus.directives_for("req-none"), ())
+
+    def test_round_trip_carries_the_rationale(self):
+        # The factory policy has allow_adaptation=False, and the chain records
+        # the FIRST failing clause — so the durable code is policy_disallowed.
+        bus = self._bus_with_two_subjects()
+        p = bus.directives_for("req-1")[0]
+        self.assertEqual(p["adaptation_rationale"], "policy_disallowed")
+
+    def test_returned_copies_cannot_mutate_the_record(self):
+        bus = self._bus_with_two_subjects()
+        p = bus.directives_for("req-1")[0]
+        p["compute_budget"] = 999999
+        p["allowed_capabilities"].append("fs.write:/")
+        fresh = bus.directives_for("req-1")[0]
+        self.assertNotEqual(fresh["compute_budget"], 999999)
+        self.assertNotIn("fs.write:/", fresh["allowed_capabilities"])
+        self.assertTrue(bus.verify_chain())
+
+
+class ReplayOnOpen(unittest.TestCase):
+    """A reopened bus continues its own chain (the session-resume case,
+    ADR 0002) — and refuses to extend a record it cannot verify."""
+
+    def _emit_on(self, bus, subject="req-1"):
+        pol = issue_policy("pol-1", subject, (), 10, 1000, 0, 3,
+                           "semantic", False, 2, 0.4, False, KEY)
+        bus.emit(interpret(pol, bus.signals_for(subject), KEY))
+
+    def test_reopened_bus_continues_the_chain(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            path = td + "/bus.jsonl"
+            first = SalienceBus(path=path)
+            first.publish(sig("req-1", Facet.ATTENTION, 0.5))
+            self._emit_on(first)
+            head_before = first.head()
+
+            second = SalienceBus(path=path)  # a NEW process reopening the file
+            self.assertEqual(second.head(), head_before)  # continues, not restarts
+            self.assertEqual(len(second.signals_for("req-1")), 1)
+            self.assertEqual(len(second.directives_for("req-1")), 1)
+            second.publish(sig("req-1", Facet.MEMORY, 0.4))
+            self._emit_on(second)
+            self.assertTrue(second.verify_chain())
+
+            third = SalienceBus(path=path)   # and the whole file still verifies
+            self.assertTrue(third.verify_chain())
+            self.assertEqual(len(third.directives_for("req-1")), 2)
+
+    def test_corrupt_tail_refuses_to_open(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            path = td + "/bus.jsonl"
+            bus = SalienceBus(path=path)
+            bus.publish(sig("req-1", Facet.ATTENTION, 0.5))
+            self._emit_on(bus)
+            with open(path, encoding="utf-8") as fh:
+                lines = fh.readlines()
+            lines[-1] = lines[-1].replace('"prev"', '"perv"', 1)  # mangle tail
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.writelines(lines)
+            with self.assertRaises(ValueError):
+                SalienceBus(path=path)
+
+    def test_tampered_middle_refuses_to_open(self):
+        import json as _json
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            path = td + "/bus.jsonl"
+            bus = SalienceBus(path=path)
+            bus.publish(sig("req-1", Facet.ATTENTION, 0.5))
+            bus.publish(sig("req-1", Facet.MEMORY, 0.9))
+            with open(path, encoding="utf-8") as fh:
+                lines = fh.readlines()
+            e = _json.loads(lines[0])
+            e["payload"]["influence"] = 1.0  # rewrite history, keep the old hash
+            lines[0] = _json.dumps(e, sort_keys=True) + "\n"
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.writelines(lines)
+            with self.assertRaises(ValueError):
+                SalienceBus(path=path)
+
+
 if __name__ == "__main__":
     unittest.main()
