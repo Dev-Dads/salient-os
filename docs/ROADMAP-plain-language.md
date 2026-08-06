@@ -94,6 +94,14 @@ moment, in miniature: a virtual machine (or any spare box) that boots to a
 minimal screen where the whole stack — a small resident model, the hands, the
 judgment system — comes up by itself and talks to you. Ugly, small, and real.
 The proof: a cold boot, no keyboard intervention, ending in a working session.
+*Reference point for this stage: **Fable-OS** (github.com/robiot/fable-os) — the
+bare-kernel project that inspired this one. It proves an agent really can boot a
+machine and run it from a sentence, so it's a north star for the "front door" and a
+useful boot-harness reference. It's also our foil: it hands the model the keys
+("everything runs in Ring 0, and the agent has access to everything"), which is the
+exact thing our judgment system exists to forbid — so it's a contrast and a demo
+target, not a source of code (and by its own record it has only ever run in a VM,
+never on real metal).*
 
 **Stage 4 — Move onto real metal.** When Sparky (or a sibling machine) is free:
 same system, serious model, real performance numbers — including the review's
