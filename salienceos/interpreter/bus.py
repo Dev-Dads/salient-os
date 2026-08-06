@@ -143,7 +143,17 @@ class SalienceBus:
                 )
             if e["kind"] == "signal":
                 p = dict(e["payload"])
-                p["provenance"] = tuple(p.get("provenance", ()))
+                # Validate the value the FILE carried, not a coerced view of
+                # it: coercing before validation would accept shapes publish()
+                # could never produce (a string split into char refs, dict
+                # keys harvested as refs) and let a non-list escape as a
+                # TypeError instead of the ValueError this loop guarantees.
+                prov = p.get("provenance", [])
+                if not isinstance(prov, list):
+                    raise ValueError(
+                        f"persisted signal fails validation at line {i + 1}: {path}"
+                    )
+                p["provenance"] = tuple(prov)
                 try:
                     signal = SalienceSignal(**p)
                 except TypeError:

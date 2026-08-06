@@ -120,6 +120,13 @@ def _denied(reasons, verdict=None) -> GovernedOutcome:
 def _valid_directive(directive) -> bool:
     return (
         type(directive) is Directive
+        # `subject` is the binding key: `bound` tests `directive.subject ==
+        # verdict.envelope_id`, an operator that dispatches to this
+        # attacker-supplied operand. A non-str subject (e.g. an always-equal
+        # object, or one whose __bool__/__eq__ raises) could bind to a verdict
+        # for a DIFFERENT action, or crash the gate — a crash is not a deny.
+        # Matches the emit-side fence, which already requires a bounded str.
+        and isinstance(directive.subject, str)
         and isinstance(directive.verification_depth, int)
         and not isinstance(directive.verification_depth, bool)
         # The rationale rides through to the consumer gates (self-describing

@@ -217,6 +217,22 @@ class ReplayOnOpen(unittest.TestCase):
         base = {"kind": kind, "payload": payload, "prev": prev}
         return _json.dumps({**base, "hash": digest(base)}, sort_keys=True) + "\n", digest(base)
 
+    def test_persisted_non_list_provenance_refuses_to_open(self):
+        # Replay must validate the value the FILE carried: a string or dict
+        # provenance is a shape publish() could never produce, and a non-list
+        # must raise ValueError (the loop's contract), never a bare TypeError.
+        base = {"subsystem_id": "s", "subject": "req-1", "facet": "attention",
+                "influence": 0.5, "confidence": 1.0}
+        for prov in ("abcdef", {"evt:1": 9}, 5):
+            line, _ = self._crafted_line("signal", {**base, "provenance": prov}, "")
+            import tempfile
+            with tempfile.TemporaryDirectory() as td:
+                path = td + "/bus.jsonl"
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write(line)
+                with self.assertRaises(ValueError):
+                    SalienceBus(path=path)
+
     def test_persisted_invalid_signal_refuses_to_open(self):
         # A hash-correct line whose signal fails valid_signal (influence 5.0)
         # must not be served by signals_for on a reopened bus — pin the

@@ -298,6 +298,34 @@ class SelfDescribingOutcome(unittest.TestCase):
             self.assertIsNone(o.directive)
             self.assertEqual(o.subject, "")
 
+    def test_non_string_subject_cannot_bind(self):
+        # The binding key is attacker-supplied and drives an == against the
+        # verdict's envelope_id. A non-str subject (always-equal object, or one
+        # whose __bool__/__eq__ raises) must NOT bind to a verdict for another
+        # action, and must never crash the gate (a crash is not a deny).
+        class AlwaysEq:
+            def __eq__(self, other):
+                return True
+            def __bool__(self):
+                return True
+
+        class Raises:
+            def __eq__(self, other):
+                raise RuntimeError("boom")
+            def __bool__(self):
+                raise RuntimeError("boom")
+
+        good = directive(subject="act-1")
+        v_other = verdict(Status.VERIFIED, envelope_id="act-innocent",
+                          effective_stakes=Stakes.HIGH)
+        for bad in (AlwaysEq(), Raises(), 3, b"act-1"):
+            d = Directive(**{**good.__dict__, "subject": bad})
+            o = decide(d, v_other)
+            self.assertFalse(o.cleared)
+            self.assertFalse(o.adaptation_allowed)
+            self.assertIsNone(o.directive)
+            self.assertEqual(o.subject, "")
+
     def test_malformed_eligibility_is_denied_at_the_boundary(self):
         # Both halves of the pair are validated symmetrically: a non-enum
         # eligibility is a malformed directive, denied the same way.
