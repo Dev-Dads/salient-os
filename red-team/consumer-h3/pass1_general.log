@@ -1,0 +1,8 @@
+pass=general  models=['deepseek/deepseek-v4-pro', 'x-ai/grok-4.5', 'mistralai/mistral-medium-3-5', 'moonshotai/kimi-k3', 'z-ai/glm-5.2']
+[ OK ] mistralai/mistral-medium-3-5  24.0s  finish=stop  out_tokens=2870  chars=9915
+[ OK ] moonshotai/kimi-k3  223.5s  finish=length  out_tokens=16000  chars=65309
+[ OK ] x-ai/grok-4.5  368.1s  finish=stop  out_tokens=19397  chars=5511
+[ OK ] deepseek/deepseek-v4-pro  368.1s  finish=length  out_tokens=16000  chars=68241
+[ OK ] z-ai/glm-5.2  879.5s  finish=length  out_tokens=16000  chars=63292
+
+Done (general): 5/5 succeeded.
