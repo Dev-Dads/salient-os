@@ -1,0 +1,16 @@
+HERMES_HOME = C:\Users\joshe\AppData\Local\Temp\h3proof_cpexfmr0
+config: floor(max_iterations)=25, compute_headroom=15  =>  window [25, 40]
+
+  turn  tool events  applied budget   note
+     1            -              25   first turn: operator floor
+     2     8 (busy)              40   applies u1 -> saturates to ceiling
+     3     4 (half)              33   applies u2 -> mid-window
+     4    0 (quiet)              25   applies u3 -> decays to floor
+     5     8 (busy)              40   applies u4 -> ceiling again (no compounding)
+
+audit bus: 8579323623ba3e54bd5925ef6add4409fd19abb93187357fff65b504015ab3aa.jsonl   chain_verified = True
+recorded directives (compute_budget per turn):
+    u1: compute_budget = 40
+    u2: compute_budget = 33
+    u3: compute_budget = 25
+    u4: compute_budget = 40
