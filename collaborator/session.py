@@ -30,6 +30,7 @@ class Session:
         leash_overrides: "dict | None" = None,
         allow_adaptation: bool = False,
         default_importance: float = 0.3,
+        now_days: float = 0.0,
         bus: "SalienceBus | None" = None,
         verifier: "Verifier | None" = None,
     ) -> None:
@@ -41,6 +42,10 @@ class Session:
         self.leash_overrides = dict(leash_overrides or {})
         self.allow_adaptation = bool(allow_adaptation)
         self.default_importance = float(default_importance)
+        nd = float(now_days)  # injected clock for the memory governor
+        if nd != nd or nd < 0:  # NaN or negative -> the memory gate would reject it
+            raise ValueError("now_days must be a finite non-negative number")
+        self.now_days = nd
         # An in-memory audit bus by default; pass SalienceBus(path=...) to persist.
         self.bus = bus if bus is not None else SalienceBus()
         self.verifier = verifier if verifier is not None else Verifier(

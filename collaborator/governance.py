@@ -28,6 +28,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 
+from salienceos.consumers import consume
 from salienceos.control import govern, stakes_for
 from salienceos.interpreter import Facet, SalienceSignal, interpret, issue_policy
 from salienceos.verifier import issue_envelope, issue_receipt
@@ -73,16 +74,30 @@ class Decision:
     outcome: object = None
     preview: "dict | None" = None
     args: dict = field(default_factory=dict)
+    # Stage-4-live: the two learning channels' records for this action (only when
+    # the session allows adaptation). disagreement == weight BLOCKS + memory RETAINS
+    # as a non-decaying inhibitor (the same risky event refused as a skill, kept as
+    # a permanent warning).
+    adaptation: object = None
+    memory: object = None
+    disagreement: bool = False
+    learning_error: "str | None" = None  # consume() failed — an inhibitor MAY be lost
 
     def summary(self) -> str:
         """The honest, human-facing line — derived from the real decision/result,
         never from the model's narration (panel gap #4)."""
+        if self.disagreement:
+            tail = "  ⟂ LEARNING BLOCKED + RETAINED AS INHIBITOR (channels disagree)"
+        elif self.learning_error:
+            tail = f"  ⚠ LEARNING ERROR — inhibitor may be lost: {self.learning_error}"
+        else:
+            tail = ""
         if self.status == RAN:
             out = (self.result.output if self.result else "") or "(no output)"
-            return f"[{self.tool} ✓ ran, verified] {out}"
+            return f"[{self.tool} ✓ ran, verified] {out}{tail}"
         if self.status == FAILED:
             err = (self.result.error if self.result else "") or "did not clear verification"
-            return f"[{self.tool} ✗ FAILED — not verified] {err}"
+            return f"[{self.tool} ✗ FAILED — not verified] {err}{tail}"
         if self.status == HELD:
             return f"[{self.tool} ⏸ HELD for your approval] would run: {self.preview}"
         if self.status == NOTIFIED:
@@ -97,11 +112,18 @@ def _leash_for(session, tool: Tool) -> str:
     return overrides.get(tool.name, tool.default_leash)
 
 
-def _emit_signals(session, action_id: str, importance: float, risk: float):
+def _emit_signals(session, action_id: str, importance: float, risk: float, learning_eligible: bool):
     sigs = [
         SalienceSignal("collaborator", action_id, Facet.ATTENTION, importance, 1.0, ()),
         SalienceSignal("collaborator", action_id, Facet.RISK, risk, 1.0, ()),
     ]
+    # Stage-4-live: request learning ONLY for tools whose outcome is actually
+    # consumed (artifact-verified) — otherwise the ADAPTATION signal is a promise
+    # the wiring can't keep, since exit/read tools produce no GovernedOutcome to
+    # consume() (panel MEDIUM). The weight gate + memory governor then decide, and
+    # for an over-cap risk they DISAGREE (block the skill, keep the warning).
+    if getattr(session, "allow_adaptation", False) and learning_eligible:
+        sigs.append(SalienceSignal("collaborator", action_id, Facet.ADAPTATION, importance, 1.0, ()))
     bus = getattr(session, "bus", None)
     if bus is not None:
         for s in sigs:
@@ -133,7 +155,7 @@ def govern_action(session, intent: ToolIntent, importance: "float | None" = None
             bool(getattr(session, "allow_adaptation", False)), 2, 0.4, False,
             session.policy_key,
         )
-        signals = _emit_signals(session, action_id, imp, rk)
+        signals = _emit_signals(session, action_id, imp, rk, tool.verify_mode == "artifact")
         directive = interpret(policy, signals, session.policy_key)
         bus = getattr(session, "bus", None)
         if bus is not None:
@@ -233,6 +255,29 @@ def execute_and_verify(session, tool: Tool, directive, action_id: str, args: dic
                         directive=directive, args=args)
 
     cleared = bool(outcome.cleared)
+    # Stage-4-live: consume the outcome through BOTH learning channels. For an
+    # over-cap-risk (RISK_EXCEEDED) action the weight gate refuses to learn it
+    # while the memory governor retains it as a non-decaying inhibitor — the
+    # already-built disagreement, now fired by a real governed action.
+    adaptation = memory = None
+    disagreement = False
+    learning_error = None
+    if getattr(session, "allow_adaptation", False):
+        try:
+            now_days = float(getattr(session, "now_days", 0.0) or 0.0)
+            adaptation, memory = consume(outcome, now_days)
+            disagreement = ((not adaptation.nominated) and adaptation.handoff is not None
+                            and bool(memory.inhibitor))
+        except Exception as exc:
+            # The memory gate RAISES rather than lose an inhibitor (fail-CLOSED on a
+            # warning). Surface that — never silently equate "consume failed" with
+            # "no disagreement", which would re-introduce the fail-open the gate
+            # exists to prevent (panel HIGH). The action's own report is unaffected.
+            learning_error = f"{type(exc).__name__}: {exc}"
+            adaptation = memory = None
+            disagreement = False
     return Decision(action_id, tool.name, RAN if cleared else FAILED,
                     "verified" if cleared else "not verified", leash, cleared=cleared,
-                    result=execution.result, directive=directive, outcome=outcome, args=args)
+                    result=execution.result, directive=directive, outcome=outcome, args=args,
+                    adaptation=adaptation, memory=memory, disagreement=disagreement,
+                    learning_error=learning_error)
