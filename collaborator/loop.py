@@ -17,6 +17,7 @@ from collaborator.governance import (
     Decision,
     execute_and_verify,
     govern_action,
+    reauthorized_or_denied,
 )
 from collaborator.toolcall import parse_message
 from collaborator.tools import get_tool
@@ -89,11 +90,21 @@ def run_turn(session, client, user_message: str, history=None, max_iterations: i
 
 
 def approve(session, decision: Decision) -> Decision:
-    """Approve a HELD (propose-first) action: run it now through the same verified
-    path, using the directive already recorded for it."""
+    """Approve a HELD (propose-first) action: run it now through the same verified path.
+
+    Authority is RE-CHECKED against the current session before running (not merely
+    trusted from origination): a held action — a lingering proposal especially — must
+    still be granted its capability and, for a path tool, still resolve in the workspace.
+    If authority no longer holds, it is DENIED, not run (closes the TOCTOU the propose
+    channel would otherwise widen). Salience/verification depth still come from the
+    recorded directive."""
     if decision.status != HELD:
         return decision
     tool = get_tool(decision.tool)
     if tool is None:
         return decision
+    denied = reauthorized_or_denied(session, tool, decision.action_id, decision.args,
+                                    decision.leash, decision.directive)
+    if denied is not None:
+        return denied
     return execute_and_verify(session, tool, decision.directive, decision.action_id, decision.args)

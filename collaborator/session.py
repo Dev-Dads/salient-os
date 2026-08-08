@@ -30,6 +30,7 @@ class Session:
         leash_overrides: "dict | None" = None,
         allow_adaptation: bool = False,
         default_importance: float = 0.3,
+        proactivity: str = "conservative",
         now_days: float = 0.0,
         bus: "SalienceBus | None" = None,
         verifier: "Verifier | None" = None,
@@ -42,6 +43,13 @@ class Session:
         self.leash_overrides = dict(leash_overrides or {})
         self.allow_adaptation = bool(allow_adaptation)
         self.default_importance = float(default_importance)
+        # How eagerly the propose channel (Step 1) surfaces unprompted proposals —
+        # host config, NEVER model-selectable. Default the conservative end. Because a
+        # surfaced proposal grants no authority (it is re-gated on approval), this dial
+        # trades quiet vs chatty, never safe vs unsafe.
+        if proactivity not in ("off", "conservative", "eager"):
+            raise ValueError("proactivity must be 'off', 'conservative', or 'eager'")
+        self.proactivity = proactivity
         nd = float(now_days)  # injected clock for the memory governor
         if nd != nd or nd < 0:  # NaN or negative -> the memory gate would reject it
             raise ValueError("now_days must be a finite non-negative number")

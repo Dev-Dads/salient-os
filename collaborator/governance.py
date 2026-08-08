@@ -35,6 +35,7 @@ from salienceos.verifier import issue_envelope, issue_receipt
 from salienceos.verifier.observers import observe_action, snapshot_tree
 
 from collaborator.tools import (
+    ACT_THEN_REPORT,
     NOTIFY_ONLY,
     PROPOSE_FIRST,
     Tool,
@@ -82,6 +83,11 @@ class Decision:
     memory: object = None
     disagreement: bool = False
     learning_error: "str | None" = None  # consume() failed — an inhibitor MAY be lost
+    # Provenance (audit only, never authority): who ORIGINATED this action — "direct"
+    # for a user turn, "collaborator" for a proposal the Collaborator raised itself. So a
+    # forensic reader can tell "the user asked for this" from "the agent suggested it and
+    # the user approved" (panel F5/F6). Bus-level provenance tagging is a later add.
+    origin: str = "direct"
 
     def summary(self) -> str:
         """The honest, human-facing line — derived from the real decision/result,
@@ -107,9 +113,25 @@ class Decision:
         return f"[{self.tool}] {self.reason}"
 
 
+_VALID_LEASHES = (ACT_THEN_REPORT, PROPOSE_FIRST, NOTIFY_ONLY)
+
+
 def _leash_for(session, tool: Tool) -> str:
     overrides = getattr(session, "leash_overrides", None) or {}
     return overrides.get(tool.name, tool.default_leash)
+
+
+def _resolve_leash(session, tool: Tool, override: "str | None") -> str:
+    """Per-task leash. ``override`` is HOST authority (a UI/proposer caller), never
+    threaded from model output. None -> today's resolution (unchanged behaviour). A
+    value must be one of the three defined levels; an invalid one fails CLOSED to
+    propose_first (held, awaiting approval) rather than ever running unleashed. A leash
+    only chooses among the levels — it can never widen the capability gate."""
+    if override is None:
+        return _leash_for(session, tool)
+    if override in _VALID_LEASHES:
+        return override
+    return PROPOSE_FIRST
 
 
 def _emit_signals(session, action_id: str, importance: float, risk: float, learning_eligible: bool):
@@ -135,15 +157,22 @@ def _emit_signals(session, action_id: str, importance: float, risk: float, learn
 
 
 def govern_action(session, intent: ToolIntent, importance: "float | None" = None,
-                  risk: "float | None" = None) -> Decision:
-    """Mediate one tool intent through the full salienceos flow. Never raises."""
+                  risk: "float | None" = None, *, leash: "str | None" = None) -> Decision:
+    """Mediate one tool intent through the full salienceos flow. Never raises.
+
+    ``leash`` is an optional HOST-supplied per-task override (Step 1), KEYWORD-ONLY so it
+    can never be threaded in positionally from model-derived args. It is caller authority
+    — the propose channel / a UI host — never sourced from model output (panel F4).
+    Omitted, behaviour is exactly as before (session/tool default). A host leash may
+    tighten OR loosen relative to the tool default (host authority over their own leash),
+    but it can never widen the capability gate, and an invalid value fails closed."""
     tool = get_tool(intent.name)
     if tool is None:
         return Decision(action_id="", tool=intent.name, status=UNKNOWN_TOOL,
                         reason=f"no such tool: {intent.name}", leash="", args=intent.args)
 
     action_id = "act-" + uuid.uuid4().hex[:16]
-    leash = _leash_for(session, tool)
+    leash = _resolve_leash(session, tool, leash)
     imp = session.default_importance if importance is None else importance
     rk = _TOOL_RISK.get(tool.name, 0.3) if risk is None else risk
 
@@ -196,6 +225,49 @@ def govern_action(session, intent: ToolIntent, importance: "float | None" = None
 
     # leash == ACT_THEN_REPORT -> run it
     return execute_and_verify(session, tool, directive, action_id, intent.args)
+
+
+def reauthorized_or_denied(session, tool: Tool, action_id: str, args: dict, leash: str,
+                           directive) -> "Decision | None":
+    """Re-gate a held action at the MOMENT OF USE (panel F1 / TOCTOU). A held decision —
+    especially an originated proposal, which is designed to linger — may have sat while
+    the session's capabilities changed. Approval must therefore re-check authority
+    against the CURRENT session, not trust the directive minted at origination: the
+    capability must STILL be granted, and a path tool must STILL resolve in the
+    workspace. Returns a DENIED Decision if authority no longer holds, else None.
+
+    (Salience/verification depth still come from the origination directive; only the
+    authority gate is re-derived. Signals are built locally and NOT re-published, so the
+    re-check does not duplicate the origination's audit records.)"""
+    try:
+        policy = issue_policy(
+            "collab-policy", action_id, tuple(session.capabilities),
+            10, 1000, 0, 3, "semantic",
+            bool(getattr(session, "allow_adaptation", False)), 2, 0.4, False,
+            session.policy_key,
+        )
+        signals = [
+            SalienceSignal("collaborator", action_id, Facet.ATTENTION,
+                           float(getattr(session, "default_importance", 0.3)), 1.0, ()),
+            SalienceSignal("collaborator", action_id, Facet.RISK,
+                           _TOOL_RISK.get(tool.name, 0.3), 1.0, ()),
+        ]
+        current = interpret(policy, signals, session.policy_key)
+    except Exception as exc:  # can't establish current authority -> deny
+        return Decision(action_id, tool.name, DENIED,
+                        f"re-gate governance error: {type(exc).__name__}", leash,
+                        directive=directive, args=args)
+    if not current.grants_capability(tool.capability):
+        return Decision(action_id, tool.name, DENIED,
+                        f"capability '{tool.capability}' not granted at approval time",
+                        leash, directive=directive, args=args)
+    if tool.name in ("write_file", "read_file"):
+        try:
+            resolve_in_workspace(session.workspace, str(args.get("path") or ""))
+        except WorkspaceError as exc:
+            return Decision(action_id, tool.name, DENIED, str(exc), leash,
+                            directive=directive, args=args)
+    return None
 
 
 def execute_and_verify(session, tool: Tool, directive, action_id: str, args: dict) -> Decision:

@@ -23,6 +23,12 @@ from collaborator.governance import (
 )
 from collaborator.loop import TurnResult, approve, run_turn
 from collaborator.model_client import OllamaClient, ScriptedClient
+from collaborator.propose import (
+    Proposal,
+    approve_proposal,
+    propose,
+    veto_proposal,
+)
 from collaborator.session import DEFAULT_CAPABILITIES, Session
 from collaborator.toolcall import ParseResult, ToolIntent, parse_message
 from collaborator.tools import (
@@ -67,4 +73,8 @@ __all__ = [
     "NOTIFY_ONLY",
     "OllamaClient",
     "ScriptedClient",
+    "propose",
+    "approve_proposal",
+    "veto_proposal",
+    "Proposal",
 ]
