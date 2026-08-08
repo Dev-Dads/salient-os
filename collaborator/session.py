@@ -36,6 +36,11 @@ class Session:
         verifier: "Verifier | None" = None,
         policy_caps=None,
         caps_key: "bytes | None" = None,
+        fact_view=None,
+        history_view=None,
+        veto_ledger=None,
+        veto_bar_delta: float = 0.15,
+        veto_half_life_days: float = 7.0,
     ) -> None:
         self.workspace = Path(workspace)
         self.capabilities = tuple(capabilities)
@@ -73,3 +78,16 @@ class Session:
         self.bus = bus if bus is not None else SalienceBus()
         self.verifier = verifier if verifier is not None else Verifier(
             policy_key, {executor_id: executor_key})
+        # ④ Memory (design v3). The two typed handles keep the fact/history split
+        # STRUCTURAL: the DOER is given only ``fact_view`` (the fact layer); the
+        # PROPOSER alone gets ``history_view`` (the gist-tuple layer). The doer's context
+        # assembler rejects a HistoryView at the type level, so history-blindness is not a
+        # convention. Both may be None (memory simply absent -> the agent runs as before).
+        self.fact_view = fact_view          # FactView | None — doer + proposer
+        self.history_view = history_view    # HistoryView | None — PROPOSER ONLY
+        # The decaying veto inhibitor (surfacing influence only, never authority).
+        if veto_ledger is not None:
+            self.veto_ledger = veto_ledger
+        else:
+            from collaborator.vetoledger import VetoLedger
+            self.veto_ledger = VetoLedger(veto_bar_delta, veto_half_life_days)

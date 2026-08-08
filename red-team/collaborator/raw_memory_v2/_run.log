@@ -1,0 +1,18 @@
+bundle chars=59590  models=['deepseek/deepseek-v4-pro', 'x-ai/grok-4.5', 'mistralai/mistral-medium-3-5', 'moonshotai/kimi-k3', 'z-ai/glm-5.2']
+[ OK ] mistralai/mistral-medium-3-5  59.6s  finish=stop  chars=14622  cost=$0.0535
+[ OK ] x-ai/grok-4.5  116.5s  finish=stop  chars=20112  cost=$0.0620
+[ OK ] deepseek/deepseek-v4-pro  148.3s  finish=stop  chars=10391  cost=$0.0042
+[ OK ] z-ai/glm-5.2  169.4s  finish=stop  chars=15890  cost=$0.0087
+[ OK ] moonshotai/kimi-k3  420.0s  finish=length  chars=5761  cost=$0.2858
+
+============== API COST — ④ memory review v2 ==============
+  deepseek/deepseek-v4-pro              $0.0042   15971->9738 tok
+  x-ai/grok-4.5                         $0.0620   16067->5020 tok
+  mistralai/mistral-medium-3-5          $0.0535   16133->3909 tok
+  moonshotai/kimi-k3                    $0.2858   15283->16000 tok
+  z-ai/glm-5.2                          $0.0087   15226->12572 tok
+  ------------------------------------------------------
+  TOTAL                                 $0.4143
+==========================================================
+
+Done: 5/5 succeeded.
