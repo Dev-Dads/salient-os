@@ -1,0 +1,24 @@
+③ SIGNED-POLICYCAPS proof — the config/controls can tighten, never widen
+
+  grant confers fs.write @ act_then_report -> write ran
+  mutate session.capabilities += shell.exec -> run_command denied
+  view set_leash(run_command, act_then_report), cap=propose_first -> held
+  unlisted tool under a grant (no leash cap) -> run_command notified
+  STRIP the grant (policy_caps=None), enforce sticky -> write denied
+  TAMPER caps (add shell.exec, keep old sig) -> write denied
+  REPLAY grant minted for another workspace -> write denied
+  approve a held action after revoke -> denied  (TOCTOU re-gate)
+  legacy session (no grant) -> write ran  (unchanged)
+
+=== CHECKS ===
+  [PASS] a valid grant confers its capability + runnable leash
+  [PASS] mutable capabilities cannot widen past the grant
+  [PASS] the control surface cannot loosen past the leash cap
+  [PASS] an unlisted tool defaults to strictest (never runs)
+  [PASS] stripping the grant fails closed (not legacy)
+  [PASS] tampered caps fail closed
+  [PASS] a grant for another workspace is rejected (subject binding)
+  [PASS] approval re-gates against the current grant
+  [PASS] a session with no grant behaves as today
+
+③ SIGNED-POLICYCAPS: OK  (9/9 properties held)

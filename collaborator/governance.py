@@ -45,6 +45,7 @@ from collaborator.tools import (
     get_tool,
     resolve_in_workspace,
 )
+from collaborator.policycaps import apply_cap, granted_capabilities, leash_cap
 from collaborator.toolcall import ToolIntent
 
 COLLABORATOR_GOVERNANCE_VERSION = "0.1.0"
@@ -174,6 +175,9 @@ def govern_action(session, intent: ToolIntent, importance: "float | None" = None
 
     action_id = "act-" + uuid.uuid4().hex[:16]
     leash = _resolve_leash(session, tool, leash)
+    # ③ a signed grant caps how loose the leash may get: the host/view can tighten but
+    # never loosen past the cap (fail-closed if the grant is present but invalid).
+    leash = apply_cap(leash, leash_cap(session, tool.name))
     imp = session.default_importance if importance is None else importance
     rk = _TOOL_RISK.get(tool.name, 0.3) if risk is None else risk
 
@@ -187,7 +191,7 @@ def govern_action(session, intent: ToolIntent, importance: "float | None" = None
     # --- interpret (fail closed: any error here denies) ----------------------
     try:
         policy = issue_policy(
-            "collab-policy", action_id, tuple(session.capabilities),
+            "collab-policy", action_id, granted_capabilities(session),
             10, 1000, 0, 3, "semantic",
             bool(getattr(session, "allow_adaptation", False)), 2, 0.4, False,
             session.policy_key,
@@ -249,7 +253,7 @@ def reauthorized_or_denied(session, tool: Tool, action_id: str, args: dict, leas
     re-check does not duplicate the origination's audit records.)"""
     try:
         policy = issue_policy(
-            "collab-policy", action_id, tuple(session.capabilities),
+            "collab-policy", action_id, granted_capabilities(session),
             10, 1000, 0, 3, "semantic",
             bool(getattr(session, "allow_adaptation", False)), 2, 0.4, False,
             session.policy_key,
@@ -282,7 +286,10 @@ def execute_and_verify(session, tool: Tool, directive, action_id: str, args: dic
     """Run a permitted, unleashed action and (for mutating tools) verify the claim
     against the observed world. Used both for act_then_report and for an approved
     propose_first action."""
-    leash = _leash_for(session, tool)
+    # The signed leash cap applies here too (the terminal enforcement point), so the
+    # recorded leash is the EFFECTIVE (capped) one and no future caller can reach this
+    # path with an un-capped leash (panel: leash cap must hold at the moment of use).
+    leash = apply_cap(_leash_for(session, tool), leash_cap(session, tool.name))
     # Read-only: gate already passed; execute and report (nothing is mutated).
     if tool.verify_mode == "none":
         try:
