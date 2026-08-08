@@ -34,9 +34,21 @@ class Session:
         now_days: float = 0.0,
         bus: "SalienceBus | None" = None,
         verifier: "Verifier | None" = None,
+        policy_caps=None,
+        caps_key: "bytes | None" = None,
     ) -> None:
         self.workspace = Path(workspace)
         self.capabilities = tuple(capabilities)
+        # ③ optional SIGNED authority grant. When present, the VERIFIED caps are
+        # authoritative (the mutable .capabilities above cannot widen them) and each
+        # tool's leash is capped by the grant. Verified per action in the seam; a grant
+        # that is present but invalid fails closed (zero capabilities, strictest leash).
+        self.policy_caps = policy_caps
+        self.caps_key = caps_key
+        # STICKY: a session built WITH a grant enforces caps for life. Stripping the grant
+        # at runtime (policy_caps=None) then fails closed, it does NOT revert to the
+        # mutable-config legacy path. Legacy only when constructed with no grant at all.
+        self.enforce_caps = policy_caps is not None
         self.policy_key = policy_key
         self.executor_id = executor_id
         self.executor_key = executor_key

@@ -17,6 +17,7 @@ import html
 from dataclasses import dataclass
 
 from collaborator.governance import FAILED, PAUSED, RAN, Decision
+from collaborator.policycaps import apply_cap, granted_capabilities, leash_cap
 from collaborator.propose import PROPOSED, Proposal, approve_proposal, veto_proposal
 from collaborator.tools import ACT_THEN_REPORT, NOTIFY_ONLY, PROPOSE_FIRST, toolset
 
@@ -101,8 +102,12 @@ class JudgmentView:
     ledger: JudgmentLedger
 
     def _leashes(self) -> dict:
+        # The EFFECTIVE leash the seam will enforce — host config capped by any signed
+        # grant — not the raw override, so the surface never shows a looseness the grant
+        # forbids (panel: the view must display effective authority, not mutable config).
         overrides = getattr(self.session, "leash_overrides", {}) or {}
-        return {name: overrides.get(name, tool.default_leash)
+        return {name: apply_cap(overrides.get(name, tool.default_leash),
+                                leash_cap(self.session, name))
                 for name, tool in toolset().items()}
 
     def _decision(self, d: Decision) -> dict:
@@ -119,7 +124,7 @@ class JudgmentView:
         return {
             "paused": bool(getattr(self.session, "paused", False)),
             "proactivity": getattr(self.session, "proactivity", "conservative"),
-            "capabilities": list(getattr(self.session, "capabilities", ())),
+            "capabilities": list(granted_capabilities(self.session)),  # effective, grant-verified
             "leashes": self._leashes(),
             "attending": [self._decision(d) for d in ds[-8:]],
             "ran": [self._decision(d) for d in ds if d.status in (RAN, FAILED)][-8:],

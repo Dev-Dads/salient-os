@@ -29,6 +29,13 @@ from collaborator.propose import (
     propose,
     veto_proposal,
 )
+from collaborator.policycaps import (
+    PolicyCaps,
+    SignedPolicyCaps,
+    mint,
+    verify,
+    workspace_subject,
+)
 from collaborator.view import (
     JudgmentLedger,
     JudgmentView,
@@ -91,4 +98,9 @@ __all__ = [
     "set_proactivity",
     "pause",
     "resume",
+    "PolicyCaps",
+    "SignedPolicyCaps",
+    "mint",
+    "verify",
+    "workspace_subject",
 ]
