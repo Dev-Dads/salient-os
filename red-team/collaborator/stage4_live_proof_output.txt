@@ -1,0 +1,19 @@
+STAGE-4-LIVE PROOF — the two learning channels disagree on a real governed action
+(the gate is salienceos/consumers/, already built + tested; here it fires end to end)
+
+RISKY + IMPORTANT write  (importance=0.9, risk=0.9 > 0.4 cap):
+  action ran (file written) : True    verified: False
+  recorded rationale        : AdaptationRationale.RISK_EXCEEDED
+  WEIGHT gate  -> nominated_for_learning=False  (HARD BLOCK)   handoff=True
+  MEMORY gate  -> inhibitor=True  class='ephemeral'  (RETAIN as warning)
+  DISAGREEMENT : True   <- the same event refused as a skill, kept as a warning
+  inhibitor weight: day 0 = 1.0   day 100000 = 1.0   -> NO DECAY (a pin, not a fading memory)
+  audit bus    : chain_intact=True  signals_recorded_for_action=3
+
+CONTRAST 1 — low-risk action (importance 0.5, risk 0.0), adaptation ON:
+  disagreement=False  inhibitor=False  -> a safe change is not pinned as a warning
+
+CONTRAST 2 — adaptation OFF (host default): the gate is dormant:
+  learning records: adaptation=None memory=None  -> no ADAPTATION signal, no consume, no inhibitor
+
+STAGE-4-LIVE: OK  (the Stage-1 disagreement proof, promoted from a unit fixture to a live governed worker)
