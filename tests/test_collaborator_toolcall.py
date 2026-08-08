@@ -53,6 +53,21 @@ class ContentEmbedded(unittest.TestCase):
         self.assertEqual(len(r.intents), 1)
         self.assertEqual(r.intents[0].name, "read_file")
 
+    def test_malformed_open_tag_variant_is_caught(self):
+        # gemma emitted "<tool_call {json}>" (no closing tag, space opener) — a real
+        # tool call. The balanced-brace scan catches it despite nested braces.
+        content = '<tool_call {"name": "write_file", "arguments": {"path": "notes.txt", "content": "hi there"}}>'
+        r = parse_message({"content": content})
+        self.assertEqual(len(r.intents), 1)
+        self.assertEqual(r.intents[0].name, "write_file")
+        self.assertEqual(r.intents[0].args, {"path": "notes.txt", "content": "hi there"})
+
+    def test_nested_braces_not_truncated(self):
+        content = '<tool_call>{"name":"write_file","arguments":{"path":"a","content":"{not the end}"}}</tool_call>'
+        r = parse_message({"content": content})
+        self.assertEqual(len(r.intents), 1)
+        self.assertEqual(r.intents[0].args["content"], "{not the end}")
+
 
 class Strictness(unittest.TestCase):
     def test_json_mid_prose_is_not_run(self):

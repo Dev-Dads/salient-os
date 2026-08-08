@@ -23,10 +23,61 @@ from dataclasses import dataclass
 
 COLLABORATOR_TOOLCALL_VERSION = "0.1.0"
 
-# An explicit, delimited tool call inside content — the strongest content signal.
-_TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(\{.*?\}|\[.*?\])\s*</tool_call>", re.DOTALL)
+# The `<tool_call` marker — the strongest content signal. We tolerate every tag
+# variant real models emit (<tool_call>{..}</tool_call>, <tool_call {..}>, bare
+# <tool_call>{..}) by scanning for the marker then extracting the BALANCED JSON
+# object/array that follows, so nested braces don't truncate the call.
+_TOOL_CALL_MARKER_RE = re.compile(r"<tool_call")
 # A single wrapping code fence we tolerate before the whole-content-JSON check.
 _FENCE_RE = re.compile(r"^```(?:json|tool_call)?\s*(.*?)\s*```$", re.DOTALL)
+
+
+def _balanced_span(text: str, i: int) -> int:
+    """text[i] is '{' or '['. Return the index just past the balanced span, or -1.
+    String-aware so braces inside quoted values don't count."""
+    open_c = text[i]
+    close_c = "}" if open_c == "{" else "]"
+    depth = 0
+    in_str = False
+    esc = False
+    for j in range(i, len(text)):
+        c = text[j]
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+        elif c == '"':
+            in_str = True
+        elif c == open_c:
+            depth += 1
+        elif c == close_c:
+            depth -= 1
+            if depth == 0:
+                return j + 1
+    return -1
+
+
+def _tool_call_tag_objects(content: str):
+    """For each ``<tool_call`` marker, extract the balanced JSON that follows it
+    (skipping tag chars/whitespace). Returns list of (start, end, json_str)."""
+    hits = []
+    for m in _TOOL_CALL_MARKER_RE.finditer(content):
+        start = None
+        for j in range(m.end(), min(len(content), m.end() + 40)):
+            if content[j] in "{[":
+                start = j
+                break
+            if content[j] not in "> \t\r\n/=\"'":  # unexpected char -> not a call
+                break
+        if start is None:
+            continue
+        end = _balanced_span(content, start)
+        if end != -1:
+            hits.append((m.start(), end, content[start:end]))
+    return hits
 
 
 @dataclass(frozen=True)
@@ -120,20 +171,26 @@ def parse_message(message: object) -> ParseResult:
     intents.extend(s_intents)
     ambiguous.extend(s_amb)
 
-    # 2) Explicit <tool_call>...</tool_call> blocks in content.
+    # 2) <tool_call> markers in content (any tag variant), balanced-JSON extracted.
     remaining = content
-    blocks = list(_TOOL_CALL_BLOCK_RE.finditer(content))
-    if blocks:
-        for m in blocks:
-            payload = _try_json(m.group(1))
-            if isinstance(payload, list):
-                for obj in payload:
-                    it = _coerce_call(obj, "content_block", raw=m.group(0))
-                    (intents if it else ambiguous).append(it if it else m.group(0)[:200])
-            else:
-                it = _coerce_call(payload, "content_block", raw=m.group(0))
-                (intents.append(it) if it else ambiguous.append(m.group(0)[:200]))
-        remaining = _TOOL_CALL_BLOCK_RE.sub("", content).strip()
+    hits = _tool_call_tag_objects(content)
+    if hits:
+        for _start, _end, js in hits:
+            payload = _try_json(js)
+            objs = payload if isinstance(payload, list) else [payload]
+            for obj in objs:
+                it = _coerce_call(obj, "content_block", raw=js)
+                if it is not None:
+                    intents.append(it)
+                else:
+                    ambiguous.append(js[:200])
+        keep, last = [], 0
+        for start, end, _js in hits:
+            keep.append(content[last:start])
+            last = max(last, end)
+        keep.append(content[last:])
+        remaining = ("".join(keep).replace("<tool_call", "").replace("</tool_call>", "")
+                     .strip(" >/\t\r\n"))
 
     # 3) Whole-content tool-call JSON (hermes3/mistral emit the call as the entire
     #    message). Only when the ENTIRE de-fenced content is that JSON — a

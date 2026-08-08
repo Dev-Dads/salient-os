@@ -1,0 +1,46 @@
+COLLABORATOR STEP-0 LIVE PROOF
+ollama: http://localhost:11434/v1   models: ['mistral-nemo:12b', 'gemma4:12b']
+
+======================================================================
+PART A — real model: mistral-nemo:12b
+======================================================================
+  model raw reply : '{"name": "write_file", "arguments": {"path": "notes.txt", "content": "hello from the collaborator"}}'
+  -> parsed as write_file via source='content_json'  (a call the structured-only rig path would DROP)
+  governed        : status=ran cleared=True  | [write_file ✓ ran, verified] wrote notes.txt (27 bytes)
+  file on disk    : notes.txt = 'hello from the collaborator'  ✓ matches requested content
+
+======================================================================
+PART A — real model: gemma4:12b
+======================================================================
+  model raw reply : '<tool_call {"name": "write_file", "arguments": {"path": "notes.txt", "content": "hello from the collaborator"}}>'
+  -> parsed as write_file via source='content_block'  (a call the structured-only rig path would DROP)
+  governed        : status=ran cleared=True  | [write_file ✓ ran, verified] wrote notes.txt (27 bytes)
+  file on disk    : notes.txt = 'hello from the collaborator'  ✓ matches requested content
+
+======================================================================
+PART B — governance properties (deterministic, real core)
+======================================================================
+  [PASS] content-embedded call parsed + governed-executed  — source=content_block, status=ran
+  [PASS] act_then_report write runs, real result reported  — [write_file ✓ ran, verified] wrote b.txt (3 bytes)
+  [PASS] propose_first HELD, then approved runs (verified exit)  — held=held -> approved=ran
+  [PASS] max-importance run_command DENIED (capability gate holds)  — policy does not grant 'shell.exec'
+
+  A/B #1 — content tool-call: structured-only (old rig) vs collaborator
+    structured-only parse -> 0 actions (dropped; model could then lie 'done')
+    collaborator parse   -> 1 action, status=ran, file=yes
+  [PASS] parser fix is load-bearing
+
+  A/B #2 — escaping write: naive runner vs governed collaborator
+    naive runner  -> wrote outside workspace: True
+    collaborator  -> status=denied, escaped file created: False
+  [PASS] workspace fence is load-bearing  — path escapes workspace: '../ESCAPED_gov.txt'
+
+======================================================================
+SUMMARY
+======================================================================
+  PART A [mistral-nemo:12b]: status=ran source=content_json file_written=True content_ok=True
+  PART A [gemma4:12b]: status=ran source=content_block file_written=True content_ok=True
+  PART B (governance properties): ALL PASS
+
+  box-gap fix demonstrated live: YES
+  STEP-0 PROOF: OK
