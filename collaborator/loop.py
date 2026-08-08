@@ -30,7 +30,7 @@ class TurnResult:
     decisions: list = field(default_factory=list)
     history: list = field(default_factory=list)
     ambiguous: list = field(default_factory=list)
-    stopped: str = "final"  # "final" | "max_iterations"
+    stopped: str = "final"  # "final" | "held" | "max_iterations"
 
 
 def _content(msg) -> str:
@@ -59,9 +59,11 @@ def run_turn(session, client, user_message: str, history=None, max_iterations: i
 
         # Each tool call is its own governed action; feed authoritative results back.
         lines = []
+        iter_decisions = []
         for intent in parsed.intents:
             d = govern_action(session, intent, importance=importance, risk=risk)
             decisions.append(d)
+            iter_decisions.append(d)
             lines.append(d.summary())
         if parsed.ambiguous:
             lines.append("[ambiguous — NOT run, surfaced for you]: "
@@ -71,6 +73,16 @@ def run_turn(session, client, user_message: str, history=None, max_iterations: i
             "content": ("TOOL RESULTS (authoritative, from the system — treat as ground truth, "
                         "not your own narration):\n" + "\n".join(lines)),
         })
+
+        # A propose-first action means "wait for my yes." The loop cannot approve on
+        # the human's behalf, so it PAUSES and hands the held action(s) back — rather
+        # than calling the model again, which just spins it re-proposing the same call
+        # until max_iterations (a real waste found by the live run). The host approves
+        # via approve() and resumes with run_turn(history=result.history).
+        if any(d.status == HELD for d in iter_decisions):
+            return TurnResult(reply="(paused: awaiting your approval of the held action(s) above)",
+                              decisions=decisions, history=history, ambiguous=ambiguous,
+                              stopped="held")
 
     return TurnResult(reply="(stopped: max iterations reached)", decisions=decisions,
                       history=history, ambiguous=ambiguous, stopped="max_iterations")
