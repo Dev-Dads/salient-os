@@ -29,6 +29,14 @@ from collaborator.propose import (
     propose,
     veto_proposal,
 )
+from collaborator.view import (
+    JudgmentLedger,
+    JudgmentView,
+    pause,
+    resume,
+    set_leash,
+    set_proactivity,
+)
 from collaborator.session import DEFAULT_CAPABILITIES, Session
 from collaborator.toolcall import ParseResult, ToolIntent, parse_message
 from collaborator.tools import (
@@ -77,4 +85,10 @@ __all__ = [
     "approve_proposal",
     "veto_proposal",
     "Proposal",
+    "JudgmentView",
+    "JudgmentLedger",
+    "set_leash",
+    "set_proactivity",
+    "pause",
+    "resume",
 ]

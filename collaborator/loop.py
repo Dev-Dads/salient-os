@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 
 from collaborator.governance import (
     HELD,
+    PAUSED,
     Decision,
     execute_and_verify,
     govern_action,
@@ -31,7 +32,7 @@ class TurnResult:
     decisions: list = field(default_factory=list)
     history: list = field(default_factory=list)
     ambiguous: list = field(default_factory=list)
-    stopped: str = "final"  # "final" | "held" | "max_iterations"
+    stopped: str = "final"  # "final" | "held" | "paused" | "max_iterations"
 
 
 def _content(msg) -> str:
@@ -80,6 +81,10 @@ def run_turn(session, client, user_message: str, history=None, max_iterations: i
         # than calling the model again, which just spins it re-proposing the same call
         # until max_iterations (a real waste found by the live run). The host approves
         # via approve() and resumes with run_turn(history=result.history).
+        if any(d.status == PAUSED for d in iter_decisions):
+            return TurnResult(reply="(stopped: the host paused the session)",
+                              decisions=decisions, history=history, ambiguous=ambiguous,
+                              stopped="paused")
         if any(d.status == HELD for d in iter_decisions):
             return TurnResult(reply="(paused: awaiting your approval of the held action(s) above)",
                               decisions=decisions, history=history, ambiguous=ambiguous,
