@@ -110,9 +110,13 @@ def _exec_write(workspace, args: dict) -> Execution:
     content = str(args.get("content") or "")
     target = resolve_in_workspace(workspace, rel)  # raises WorkspaceError -> denied upstream
     # A real child process performs the write, so the supervisor observes an exit
-    # status this process did not author.
+    # status this process did not author. We write raw UTF-8 BYTES (not write_text)
+    # so the file on disk is byte-for-byte the content we hashed — text mode would
+    # translate "\n"->"\r\n" on Windows, diverging the disk bytes from the artifact
+    # hash and false-failing verification on every multi-line write (a real bug found
+    # by the live task-scale run; Linux CI never saw it).
     script = ("import sys,pathlib;"
-              "pathlib.Path(sys.argv[1]).write_text(sys.argv[2], encoding='utf-8');"
+              "pathlib.Path(sys.argv[1]).write_bytes(sys.argv[2].encode('utf-8'));"
               "sys.exit(0)")
     res = run_supervised([sys.executable, "-c", script, str(target), content], cwd=workspace)
     ok = res.returncode == 0
