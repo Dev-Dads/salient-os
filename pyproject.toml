@@ -13,4 +13,4 @@ license = { file = "LICENSE" }
 dependencies = []
 
 [tool.setuptools.packages.find]
-include = ["salienceos*"]
+include = ["salienceos*", "collaborator*"]
