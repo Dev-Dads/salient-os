@@ -55,6 +55,7 @@ FAILED = "failed"    # executed but did not clear (verification failed / tool er
 HELD = "held"        # propose_first: awaiting your approval, not run
 DENIED = "denied"    # capability not granted, path escaped, or governance error
 NOTIFIED = "notified"  # notify_only: surfaced, not run
+PAUSED = "paused"    # the host paused the session from the judgment view — not run
 UNKNOWN_TOOL = "unknown_tool"
 
 # Host-computed risk per tool (INFLUENCE only — drives verification depth, never
@@ -175,6 +176,13 @@ def govern_action(session, intent: ToolIntent, importance: "float | None" = None
     leash = _resolve_leash(session, tool, leash)
     imp = session.default_importance if importance is None else importance
     rk = _TOOL_RISK.get(tool.name, 0.3) if risk is None else risk
+
+    # The judgment view's pause control (Step 2): while paused, the agent's action
+    # stream is HELD — nothing runs — until the host resumes. Fail-safe (holds, never
+    # runs). The host's own explicit approve()/veto of a specific item is unaffected.
+    if getattr(session, "paused", False):
+        return Decision(action_id=action_id, tool=tool.name, status=PAUSED,
+                        reason="session paused by host", leash=leash, args=intent.args)
 
     # --- interpret (fail closed: any error here denies) ----------------------
     try:

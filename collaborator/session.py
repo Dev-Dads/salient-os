@@ -50,6 +50,9 @@ class Session:
         if proactivity not in ("off", "conservative", "eager"):
             raise ValueError("proactivity must be 'off', 'conservative', or 'eager'")
         self.proactivity = proactivity
+        # Runtime steering state (set from the judgment view, not construction): while
+        # paused, the agent's action stream is held. Host authority, never model-set.
+        self.paused = False
         nd = float(now_days)  # injected clock for the memory governor
         if nd != nd or nd < 0:  # NaN or negative -> the memory gate would reject it
             raise ValueError("now_days must be a finite non-negative number")

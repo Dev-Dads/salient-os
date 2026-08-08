@@ -1,0 +1,24 @@
+② JUDGMENT-VIEW proof — steering a job through the view (no prompts)
+
+  1. write draft.txt (act-then-report)      -> ran
+  2. [control: tighten write_file leash]     -> held  (steered to hold)
+  3. [control: pause]                        -> paused  (job held)
+     a running turn under pause               -> stopped=paused
+  4. [control: resume]
+  5. [control: veto a proposal]              -> held  (exists=False)
+  6. [control: approve a proposal]           -> ran  (exists=True)
+  7. P-01: controls grant nothing            -> paused=paused  then=denied
+
+  view snapshot counts: {'governed': 5, 'ran': 2, 'held': 3, 'paused': 1, 'proposals_pending': 1}
+  rendered -> D:\repo\salient-os\red-team\collaborator\judgment_view.html
+
+=== CHECKS ===
+  [PASS] a normal write runs
+  [PASS] tightening the leash holds the next write
+  [PASS] pause halts the next action
+  [PASS] a running turn halts under pause
+  [PASS] a vetoed proposal never runs
+  [PASS] an approved proposal runs
+  [PASS] controls never grant a capability (paused, then still denied)
+
+② JUDGMENT-VIEW: OK  (7/7 steering properties held)
