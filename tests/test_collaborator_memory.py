@@ -472,6 +472,24 @@ class VerifyPassHardening(unittest.TestCase):
         self.assertEqual(te["session_id"], "collaborator_deed:sess_123")
 
 
+class NestedWrite(unittest.TestCase):
+    def test_write_file_creates_parent_dirs(self):
+        from collaborator.tools import execute_tool, get_tool
+        with tempfile.TemporaryDirectory() as tmp:
+            ex = execute_tool(get_tool("write_file"), tmp,
+                              {"path": ".github/workflows/ci.yml", "content": "name: CI\n"})
+            self.assertTrue(ex.result.ok, ex.result.error)
+            self.assertTrue((pathlib.Path(tmp) / ".github" / "workflows" / "ci.yml").exists())
+
+    def test_nested_write_still_fenced(self):
+        # creating parents must NOT let a write escape the workspace
+        from collaborator.tools import WorkspaceError, execute_tool, get_tool
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(WorkspaceError):
+                execute_tool(get_tool("write_file"), tmp,
+                             {"path": "../../escape/x.txt", "content": "no"})
+
+
 class RecentActionsContext(unittest.TestCase):
     def test_recent_actions_are_fenced(self):
         with tempfile.TemporaryDirectory() as tmp:
