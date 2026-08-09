@@ -16,6 +16,7 @@ defenses, not structural ones.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
@@ -25,11 +26,40 @@ _MAX_FIELD = 160  # per-field render cap (anti-DoS / anti-structure-forging)
 
 
 def _flatten(text: str) -> str:
-    """Collapse a stored field to a single safe inline span: strip control chars and
-    newlines (so memory content can never forge message structure), cap length."""
-    s = "".join(ch if (ch == " " or ord(ch) >= 32) else " " for ch in str(text or ""))
-    s = s.replace("\r", " ").replace("\n", " ").strip()
-    return s[:_MAX_FIELD]
+    """Collapse a stored field to a single safe inline span so memory content can never
+    forge message structure: replace every NON-PRINTABLE codepoint with a space — this
+    covers ASCII controls, DEL, the C1 block, NEL (U+0085), the Unicode line/paragraph
+    separators (U+2028/9), zero-width and bidi-override format chars — neutralize the
+    reserved fence delimiters (`<<`/`>>`), collapse whitespace, and cap length.
+    (`str.isprintable()` is False for exactly the Cc/Cf/Cs/Co/Cn/Zl/Zp/Zs categories bar
+    the ASCII space, which is the set that can forge lines or hide payloads.)"""
+    s = "".join(ch if ch.isprintable() else " " for ch in str(text or ""))
+    s = s.replace("<<", "«").replace(">>", "»")   # content can't forge a fence open/close
+    return " ".join(s.split())[:_MAX_FIELD]        # collapse whitespace runs, trim
+
+
+# Substrings that, in memory/fact content, most often mean "someone is steering the model
+# through data". Neutralized (not executed) at render time — belt to the fence. NOTE: no
+# trailing \b after the colon forms (a `\b` between ':' and ' ' never matches, which had
+# silently disabled the `system:`/`assistant:` branches for the natural `role: text` shape).
+_IMPERATIVE_MARKERS = re.compile(
+    r"(?i)(ignore\s+(all|previous|prior)|disregard|override|forget\s+(all|the|previous)|"
+    r"you\s+are\s+now|new\s+instructions|(system|assistant|user|developer)\s*:|"
+    r"instructions?\s*:)")
+# Tool-call shapes: the tool names we run, plus generic verbs, followed by a bracket/brace/
+# quote via a `:`, `=`, or whitespace separator (so `run_command ["rm"]` is caught too).
+_TOOLJSON_MARKER = re.compile(
+    r'(?i)"?(propose|action|run_command|read_file|write_file|run|exec|tool|command)"?'
+    r'\s*[:=\s]\s*[\[{"]')
+
+
+def _neutralize(value: str) -> str:
+    """Flatten + redact instruction/tool-call shapes. The single renderer path for BOTH
+    facts and history tuples (behavioral defense E; canary-tested)."""
+    s = _flatten(value)
+    s = _IMPERATIVE_MARKERS.sub("⟨redacted-imperative⟩", s)
+    s = _TOOLJSON_MARKER.sub("⟨redacted-tool-shape⟩", s)
+    return s
 
 
 @dataclass(frozen=True)
@@ -92,12 +122,19 @@ class CdmsMemorySource:
     def read_gist_tuples(self, query: str, *, k: int = 8,
                          project: "str | None" = None) -> "tuple[GistTuple, ...]":
         try:
-            rows = self._read(query, k, project) or ()
+            # Materialize inside the guard: a LAZY reader (generator) that raises mid-
+            # iteration must still fail to EMPTY, never let the exception escape as a
+            # partial/raw result (claim B: "errors return empty on every path").
+            rows = list(self._read(query, k, project) or ())
         except Exception:  # noqa: BLE001 — memory is best-effort; fail to empty, never raw
             return ()
         out = []
         for r in rows:
             try:
+                # Defense-in-depth on the injected seam: a row that declares a non-gist
+                # tier is dropped (the proposer reads the gist tier only).
+                if str(r.get("tier", "gist")).lower() != "gist":
+                    continue
                 out.append(GistTuple(
                     subject=str(r["subject"]), relation=str(r["relation"]),
                     obj=str(r.get("obj", r.get("object", ""))),
@@ -135,7 +172,7 @@ def render_history(tuples: "tuple[GistTuple, ...] | list[GistTuple]") -> str:
         return ""
     lines = [HISTORY_FENCE_OPEN]
     for t in tuples:
-        rel, obj = _flatten(t.relation), _flatten(t.obj)
+        rel, obj = _neutralize(t.relation), _neutralize(t.obj)  # SAME fence as facts (E)
         try:
             support = max(1, int(t.support))
         except (TypeError, ValueError):

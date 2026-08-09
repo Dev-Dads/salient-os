@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 
 COLLABORATOR_INGEST_VERSION = "0.1.0"
@@ -54,8 +54,11 @@ class DeedEvent:
     project: str
     session_id: str
     success: "bool | None" = None
-    provenance: str = DEED_PROVENANCE
-    source: str = DEED_SOURCE
+    # NON-init + frozen: a deed is ALWAYS `ambiguous` and source-tagged. No caller can
+    # construct a `trusted` deed (which could then mint a scar in CDMS) — the guarantee is
+    # the type, not the convention of going through ingest_deed.
+    provenance: str = field(default=DEED_PROVENANCE, init=False)
+    source: str = field(default=DEED_SOURCE, init=False)
 
     def to_turn_event(self) -> dict:
         """A CDMS-``TurnEvent``-shaped dict. Text fields carry the STRUCTURED deed, never
