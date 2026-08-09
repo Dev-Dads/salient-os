@@ -42,9 +42,10 @@ class _FakeConn:
         self.sent = {"headers": {}}
         sink.append(self)
 
-    def putrequest(self, method, target):
+    def putrequest(self, method, target, skip_host=False, **kw):
         self.sent["method"] = method
         self.sent["target"] = target
+        self.sent["skip_host"] = skip_host
 
     def putheader(self, key, value):
         self.sent["headers"][key] = value
@@ -240,6 +241,15 @@ class Fetch(unittest.TestCase):
         self.assertFalse(r.record.ok)
         self.assertIn("resolve failed", r.record.error)
 
+    def test_get_uses_skip_host_single_host_header(self):
+        # M3: skip_host=True so we set exactly ONE canonical Host header (not a duplicate).
+        sink = []
+        r = fetch("https://docs.example/x", resolver=lambda h: ["93.184.216.34"],
+                  connection_factory=_factory(_FakeResp(200, b"ok"), sink))
+        self.assertTrue(r.record.ok)
+        self.assertTrue(sink[0].sent["skip_host"])
+        self.assertEqual(sink[0].sent["headers"].get("Host"), "docs.example")
+
 
 class _FakePostConn:
     """Like _FakeConn but for the POST path: accepts skip_host, and captures the sent body."""
@@ -419,6 +429,52 @@ class Post(unittest.TestCase):
                             connection_factory=_post_factory(_FakeResp(200), []))
             self.assertFalse(r.record.ok, u)
             self.assertIn("request target", r.record.error)
+
+    def test_lone_surrogate_body_refused_never_raises(self):
+        # S1: a lone surrogate is legal JSON (survives a model tool-call) but not utf-8-encodable.
+        r = egress.post("https://api.example/", "\ud800", resolver=lambda h: ["93.184.216.34"],
+                        connection_factory=_post_factory(_FakeResp(200), []))
+        self.assertFalse(r.record.ok)
+        self.assertIn("utf-8", r.record.error)
+
+    def test_content_type_is_recorded_in_audit(self):
+        # C1: the content-type rides the wire, so the channel-integrity record must carry it.
+        r, sink = self._ok(content_type="application/json; x=marker")
+        self.assertEqual(r.record.request_content_type, "application/json; x=marker")
+        self.assertEqual(sink[0].sent["headers"].get("Content-Type"), "application/json; x=marker")
+
+    def test_c1_control_char_content_type_refused(self):
+        # C1: U+0085 (NEL) is latin-1 but non-ASCII -> refused (would otherwise reach the wire).
+        r = egress.post("https://api.example/", "{}", content_type="app/json\x85evil",
+                        resolver=lambda h: ["93.184.216.34"],
+                        connection_factory=_post_factory(_FakeResp(200), []))
+        self.assertFalse(r.record.ok)
+
+    def test_over_cap_refusal_keeps_body_hash(self):
+        # M4: an over-cap refusal is still linkable to what was attempted (hash + length).
+        r = egress.post("https://api.example/", "x" * (egress.MAX_POST_BODY + 1),
+                        resolver=lambda h: ["93.184.216.34"],
+                        connection_factory=_post_factory(_FakeResp(200), []))
+        self.assertFalse(r.record.ok)
+        self.assertTrue(r.record.request_body_hash)
+        self.assertEqual(r.record.request_body_len, egress.MAX_POST_BODY + 1)
+
+    def test_empty_auth_is_no_credential_not_a_refusal(self):
+        # M5: an empty host credential means "send no Authorization", not "refuse the emission".
+        r, sink = self._ok(auth="")
+        self.assertTrue(r.record.ok)
+        self.assertNotIn("Authorization", sink[0].sent["headers"])
+
+    def test_redirect_location_bounded_and_sanitized(self):
+        # M1: a huge / CRLF-bearing Location must not enter the audit unbounded or unsanitized.
+        loc = "https://evil/" + ("A" * 60000) + "\r\nFORGED: 1"
+        r = egress.post("https://api.example/", "{}", resolver=lambda h: ["93.184.216.34"],
+                        connection_factory=_post_factory(
+                            _FakeResp(302, headers={"Location": loc}), []))
+        self.assertFalse(r.record.ok)
+        self.assertLessEqual(len(r.record.redirect_location), egress.MAX_URL_TARGET)
+        self.assertNotIn("\r", r.record.redirect_location)
+        self.assertNotIn("\n", r.record.redirect_location)
 
 
 class EmissionSeal(unittest.TestCase):

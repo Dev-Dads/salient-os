@@ -312,6 +312,52 @@ class NetPostHeldPayloadSeal(unittest.TestCase):
             self.assertEqual(out.status, RAN)   # unchanged payload -> seal matches -> sends
 
 
+class NetPostNeverRaises(unittest.TestCase):
+    """govern_action / approve must degrade a bad emission to a FAILED Decision, never raise
+    (transport red-team S1: a lone-surrogate body is legal JSON but not utf-8-encodable)."""
+
+    def test_lone_surrogate_body_autonomous_fails_not_raises(self):
+        with tempfile.TemporaryDirectory() as d:
+            s = _granted(d, ("net.post:api.example", "net.post.auto:api.example"),
+                         {"net_post": "act_then_report"})
+            dec = govern_action(s, _np(body="\ud800"))   # must NOT raise
+            self.assertin_failed(dec)
+
+    def test_lone_surrogate_body_gated_approve_fails_not_raises(self):
+        with tempfile.TemporaryDirectory() as d:
+            s = _granted(d, ("net.post:api.example",), {"net_post": "propose_first"})
+            held = govern_action(s, _np(body="\ud800"))
+            self.assertEqual(held.status, HELD)
+            out = approve(s, held)                        # must NOT raise
+            self.assertin_failed(out)
+
+    def test_egress_backstop_downgrades_any_raise_to_failed(self):
+        # Even if the mediated client raised for an UNFORESEEN reason, the seam returns FAILED.
+        def boom(*a, **k):
+            raise RuntimeError("unexpected")
+        with tempfile.TemporaryDirectory() as d:
+            s = _granted(d, ("net.post:api.example", "net.post.auto:api.example"),
+                         {"net_post": "act_then_report"})
+            with mock.patch("collaborator.egress.post", boom):
+                dec = govern_action(s, _np())
+            self.assertEqual(dec.status, FAILED)
+            self.assertIn("egress error", dec.reason)
+
+    def assertin_failed(self, dec):
+        self.assertEqual(dec.status, FAILED)
+
+
+class NetPostPreviewShowsCanonicalDest(unittest.TestCase):
+    def test_held_emission_preview_carries_canonical_dest(self):
+        # M6: the one human hand reads the canonical destination, not a raw string canonicalization
+        # may rewrite (soft hyphen / ideographic dot).
+        with tempfile.TemporaryDirectory() as d:
+            s = _granted(d, ("net.post:api.example",), {"net_post": "propose_first"})
+            held = govern_action(s, _np("https://api.exa­mple/pay"))  # soft hyphen -> api.example
+            self.assertEqual(held.status, HELD)
+            self.assertEqual(held.preview.get("canonical_dest"), "api.example")
+
+
 class NetPostApprovalRegateTOCTOU(unittest.TestCase):
     def test_host_revoked_between_hold_and_approve_denies(self):
         with tempfile.TemporaryDirectory() as d:

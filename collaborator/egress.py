@@ -213,6 +213,10 @@ class EgressRecord:
     request_body_hash: str = ""
     request_body_len: int = 0
     request_body_preview: str = ""
+    # ADR 0003 Tier 2 (transport red-team C1): the content-type actually put on the wire — it is a
+    # model-reachable outbound header, so the audited surface must include it or the channel-
+    # integrity record under-counts what was sent. Empty for a GET / a refusal before validation.
+    request_content_type: str = ""
 
 
 @dataclass
@@ -260,18 +264,29 @@ def _is_clean_request_target(target: str) -> bool:
     return True
 
 
+def _sanitize_location(loc):
+    """Bound + strip control chars from a redirect Location before it enters the audit record: a
+    real response parser can obs-fold a CRLF into a header value (which would forge audit lines),
+    and a 60 KB Location must not outweigh our own request-target cap (transport red-team M1)."""
+    if not loc:
+        return loc
+    cleaned = "".join(c for c in loc if ord(c) >= 0x20 and ord(c) != 0x7f)
+    return cleaned[:MAX_URL_TARGET]
+
+
 def _is_clean_header_value(value: str, max_len: int = 8192) -> bool:
-    """A single-line, latin-1-encodable header value within a length bound and free of control
-    chars. HTTP header values are latin-1: a non-latin-1 char (e.g. a model-supplied
-    ``content_type`` with a snowman) would raise UnicodeEncodeError out of ``putheader`` — this
-    guard turns that (and control-char injection and oversize) into a clean refused record instead
-    of an exception escaping the client (the ADR's 'never raises' boundary)."""
+    """A single-line, **ASCII** header value within a length bound and free of control chars. A
+    content-type and a Bearer credential are ASCII in practice; requiring ASCII (not just latin-1)
+    ALSO rejects the C1 control range U+0080–U+009F (NEL etc.) which is latin-1-encodable and would
+    otherwise reach the wire inside a header. Turns non-ascii / control-char injection / oversize
+    into a clean refused record instead of a UnicodeEncodeError escaping the client (the ADR's
+    'never raises' boundary; net.post transport red-team C1/S1)."""
     if not isinstance(value, str) or not value or len(value) > max_len:
         return False
     if _has_control_chars(value):
         return False
     try:
-        value.encode("latin-1")
+        value.encode("ascii")
     except UnicodeEncodeError:
         return False
     return True
@@ -292,7 +307,10 @@ def emission_seal(url: str, body, content_type: str = "") -> str:
     if isinstance(body, (bytes, bytearray)):
         body_bytes = bytes(body)
     else:
-        body_bytes = str(body if body is not None else "").encode("utf-8")
+        # surrogatepass so a lone-surrogate body (legal JSON, refused later by post()) still SEALS
+        # deterministically instead of raising here at hold time — the seal only needs consistency
+        # between hold and approve, not validity.
+        body_bytes = str(body if body is not None else "").encode("utf-8", "surrogatepass")
     h = hashlib.sha256()
     for part in (host, target, str(content_type or "")):
         h.update(part.encode("utf-8", "replace"))
@@ -338,8 +356,8 @@ def fetch(url: str, *, timeout: int = DEFAULT_TIMEOUT, max_response: int = DEFAU
         conn = connection_factory(host, pinned)
 
     try:
-        conn.putrequest("GET", target)          # Host header defaults to the canonical self.host
-        conn.putheader("Host", host)
+        conn.putrequest("GET", target, skip_host=True)   # we set the canonical Host ONCE ourselves
+        conn.putheader("Host", host)                      # (skip_host avoids a duplicate Host header)
         conn.putheader("User-Agent", _USER_AGENT)
         conn.putheader("Accept", "*/*")
         conn.putheader("Connection", "close")
@@ -347,7 +365,7 @@ def fetch(url: str, *, timeout: int = DEFAULT_TIMEOUT, max_response: int = DEFAU
         resp = conn.getresponse()
         status = int(resp.status)
         if 300 <= status < 400:                  # FAIL CLOSED on redirect — do not follow
-            loc = resp.getheader("Location")
+            loc = _sanitize_location(resp.getheader("Location"))
             return _refused(host, target_hash, request_bytes,
                             f"redirect not followed ({status}); re-gate the target as a new intent",
                             status=status, redirect=loc, ip=pinned)
@@ -407,31 +425,38 @@ def post(url: str, body, *, content_type: str = DEFAULT_POST_CONTENT_TYPE, auth:
     target_hash = hashlib.sha256(target.encode("utf-8", "replace")).hexdigest()
     request_bytes = len(target)
 
-    # The body is the outbound PAYLOAD. Encode a str as UTF-8; accept bytes as-is; refuse anything
-    # else. Hard-cap the length — the payload is the real exfil surface for an emission.
+    # The body is the outbound PAYLOAD. Encode a str as UTF-8 (a lone surrogate is legal JSON but
+    # NOT utf-8-encodable -> refuse, never raise: transport red-team S1); accept bytes as-is; refuse
+    # anything else. Hash BEFORE the cap so an over-cap refusal stays linkable to what was attempted
+    # (M4). Hard-cap the length — the payload is the real exfil surface for an emission.
     if isinstance(body, str):
-        body_bytes = body.encode("utf-8")
+        try:
+            body_bytes = body.encode("utf-8")
+        except UnicodeError:
+            return _refused(host, target_hash, request_bytes,
+                            "body not utf-8 encodable (lone surrogate?)", method="POST")
     elif isinstance(body, (bytes, bytearray)):
         body_bytes = bytes(body)
     else:
         return _refused(host, target_hash, request_bytes, "body must be str or bytes", method="POST")
     body_len = len(body_bytes)
+    body_hash = hashlib.sha256(body_bytes).hexdigest()
     if body_len > MAX_POST_BODY:
         return _refused(host, target_hash, request_bytes,
                         f"body exceeds cap ({body_len} > {MAX_POST_BODY}; exfil guard)",
-                        method="POST", body_len=body_len)
-    body_hash = hashlib.sha256(body_bytes).hexdigest()
+                        method="POST", body_hash=body_hash, body_len=body_len)
     # The preview is recorded ONLY for a human-gated emission (keep_preview) — the durable trail
     # is otherwise body-free (Josh's steer: body-free for autonomous, bounded preview for gated).
     body_preview = body_bytes[:_BODY_PREVIEW_BYTES].decode("utf-8", "replace") if keep_preview else ""
 
     ctype = str(content_type or DEFAULT_POST_CONTENT_TYPE)
-    if not _is_clean_header_value(ctype, max_len=256):  # a content-type is short + latin-1
+    if not _is_clean_header_value(ctype, max_len=256):  # a content-type is short + ASCII
         return _refused(host, target_hash, request_bytes, "illegal content-type (header injection?)",
                         method="POST", body_hash=body_hash, body_len=body_len, body_preview=body_preview)
-    # Belt-and-suspenders on the host-injected credential too: never let a control char split the
-    # request (the source is host config, not the model, but the transport point stays fail-closed).
-    if auth is not None and not _is_clean_header_value(str(auth)):
+    # An EMPTY host credential is "no credential" (skip the header), not a refusal (M5); a NON-empty
+    # one is fail-closed on any control/non-ascii char (the source is host config, not the model,
+    # but the transport point stays honest).
+    if auth and not _is_clean_header_value(str(auth)):
         return _refused(host, target_hash, request_bytes, "illegal authorization value",
                         method="POST", body_hash=body_hash, body_len=body_len, body_preview=body_preview)
 
@@ -439,9 +464,9 @@ def post(url: str, body, *, content_type: str = DEFAULT_POST_CONTENT_TYPE, auth:
         return EgressRecord(
             canonical_dest=host, method="POST", request_target_hash=target_hash,
             request_bytes=request_bytes, status=status, response_hash=response_hash,
-            response_len=response_len, redirect_location=redirect, resolved_ip=pinned, ok=ok,
-            error=error, truncated=truncated, request_body_hash=body_hash,
-            request_body_len=body_len, request_body_preview=body_preview)
+            response_len=response_len, redirect_location=_sanitize_location(redirect),
+            resolved_ip=pinned, ok=ok, error=error, truncated=truncated, request_body_hash=body_hash,
+            request_body_len=body_len, request_body_preview=body_preview, request_content_type=ctype)
 
     try:
         ips = resolver(host)

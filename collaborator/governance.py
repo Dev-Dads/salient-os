@@ -320,12 +320,17 @@ def govern_action(session, intent: ToolIntent, importance: "float | None" = None
         seal = (egress.emission_seal(str(intent.args.get("url") or ""), intent.args.get("body"),
                                      str(intent.args.get("content_type") or ""))
                 if (getattr(tool, "egress", False) and tool.mutating) else "")
+        # Surface the CANONICAL destination for an egress action, so the one human hand on an
+        # emission reads the host bytes actually leave for — not the raw model string, which
+        # canonicalization may quietly rewrite (soft hyphen, ideographic dot; transport red-team M6).
+        preview = {"tool": tool.name, "args": intent.args,
+                   "verification_depth": directive.verification_depth}
+        if getattr(tool, "egress", False):
+            preview["canonical_dest"] = egress.canonical_host(str(intent.args.get("url") or ""))
         return Decision(action_id=action_id, tool=tool.name, status=HELD,
                         reason="propose-first leash: awaiting approval", leash=leash,
                         directive=directive, args=intent.args, offense_flag=offense_flag,
-                        seal=seal,
-                        preview={"tool": tool.name, "args": intent.args,
-                                 "verification_depth": directive.verification_depth})
+                        seal=seal, preview=preview)
 
     # leash == ACT_THEN_REPORT -> run it (pass the EFFECTIVE leash, incl. any net.post auto-lift)
     return execute_and_verify(session, tool, directive, action_id, intent.args, leash=leash)
@@ -432,8 +437,14 @@ def execute_and_verify(session, tool: Tool, directive, action_id: str, args: dic
             creds = getattr(session, "egress_credentials", None) or {}
             egress_auth = creds.get(emit_host) if emit_host is not None else None
             egress_preview = (leash == PROPOSE_FIRST)
-        execution = execute_tool(tool, session.workspace, args,
-                                 egress_preview=egress_preview, egress_auth=egress_auth)
+        try:
+            execution = execute_tool(tool, session.workspace, args,
+                                     egress_preview=egress_preview, egress_auth=egress_auth)
+        except Exception as exc:  # noqa: BLE001 — egress must degrade to FAILED, never raise out of
+            # govern_action/approve (transport red-team S1 backstop: the mediated client's own input
+            # guards are belt; this is suspenders around the whole egress execute, like the artifact branch).
+            return Decision(action_id, tool.name, FAILED, f"egress error: {type(exc).__name__}", leash,
+                            cleared=False, directive=directive, args=args)
         rec = execution.egress
         if rec is None:  # an egress executor must always attach a record; missing -> FAILED, never a raise
             return Decision(action_id, tool.name, FAILED, "egress produced no record", leash,
