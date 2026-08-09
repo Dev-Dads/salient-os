@@ -16,6 +16,7 @@ says so (never a fabricated success).
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import sys
 import unicodedata
@@ -25,6 +26,8 @@ from pathlib import Path
 from salienceos.verifier import Stakes
 from salienceos.verifier.observers import SupervisedResult, run_supervised
 from salienceos.verifier.signing import sha256_bytes
+
+from collaborator import egress
 
 COLLABORATOR_TOOLS_VERSION = "0.1.0"
 
@@ -51,8 +54,14 @@ class Tool:
     #                strongest "can't lie about what was written".
     #   "exit"     — supervised exit code (the supervisor's own view, not the
     #                tool's self-report); for commands with no declared artifact.
+    #   "egress_log" — a mediated network read; the claim is a channel-integrity
+    #                egress record (ADR 0003), NOT independent world-observation.
     #   "none"     — read-only; nothing is mutated, nothing to verify.
     verify_mode: str = "none"
+    # ADR 0003: an egress tool's authority is a per-request capability DERIVED from its
+    # destination (net.get:<canonical-host>), not the static ``capability`` string. The
+    # governance gate computes and checks the derived capability when this is True.
+    egress: bool = False
 
 
 @dataclass(frozen=True)
@@ -71,6 +80,7 @@ class Execution:
     exit_code: "int | None" = None
     write_set: tuple[str, ...] = ()
     artifact_hashes: dict = field(default_factory=dict)
+    egress: "egress.EgressRecord | None" = None  # ADR 0003: channel-integrity audit of a net.get
 
 
 _TOOLS: dict[str, Tool] = {
@@ -80,7 +90,43 @@ _TOOLS: dict[str, Tool] = {
                       Stakes.LOW, ACT_THEN_REPORT, verify_mode="none"),
     "run_command": Tool("run_command", "shell.exec", True, "shell.run",
                         Stakes.NORMAL, PROPOSE_FIRST, verify_mode="exit"),  # strictest leash
+    # ADR 0003 Tier 1: a mediated, allowlisted, read-only network GET. Its authority is the
+    # DERIVED capability net.get:<canonical-host> (default-deny — reachable only if the signed
+    # caps name that exact host), never the static "net.get" base below. Not mutating (it
+    # changes nothing in the workspace); the claim is a channel-integrity egress record.
+    "web_fetch": Tool("web_fetch", "net.get", False, "net.get",
+                      Stakes.LOW, ACT_THEN_REPORT, verify_mode="egress_log", egress=True),
 }
+
+
+# --- ADR 0003 audit-only offense recognizer (defense-in-depth; NEVER denies) --------------
+
+# High-signal offensive-tool binary names. Deliberately NARROW: offense is semantic and lives
+# in the aggregate of innocuous steps, so a recognizer cannot be the boundary — the real
+# prohibition is STRUCTURAL (default-deny egress + no in-band path to a non-consented host).
+# This only TAGS obvious shapes for the audit trail (ADR 0003 "audit-only defense-in-depth").
+_OFFENSE_TOKENS = frozenset({
+    "nmap", "masscan", "zmap", "sqlmap", "hydra", "medusa", "ncrack", "patator",
+    "msfconsole", "msfvenom", "metasploit", "nikto", "wpscan", "gobuster", "dirbuster",
+    "hashcat", "aircrack-ng", "responder", "bettercap", "ettercap", "setoolkit", "sqlninja",
+})
+
+
+def flag_offense_shape(name: str, args: dict) -> str:
+    """AUDIT-ONLY tag of an obvious offensive-tool shape in a shell command (ADR 0003).
+
+    Returns the matched token(s) joined by ``,`` (empty string = no match). This NEVER denies
+    and NEVER changes control flow — it is recorded so a forensic reader can see it. The
+    boundary is the structural default-deny, not this predicate; a determined attacker renames
+    the binary or hand-writes a socket, and legitimate authorized testing also trips it, which
+    is exactly why it must not gate.
+    """
+    if name != "run_command":
+        return ""
+    cmd = args.get("command")
+    text = " ".join(str(c) for c in cmd) if isinstance(cmd, (list, tuple)) else str(cmd or "")
+    tokens = {t.strip("/\\").lower() for t in re.split(r"[\s;|&/\\()]+", text) if t}
+    return ",".join(sorted(tokens & _OFFENSE_TOKENS))
 
 
 def get_tool(name: str) -> "Tool | None":
@@ -220,7 +266,29 @@ def _exec_command(workspace, args: dict) -> Execution:
     )
 
 
-_EXECUTORS = {"write_file": _exec_write, "read_file": _exec_read, "run_command": _exec_command}
+def _exec_web_fetch(workspace, args: dict) -> Execution:
+    """ADR 0003 Tier 1: a mediated, safety-contracted GET. Authority (the net.get:<host>
+    capability) is already checked in the governance gate; here we just perform the fetch
+    through the single mediated client and return its channel-integrity record. The surfaced
+    output is length-capped; the raw body is not persisted (only its hash, in the record)."""
+    url = str(args.get("url") or "")
+    result = egress.fetch(url)
+    rec = result.record
+    ok = rec.ok
+    if ok:
+        head = f"[{rec.status}] {rec.canonical_dest} ({rec.response_len}b" \
+               f"{', truncated' if rec.truncated else ''})"
+        output = head + "\n" + result.text(2000)
+    else:
+        output = ""
+    return Execution(
+        result=ToolResult(ok=ok, output=output, error=("" if ok else rec.error)),
+        egress=rec,
+    )
+
+
+_EXECUTORS = {"write_file": _exec_write, "read_file": _exec_read,
+              "run_command": _exec_command, "web_fetch": _exec_web_fetch}
 
 
 def execute_tool(tool: Tool, workspace, args: dict) -> Execution:

@@ -10,6 +10,13 @@ inside them.
 See docs/collaborator-plain-language.md (the approved plan).
 """
 
+from collaborator.egress import (
+    EgressRecord,
+    EgressResult,
+    canonical_host,
+    fetch,
+    required_capability,
+)
 from collaborator.governance import (
     DENIED,
     FAILED,
@@ -105,4 +112,9 @@ __all__ = [
     "mint",
     "verify",
     "workspace_subject",
+    "fetch",
+    "canonical_host",
+    "required_capability",
+    "EgressRecord",
+    "EgressResult",
 ]
