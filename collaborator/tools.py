@@ -28,7 +28,7 @@ from salienceos.verifier.observers import SupervisedResult, run_supervised
 from salienceos.verifier.signing import sha256_bytes
 
 from collaborator import egress
-from collaborator.netns import wrap_no_network
+from collaborator.netns import isolation_unverified, wrap_no_network
 
 COLLABORATOR_TOOLS_VERSION = "0.1.0"
 
@@ -264,6 +264,10 @@ def _exec_command(workspace, args: dict) -> Execution:
     # off the machine. Fails closed to unisolated + a False flag where netns is unavailable.
     run_argv, isolated = wrap_no_network(argv)
     res = run_supervised(run_argv, cwd=workspace)
+    # If the per-run guard tripped (child was NOT in a fresh netns), the command did not run — no
+    # egress — and we correct the flag to False so it never falsely claims isolation (red-team).
+    if isolated and isolation_unverified(res.returncode, res.stderr):
+        isolated = False
     ok = res.returncode == 0
     out = (res.stdout or b"").decode("utf-8", "replace")
     err = (res.stderr or b"").decode("utf-8", "replace")

@@ -3,12 +3,13 @@ the machine. The argv wrap + honest flag are testable everywhere; the actual "no
 egress" PROOF is OS-gated to Linux (runs in ubuntu CI, skips on the Windows dev host).
 """
 
+import os
 import sys
 import tempfile
 import unittest
 from unittest import mock
 
-from collaborator.netns import netns_available, wrap_no_network
+from collaborator.netns import isolation_unverified, netns_available, wrap_no_network
 from collaborator.tools import _exec_command
 
 
@@ -39,11 +40,27 @@ class WrapComposition(unittest.TestCase):
         # shadowed by a planted binary → egress while falsely reporting isolated. argv[0] must be
         # an absolute path so subprocess runs it via execv with no PATH lookup.
         from collaborator import netns
-        self.assertTrue(netns._UNSHARE_BIN.startswith("/"), netns._UNSHARE_BIN)  # never a bare name
+        self.assertTrue(os.path.isabs(netns._UNSHARE_BIN), netns._UNSHARE_BIN)  # never a bare name
         with mock.patch("collaborator.netns.netns_available", return_value=True):
             argv2, _ = wrap_no_network(["curl", "https://evil.example"])
         self.assertEqual(argv2[0], netns._UNSHARE_BIN)
         self.assertNotEqual(argv2[0], "unshare")  # never the bare, shadowable name
+        self.assertTrue(os.path.isabs(netns._SH_BIN), netns._SH_BIN)  # sh absolute too (parity)
+        self.assertIn(netns._SH_BIN, argv2)
+
+
+class IsolationUnverified(unittest.TestCase):
+    """Red-team synthesis: network_isolated must be VERIFIED, not trust that unshare isolated.
+    The per-run guard fails closed with a sentinel; the caller then flags isolated=False."""
+
+    def test_sentinel_trips(self):
+        self.assertTrue(isolation_unverified(44, "SALIENT_NETNS_UNVERIFIED\n"))
+        self.assertTrue(isolation_unverified(44, b"...SALIENT_NETNS_UNVERIFIED..."))
+
+    def test_normal_exit_or_other_error_does_not(self):
+        self.assertFalse(isolation_unverified(0, ""))
+        self.assertFalse(isolation_unverified(44, "some other error"))  # code alone isn't enough
+        self.assertFalse(isolation_unverified(1, "SALIENT_NETNS_UNVERIFIED"))  # sentinel alone isn't
 
 
 class AvailabilityAndFlag(unittest.TestCase):

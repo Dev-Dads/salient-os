@@ -202,12 +202,16 @@ proposer context (`research.py:143-145`) → the proposer's user message
   `run_command` executes inside a fresh, unprivileged **network namespace** with no route
   out (`collaborator/netns.py`), so a raw socket / `curl` / `git push` fails closed and
   **`egress.py` is the sole IP-network path off the machine** — which is what makes the
-  same-channel egress log *sound* for IP egress (no other IP channel for bytes to leave by). It is **OS-gated**:
-  where netns is unavailable (non-Linux, no `unshare`, user namespaces disabled) the shell
-  runs unisolated and the run is **honestly flagged** `network_isolated=False` — never a
-  silent claim of isolation. Scope limit: a network namespace isolates the *network*, not
-  the filesystem or local UNIX-socket IPC — those are governed by other means (the tool is
-  proposer-floored to `propose_first`), not by this change.
+  same-channel egress log *sound* for IP egress (no other IP channel for bytes to leave by).
+  Isolation is **verified, not trusted** — the probe and each run confirm the child is in a
+  genuinely distinct netns (`/proc/self/ns/net` inode), so a substituted / broken /
+  `LD_PRELOAD`-hooked `unshare` that exits 0 without isolating is caught (fail closed + honest
+  flag), never reported as isolated. It is **OS-gated**: where netns is unavailable (non-Linux,
+  no `unshare`, userns disabled) the shell runs unisolated and the run is **honestly flagged**
+  `network_isolated=False` — never a silent claim. Scope limit: a network namespace isolates
+  the *network*, not the filesystem or *pathname* UNIX-socket IPC — so a network-capable local
+  daemon socket (notably a Docker socket, `systemd-resolved`, a local proxy) is a residual
+  confused-deputy path on hosts that expose one; `--mount`/seccomp is the follow-up hardening.
 - **Known seam-fallers the tiered model does not fully close** (documented, not
   hidden): exfil of the operator's *own* secret to an allowlisted-for-read host (the
   missing axis is *what leaves*, not *where to*); and offense *through* a sanctioned
