@@ -17,6 +17,7 @@ defenses, not structural ones.
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
@@ -24,17 +25,24 @@ COLLABORATOR_MEMORY_VERSION = "0.1.0"
 
 _MAX_FIELD = 160  # per-field render cap (anti-DoS / anti-structure-forging)
 
+_FENCE_MARKERS = ("<<", ">>", "«", "»")  # neither the real markers nor their look-alikes
+
 
 def _flatten(text: str) -> str:
     """Collapse a stored field to a single safe inline span so memory content can never
-    forge message structure: replace every NON-PRINTABLE codepoint with a space — this
-    covers ASCII controls, DEL, the C1 block, NEL (U+0085), the Unicode line/paragraph
-    separators (U+2028/9), zero-width and bidi-override format chars — neutralize the
-    reserved fence delimiters (`<<`/`>>`), collapse whitespace, and cap length.
-    (`str.isprintable()` is False for exactly the Cc/Cf/Cs/Co/Cn/Zl/Zp/Zs categories bar
-    the ASCII space, which is the set that can forge lines or hide payloads.)"""
-    s = "".join(ch if ch.isprintable() else " " for ch in str(text or ""))
-    s = s.replace("<<", "«").replace(">>", "»")   # content can't forge a fence open/close
+    forge message structure: NFKC-normalize first (folds full-width / styled Unicode
+    look-alikes like `ＳＹＳＴＥＭ`→`SYSTEM`, `𝘳𝘶𝘯`→`run` back to ASCII so the redaction
+    regexes see them), replace every NON-PRINTABLE codepoint with a space (ASCII controls,
+    DEL, C1, NEL, U+2028/9 line/para separators, zero-width and bidi-override format chars),
+    neutralize the reserved fence delimiters and their guillemet look-alikes, collapse
+    whitespace, cap length. (`str.isprintable()` is False for exactly the categories that
+    can forge lines or hide payloads.) NOTE: this is a BEHAVIORAL defense — NFKC does not
+    fold cross-script homoglyphs (Cyrillic `с`), so it is backed by ③ + the human, not
+    treated as a complete injection barrier."""
+    s = unicodedata.normalize("NFKC", str(text or ""))
+    s = "".join(ch if ch.isprintable() else " " for ch in s)
+    for m in _FENCE_MARKERS:
+        s = s.replace(m, "·")
     return " ".join(s.split())[:_MAX_FIELD]        # collapse whitespace runs, trim
 
 
@@ -46,17 +54,26 @@ _IMPERATIVE_MARKERS = re.compile(
     r"(?i)(ignore\s+(all|previous|prior)|disregard|override|forget\s+(all|the|previous)|"
     r"you\s+are\s+now|new\s+instructions|(system|assistant|user|developer)\s*:|"
     r"instructions?\s*:)")
-# Tool-call shapes: the tool names we run, plus generic verbs, followed by a bracket/brace/
-# quote via a `:`, `=`, or whitespace separator (so `run_command ["rm"]` is caught too).
+# Tool-call shapes: the tool names we run, plus generic verbs, followed by an opening
+# bracket/brace/paren/quote via a `:`/`=` separator OR just whitespace — so both
+# `run_command:["rm"]` AND `run_command ["rm"]` are caught.
 _TOOLJSON_MARKER = re.compile(
     r'(?i)"?(propose|action|run_command|read_file|write_file|run|exec|tool|command)"?'
-    r'\s*[:=\s]\s*[\[{"]')
+    r'(?:\s*[:=]\s*|\s+)[\[{("]')
+# Long opaque runs (base64 / hex / token shapes): in fact/tuple content these are almost
+# always secrets or an encoded payload ("decode this: …"), so demote them to a placeholder.
+# Heuristic defense-in-depth, not a guarantee (short/split encodings still pass — a named
+# behavioral residual).
+_ENCODED_BLOB = re.compile(r"(?<![\w+/=])[A-Za-z0-9+/]{32,}={0,2}(?![\w+/=])")
 
 
 def _neutralize(value: str) -> str:
-    """Flatten + redact instruction/tool-call shapes. The single renderer path for BOTH
-    facts and history tuples (behavioral defense E; canary-tested)."""
+    """Flatten + redact instruction/tool-call/encoded shapes. The single renderer path for
+    BOTH facts and history tuples (behavioral defense E; canary-tested). Not a complete
+    barrier — keyword-free natural-language instructions and cross-script homoglyphs are a
+    named residual, contained by ③ + the human, never trusted as structural."""
     s = _flatten(value)
+    s = _ENCODED_BLOB.sub("⟨redacted-encoded⟩", s)
     s = _IMPERATIVE_MARKERS.sub("⟨redacted-imperative⟩", s)
     s = _TOOLJSON_MARKER.sub("⟨redacted-tool-shape⟩", s)
     return s

@@ -87,7 +87,8 @@ def render_facts(records: "tuple[FactRecord, ...] | list[FactRecord]") -> str:
     lines = [FACTS_FENCE_OPEN]
     for r in records:
         tier = r.tier if r.tier in _FACT_TIERS else "?"
-        lines.append(f"- [{tier}] {_flatten(r.key)} = {_neutralize(r.value)}")
+        # BOTH key and value are neutralized — a key is an injection channel too.
+        lines.append(f"- [{tier}] {_neutralize(r.key)} = {_neutralize(r.value)}")
     lines.append(FACTS_FENCE_CLOSE)
     return "\n".join(lines)
 
@@ -103,19 +104,21 @@ _ALLOW = (
     (re.compile(r"^svc\.[a-z0-9_.\-]+\.(enabled|port)$"), ("bool", "int")),
 )
 
-# Defense-in-depth denylist on the VALUE: anything that looks private/credential/pointer.
+# Defense-in-depth denylist on the VALUE: anything that looks private/credential/pointer
+# (incl. IPv6, env-var refs, `~/`). Mostly belt-and-suspenders since values are typed bool/int.
 _DENY_VALUE = re.compile(
     r"(?i)(/home/|/users/|\.ssh|/root/|token|secret|password|passwd|api[_-]?key|"
-    r"bearer |-----begin|@[a-z0-9.-]+\.[a-z]{2,}|[a-f0-9]{32,}|[A-Za-z0-9+/]{40,}={0,2})")
+    r"bearer |-----begin|@[a-z0-9.-]+\.[a-z]{2,}|[a-f0-9]{32,}|[A-Za-z0-9+/]{40,}={0,2}|"
+    r"(?:[0-9a-f]{1,4}:){2,}[0-9a-f:]+|\$\{?\w+\}?|%\w+%|~/)")
 
-# Denylist on the KEY: the key is the covert channel — a typed value can't carry prose, but
+# Denylist on the KEY: the key is a covert channel — a typed value can't carry prose, but
 # an operator (or a buggy pipeline) could encode a user-private datum into the KEY of an
-# all-users fact (e.g. `os.user_alice_has_sudo`). Segments are `.`/`_`-delimited, so we match
-# a private marker bounded by `^`/`.`/`_`/`$` — which catches `user_alice` and `alice.email`
-# WITHOUT tripping on legitimate keys like `os.passwordless_sudo` ("password" is not a segment).
-_DENY_KEY = re.compile(
-    r"(?i)(?:^|[._])(user|users|home|ssh|token|secret|passwd|password|apikey|api_key|"
-    r"email|mail|phone|ssn|addr|name|creds?|credential)(?:[._]|$)")
+# all-users fact (`os.user_alice_has_sudo`, `hw.primary_user_id`). A SUBSTRING match (a fresh
+# panel showed a segment-bounded regex missed `primary_user_id`) — security-first, so a few
+# false positives are fine; `password` is deliberately excluded so `passwordless_sudo` still
+# admits (credential VALUES are caught by _DENY_VALUE, which the value type already blocks).
+_DENY_KEY_SUBSTR = ("user", "home", "ssh", "email", "mail", "phone", "ssn",
+                    "secret", "token", "passwd", "apikey", "credential", "bearer")
 
 
 def _typed(value: str) -> "str | None":
@@ -142,12 +145,12 @@ def system_admits(record: FactRecord) -> bool:
         return False
     if _DENY_VALUE.search(str(record.value)):
         return False
-    # Scan the KEY for private/PII markers too (segment-bounded, so it does not trip on
-    # legitimate keys like `os.passwordless_sudo`). Closes the key-as-covert-channel leak.
-    if _DENY_KEY.search(str(record.key)):
+    key = str(record.key).lower()  # match case-insensitively (an UPPER key would else just
+                                   # fail the allowlist — fine, but this keeps it consistent)
+    if any(sub in key for sub in _DENY_KEY_SUBSTR):  # key-as-covert-channel leak, closed
         return False
     for pat, types in _ALLOW:
-        if pat.match(record.key) and vtype in types:
+        if pat.match(key) and vtype in types:
             return True
     return False
 

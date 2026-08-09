@@ -70,7 +70,9 @@ class DeedEvent:
             "outcome_feedback": self.status,           # a status token, not prose
             "tool_name": self.tool,
             "success": self.success,
-            "session_id": f"{self.source}:{self.session_id}",
+            # Sanitize the delimiter so the source marker stays unambiguous even if the host
+            # session_id itself contains a colon.
+            "session_id": f"{self.source}:{str(self.session_id).replace(':', '_')}",
             "project": self.project,
             "provenance": self.provenance,             # MUST be 'ambiguous', never trusted
         }

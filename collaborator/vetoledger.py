@@ -39,13 +39,14 @@ def normalize_intent(tool: str, args: dict) -> str:
         # alias re-surfaces a vetoed action past the inhibitor.
         ident = os.path.normcase(os.path.normpath(str(args.get("path") or "")))
     elif tool == "run_command":
-        # Canonicalize a command to a normalized argv string: drop empty args, collapse
-        # whitespace. `["rm","-rf","/"]`, `["rm","-rf","","/"]` and `"rm -rf /"` all match.
+        # Canonicalize a command: drop empty args, and SORT the args after the program so
+        # option-reordering (`ls -a -l` vs `ls -l -a`) maps to the same key. This can slightly
+        # over-inhibit a positional-arg command (`mv a b` ~ `mv b a`), which is acceptable for
+        # a soft, decaying SURFACING control (over-suppressing a re-nag is the safe direction).
         cmd = args.get("command")
-        if isinstance(cmd, (list, tuple)):
-            ident = " ".join(str(x) for x in cmd if str(x).strip() != "")
-        else:
-            ident = " ".join(str(cmd or "").split())
+        toks = ([str(x) for x in cmd if str(x).strip() != ""]
+                if isinstance(cmd, (list, tuple)) else str(cmd or "").split())
+        ident = " ".join(toks[:1] + sorted(toks[1:]))
     else:
         try:
             ident = json.dumps(args, sort_keys=True, default=str)[:256]
