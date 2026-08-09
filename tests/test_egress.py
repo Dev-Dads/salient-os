@@ -103,6 +103,14 @@ class CanonicalHost(unittest.TestCase):
         for bad in ("", "   ", None, "https://", "https://@/", "ftp://example.com/"):
             self.assertIsNone(canonical_host(bad))
 
+    def test_dotless_and_numeric_ip_forms_refused(self):
+        # Dotless numeric/hex host forms (decimal/hex IP literals, single-label junk) are refused;
+        # a dotted-quad literal and a real FQDN pass (then the resolved IP is safety-checked).
+        for bad in ("https://2130706433/", "https://0x7f000001/", "https://2852039166/",
+                    "https://localhost/"):
+            self.assertIsNone(canonical_host(bad), bad)
+        self.assertEqual(canonical_host("https://93.184.216.34/"), "93.184.216.34")
+
 
 class Capability(unittest.TestCase):
     def test_capability_string(self):
@@ -123,8 +131,16 @@ class SafePublicIP(unittest.TestCase):
                    "0.0.0.0", "224.0.0.1", "::1", "fd00::1", "fe80::1"):
             self.assertFalse(is_safe_public_ip(ip), ip)
 
+    def test_blocks_cgnat_mapped_and_nat64(self):
+        # Red-team: CGNAT/shared space (Tailscale tailnet), IPv4-mapped IPv6 (version-independent),
+        # and NAT64 must all fail closed — the guards the boolean denylist alone missed.
+        for ip in ("100.64.0.1", "100.127.255.255",           # RFC6598 CGNAT / tailnet
+                   "::ffff:169.254.169.254", "::ffff:10.0.0.1", "::ffff:127.0.0.1",  # IPv4-mapped
+                   "64:ff9b::a9fe:a9fe"):                       # NAT64 -> 169.254.169.254
+            self.assertFalse(is_safe_public_ip(ip), ip)
+
     def test_allows_global_unicast(self):
-        for ip in ("8.8.8.8", "93.184.216.34", "1.1.1.1"):
+        for ip in ("8.8.8.8", "93.184.216.34", "1.1.1.1", "2606:4700:4700::1111"):
             self.assertTrue(is_safe_public_ip(ip), ip)
 
     def test_garbage_is_unsafe(self):
@@ -180,12 +196,20 @@ class Fetch(unittest.TestCase):
         self.assertNotIn("Authorization", sink[0].sent["headers"])
         self.assertNotIn("Cookie", sink[0].sent["headers"])
 
-    def test_query_length_capped(self):
-        big = "https://docs.example/x?d=" + ("A" * (egress.MAX_URL_QUERY + 1))
+    def test_request_target_length_capped_query(self):
+        big = "https://docs.example/x?d=" + ("A" * (egress.MAX_URL_TARGET + 1))
         r = fetch(big, resolver=lambda h: ["93.184.216.34"],
                   connection_factory=_factory(_FakeResp(200), []))
         self.assertFalse(r.record.ok)
-        self.assertIn("query exceeds cap", r.record.error)
+        self.assertIn("request target exceeds cap", r.record.error)
+
+    def test_request_target_length_capped_path(self):
+        # The PATH exfils identically to the query — capping only the query was security theater.
+        big = "https://docs.example/" + ("B" * (egress.MAX_URL_TARGET + 1))
+        r = fetch(big, resolver=lambda h: ["93.184.216.34"],
+                  connection_factory=_factory(_FakeResp(200), []))
+        self.assertFalse(r.record.ok)
+        self.assertIn("request target exceeds cap", r.record.error)
 
     def test_response_truncated_at_ceiling(self):
         body = b"Z" * (egress.DEFAULT_MAX_RESPONSE + 100)

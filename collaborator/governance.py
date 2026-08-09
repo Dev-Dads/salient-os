@@ -192,14 +192,14 @@ def govern_action(session, intent: ToolIntent, importance: "float | None" = None
     # ③ a signed grant caps how loose the leash may get: the host/view can tighten but
     # never loosen past the cap (fail-closed if the grant is present but invalid).
     leash = apply_cap(leash, leash_cap(session, tool.name))
-    # A PROPOSER-originated shell command must never AUTO-run: floor it at propose_first so it is
-    # always surfaced for a human hand, whatever the host leash config. run_command is the
-    # unbounded-reach mutator — it can write anywhere (including controlled trees the write_file
-    # hard-deny protects) and reach OUTSIDE the machine, and its verify_mode="exit" gives it no
-    # write-set floor — so the human is the control (red-team: hard-deny-and-stage was
-    # write_file-only; a loosened run_command leash could otherwise auto-place into `.github`).
-    if intent.name == "run_command" and getattr(intent, "source", "") == "proposed" \
-            and leash == ACT_THEN_REPORT:
+    # A PROPOSER-originated shell command OR network egress must never AUTO-run: floor it at
+    # propose_first so it is always surfaced for a human hand, whatever the host leash config.
+    # run_command is the unbounded-reach mutator (writes anywhere, reaches outside the machine,
+    # verify_mode="exit" gives it no write-set floor); an egress tool EMITS off the owned domain
+    # (ADR 0003 treats even a GET as an exfil channel). Both are the consequential emission the
+    # human must gate — a loosened leash config must not let either auto-fire.
+    if (getattr(intent, "source", "") == "proposed" and leash == ACT_THEN_REPORT
+            and (intent.name == "run_command" or getattr(tool, "egress", False))):
         leash = PROPOSE_FIRST
     imp = session.default_importance if importance is None else importance
     rk = _TOOL_RISK.get(tool.name, 0.3) if risk is None else risk

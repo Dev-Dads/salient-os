@@ -44,7 +44,8 @@ COLLABORATOR_EGRESS_VERSION = "0.1.0"
 # Tier-1 bounds (host config in a later rev; conservative defaults now).
 DEFAULT_TIMEOUT = 15            # connect/read seconds
 DEFAULT_MAX_RESPONSE = 262144   # 256 KiB response ceiling
-MAX_URL_QUERY = 512             # cap the GET query string (exfil surface)
+MAX_URL_TARGET = 2048           # cap the FULL GET request target (path+query) — the whole
+                                # outbound surface, not just the query (a path exfils identically)
 EGRESS_CAP_PREFIX = "net.get:"
 _USER_AGENT = "SalienceOS-Collaborator/0.1 (+egress-mediated)"
 _HTTPS_PORT = 443
@@ -101,6 +102,8 @@ def canonical_host(url_or_host: str) -> "str | None":
         return None
     if any(ch not in _HOST_CHARS for ch in canon):  # reject IPv6 literals / non-hostname junk
         return None
+    if "." not in canon:  # reject dotless hosts: numeric/hex IP forms (2130706433, 0x7f000001),
+        return None       # single-label junk. A real public FQDN and a dotted-quad both have a dot.
     return canon
 
 
@@ -119,15 +122,27 @@ def required_capability(url: str) -> "str | None":
 # --- IP safety (the rebind / SSRF-to-metadata guard) --------------------------------------
 
 def is_safe_public_ip(ip: str) -> bool:
-    """True only for a globally-routable unicast address. Loopback (127/8, ::1), private
-    (RFC1918, fc00::/7), link-local (169.254/16 — incl. the 169.254.169.254 cloud-metadata
-    endpoint — and fe80::/10), multicast, reserved, and unspecified all fail closed."""
+    """True ONLY for a globally-routable unicast address. Loopback, RFC1918 private, link-local
+    (incl. 169.254.169.254 cloud-metadata), CGNAT/shared space (100.64.0.0/10 — Tailscale's
+    default tailnet range), multicast, reserved (incl. NAT64 64:ff9b::/96), and unspecified all
+    fail closed."""
     try:
         addr = ipaddress.ip_address(ip)
     except ValueError:
         return False
-    return not (addr.is_private or addr.is_loopback or addr.is_link_local
-                or addr.is_multicast or addr.is_reserved or addr.is_unspecified)
+    # Classify an IPv4-mapped IPv6 address (::ffff:a.b.c.d) by its EMBEDDED IPv4, so a mapped
+    # private/metadata address cannot slip through. Do NOT depend on the interpreter projecting
+    # mapped properties onto the wrapper (that fix landed in 3.11.9 / 3.12.4; older ones leak it).
+    mapped = getattr(addr, "ipv4_mapped", None)
+    if mapped is not None:
+        addr = mapped
+    # POSITIVE contract: is_global is what excludes CGNAT / shared address space (100.64.0.0/10),
+    # which none of the boolean flags below catch (a red-team finding: an allowlisted host
+    # resolving into the operator's tailnet is an SSRF target). The denylist stays as belt-and-
+    # suspenders — and it, not is_global, is what catches NAT64 (marked globally-routable).
+    return addr.is_global and not (
+        addr.is_private or addr.is_loopback or addr.is_link_local
+        or addr.is_multicast or addr.is_reserved or addr.is_unspecified)
 
 
 def _resolve(host: str) -> "list[str]":
@@ -206,9 +221,9 @@ def fetch(url: str, *, timeout: int = DEFAULT_TIMEOUT, max_response: int = DEFAU
     parts = urlsplit(url.strip())
     target = parts.path or "/"
     if parts.query:
-        if len(parts.query) > MAX_URL_QUERY:
-            return _refused(host, "", len(target), "query exceeds cap (exfil guard)")
         target = target + "?" + parts.query
+    if len(target) > MAX_URL_TARGET:  # cap the WHOLE target — path and query exfil identically
+        return _refused(host, "", len(target), "request target exceeds cap (exfil guard)")
     target_hash = hashlib.sha256(target.encode("utf-8", "replace")).hexdigest()
     request_bytes = len(target)
 

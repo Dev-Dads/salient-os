@@ -40,14 +40,18 @@ class WebGetFinding(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             s = Session(workspace=d, capabilities=("net.get:docs.example",),
                         research_trust="web_research")
-            self.assertIn("ineligible web url", _web_get_finding(s, "http://docs.example/x"))
+            out = _web_get_finding(s, "http://docs.example/x")
+            self.assertIn("not performed", out)
+            self.assertIn("ineligible", out)
 
     def test_default_deny_non_allowlisted(self):
+        # Default-deny is enforced by the ONE gate now (govern_action), not a parallel check.
         with tempfile.TemporaryDirectory() as d:
             s = Session(workspace=d, capabilities=(), research_trust="web_research")
             out = _web_get_finding(s, "https://docs.example/x")
-            self.assertIn("not allowlisted", out)
-            self.assertIn("default-deny", out)
+            self.assertIn("not performed", out)
+            self.assertIn("does not grant", out)
+            self.assertIn("net.get:docs.example", out)
 
     def test_allowlisted_get_is_tagged_untrusted(self):
         with tempfile.TemporaryDirectory() as d:
@@ -64,7 +68,24 @@ class WebGetFinding(unittest.TestCase):
                         research_trust="web_research")
             with mock.patch("collaborator.egress.fetch", lambda url, **k: _resp(ok=False)):
                 out = _web_get_finding(s, "https://docs.example/x")
-            self.assertIn("failed", out)
+            self.assertIn("not performed", out)
+            self.assertIn("boom", out)  # the egress error, surfaced through the governed decision
+
+
+class ResearchEgressRespectsLeashCap(unittest.TestCase):
+    def test_operator_can_floor_research_egress_to_propose_first(self):
+        # "Autonomous but bounded": routing through the ONE gate means an operator who caps
+        # web_fetch to propose_first in the signed grant HOLDS research egress instead of letting
+        # it auto-run — the stricter floor is available without a code change.
+        from collaborator.policycaps import mint, workspace_subject
+        with tempfile.TemporaryDirectory() as d:
+            signed = mint(("net.get:docs.example",), {"web_fetch": "propose_first"},
+                          "admin", workspace_subject(d), b"k")
+            s = Session(workspace=d, policy_caps=signed, caps_key=b"k",
+                        research_trust="web_research")
+            with mock.patch("collaborator.egress.fetch", lambda url, **k: _resp(b"X")):
+                out = _web_get_finding(s, "https://docs.example/x")
+            self.assertIn("not performed", out)  # HELD by the operator's leash cap, not auto-run
 
 
 class RunResearchWithWeb(unittest.TestCase):
