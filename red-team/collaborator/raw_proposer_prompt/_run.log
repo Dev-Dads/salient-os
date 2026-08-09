@@ -1,0 +1,17 @@
+bundle chars=5178  models=['anthropic/claude-opus-4.1', 'anthropic/claude-sonnet-4.5', 'openai/gpt-5.1', 'google/gemini-2.5-pro', 'x-ai/grok-4.5']
+[ OK ] openai/gpt-5.1  15.2s  cost=$0.0157  chars=6361
+[ OK ] x-ai/grok-4.5  25.1s  cost=$0.0116  chars=5075
+[ OK ] anthropic/claude-sonnet-4.5  27.3s  cost=$0.0246  chars=5444
+[ OK ] anthropic/claude-opus-4.1  59.2s  cost=$0.0955  chars=3965
+[ OK ] google/gemini-2.5-pro  141.9s  cost=$0.0000  chars=7559
+
+=========== API COST — proposer-prompt panel ===========
+  anthropic/claude-opus-4.1           $0.0955
+  anthropic/claude-sonnet-4.5         $0.0246
+  openai/gpt-5.1                      $0.0157
+  google/gemini-2.5-pro               $0.0000
+  x-ai/grok-4.5                       $0.0116
+  --------------------------------------------
+  TOTAL                               $0.1474
+========================================================
+Done: 5/5 succeeded.
