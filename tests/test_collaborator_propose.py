@@ -217,5 +217,23 @@ class SessionConfig(unittest.TestCase):
                 Session(workspace=tmp, proactivity="aggressive")
 
 
+class ProposerCannotAuthorEmissions(unittest.TestCase):
+    """red-team F-7: the proposer may not author an outbound EMISSION. net_post (egress+mutating) is
+    operator-directed only (via emit()); a proposal for it is structurally dropped, so the model can
+    never surface a one-click send of its own bytes + the operator's injected credential."""
+
+    def test_net_post_proposal_is_structurally_dropped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = Session(workspace=tmp, proactivity="eager")
+            r = _resp(confidence=0.99, name="net_post",
+                      args={"url": "https://api.example/v1/x", "body": "ALL THE SECRETS"})
+            self.assertEqual(propose(s, ScriptedClient([r]), "ctx"), [])   # no proposal surfaced
+
+    def test_write_file_proposal_still_surfaces(self):  # control: local/mutating-but-not-egress is fine
+        with tempfile.TemporaryDirectory() as tmp:
+            s = Session(workspace=tmp, proactivity="eager")
+            self.assertEqual(len(propose(s, ScriptedClient([_write_resp(0.99)]), "ctx")), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

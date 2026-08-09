@@ -164,18 +164,6 @@ def leash_cap(session, tool_name: str):
     return cap if cap is not None else NOTIFY_ONLY
 
 
-def signed_leash_cap(session, tool_name: str):
-    """The signed max-looseness a grant EXPLICITLY set for ``tool_name`` — or None if unlisted /
-    not enforced / no valid grant. Unlike ``leash_cap`` (which defaults an unlisted tool to
-    NOTIFY_ONLY), this distinguishes 'the operator did not pin this tool' (None) from a real cap,
-    so the emission auto-lift can let a per-host ``net.post.auto`` grant permit act_then_report
-    UNLESS the operator ALSO explicitly capped the tool tighter (red-team F2)."""
-    if not _enforced(session):
-        return None
-    grant = _valid_grant(session)
-    return grant.caps.leash_cap_for(tool_name) if grant is not None else None
-
-
 def apply_cap(leash: str, cap) -> str:
     """The stricter of ``leash`` and ``cap`` (cap = 'no looser than this'). cap None -> leash
     unchanged (no ceiling). An UNRECOGNISED value on EITHER side fails closed to NOTIFY_ONLY —

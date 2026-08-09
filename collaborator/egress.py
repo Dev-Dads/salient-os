@@ -305,17 +305,22 @@ def emission_seal(url: str, body, content_type: str = "") -> str:
     except ValueError:
         target = ""
     if isinstance(body, (bytes, bytearray)):
-        body_bytes = bytes(body)
+        body_bytes = b"\x01" + bytes(body)          # a bytes body sends verbatim
     else:
         # surrogatepass so a lone-surrogate body (legal JSON, refused later by post()) still SEALS
         # deterministically instead of raising here at hold time — the seal only needs consistency
-        # between hold and approve, not validity.
-        body_bytes = str(body if body is not None else "").encode("utf-8", "surrogatepass")
+        # between hold and approve, not validity. The \x00 type tag distinguishes a str body from a
+        # bytes SWAP of the same bytes (red-team A5: a lone-surrogate str is refused by post() while
+        # the swapped-in bytes SEND — different behaviour must seal differently).
+        body_bytes = b"\x00" + str(body if body is not None else "").encode("utf-8", "surrogatepass")
     h = hashlib.sha256()
-    for part in (host, target, str(content_type or "")):
-        h.update(part.encode("utf-8", "replace"))
-        h.update(b"\x00")
-    h.update(body_bytes)
+    # LENGTH-PREFIX every field (8-byte big-endian) so the framing is injective — no NUL byte or
+    # boundary shift can move bytes between fields and collide two distinct emissions to the same
+    # seal (red-team #4: a bare \x00 separator let content_type/target/body steal each other's bytes).
+    for part in (host.encode("utf-8", "replace"), target.encode("utf-8", "replace"),
+                 str(content_type or "").encode("utf-8", "replace"), body_bytes):
+        h.update(len(part).to_bytes(8, "big"))
+        h.update(part)
     return h.hexdigest()
 
 
