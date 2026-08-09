@@ -487,5 +487,65 @@ class RecentActionsContext(unittest.TestCase):
             self.assertEqual(build_proposer_context(Session(workspace=tmp)), "")
 
 
+class _QueuedClient:
+    """Returns queued JSON contents in order (research requests, then a proposal)."""
+    def __init__(self, contents):
+        self._q = list(contents)
+        self.calls = 0
+
+    def complete(self, messages, tools=None):
+        self.calls += 1
+        return {"content": self._q.pop(0)} if self._q else {"content": '{"propose": false}'}
+
+
+class ResearchLoop(unittest.TestCase):
+    def test_reads_are_workspace_fenced(self):
+        from collaborator.research import _list_dir, _read_file
+        with tempfile.TemporaryDirectory() as tmp:
+            (pathlib.Path(tmp) / "a.txt").write_text("hello-body", encoding="utf-8")
+            self.assertIn("hello-body", _read_file(tmp, "a.txt"))
+            self.assertIn("refused", _read_file(tmp, "../../../etc/passwd"))  # can't escape
+            self.assertIn("a.txt", _list_dir(tmp, "."))
+            self.assertIn("refused", _list_dir(tmp, "../.."))
+
+    def test_run_research_gathers_findings(self):
+        from collaborator.research import run_research
+        with tempfile.TemporaryDirectory() as tmp:
+            (pathlib.Path(tmp) / "a.txt").write_text("secret-content-xyz", encoding="utf-8")
+            c = _QueuedClient(['{"read":{"name":"list_dir","arguments":{"path":"."}}}',
+                               '{"read":{"name":"read_file","arguments":{"path":"a.txt"}}}',
+                               '{"done":true}'])
+            findings = run_research(Session(workspace=tmp), c, "ctx", budget=4)
+            self.assertTrue(any("a.txt" in f for f in findings))
+            self.assertTrue(any("secret-content-xyz" in f for f in findings))
+
+    def test_local_only_skips_research(self):
+        from collaborator.research import propose_researched
+        with tempfile.TemporaryDirectory() as tmp:
+            s = Session(workspace=tmp, research_trust="local_only")
+            c = _QueuedClient(['{"propose": false}'])
+            propose_researched(s, c, "ctx")
+            self.assertEqual(c.calls, 1)  # only the propose call — no research loop
+
+    def test_researched_proposal_is_grounded(self):
+        from collaborator.research import propose_researched
+        with tempfile.TemporaryDirectory() as tmp:
+            s = Session(workspace=tmp, research_budget=2)  # default trust = read_only_research
+            c = _QueuedClient([
+                '{"read":{"name":"list_dir","arguments":{"path":"."}}}',  # research step
+                '{"done":true}',                                          # end research
+                '{"propose": true, "confidence": 0.9, "rationale": "grounded",'
+                ' "action": {"name": "write_file", "arguments": {"path": "b.txt", "content": "hi"}}}',
+            ])
+            props = propose_researched(s, c, "ctx", threshold=0.0)
+            self.assertEqual(len(props), 1)
+            self.assertEqual(props[0].decision.tool, "write_file")
+
+    def test_invalid_trust_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(ValueError):
+                Session(workspace=tmp, research_trust="root")
+
+
 if __name__ == "__main__":
     unittest.main()
