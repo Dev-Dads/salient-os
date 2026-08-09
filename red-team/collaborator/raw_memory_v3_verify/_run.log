@@ -1,0 +1,18 @@
+bundle chars=71214  models=['openai/gpt-5.1', 'google/gemini-2.5-pro', 'anthropic/claude-opus-4.1', 'qwen/qwen3-max', 'meta-llama/llama-4-maverick']
+[ OK ] openai/gpt-5.1  13.3s  finish=stop  chars=3967  cost=$0.0333
+[ OK ] meta-llama/llama-4-maverick  15.0s  finish=stop  chars=4052  cost=$0.0045
+[ OK ] qwen/qwen3-max  17.6s  finish=stop  chars=4117  cost=$0.0185
+[ OK ] google/gemini-2.5-pro  102.7s  finish=stop  chars=10917  cost=$0.1326
+[ OK ] anthropic/claude-opus-4.1  121.3s  finish=stop  chars=5012  cost=$0.4435
+
+======= API COST — ④ memory v3 CODE review (VERIFY pass) =======
+  openai/gpt-5.1                        $0.0333   18823->981 tok
+  google/gemini-2.5-pro                 $0.1326   20921->10646 tok
+  anthropic/claude-opus-4.1             $0.4435   22312->1451 tok
+  qwen/qwen3-max                        $0.0185   18756->987 tok
+  meta-llama/llama-4-maverick           $0.0045   18706->980 tok
+  ------------------------------------------------------
+  TOTAL                                 $0.6325
+==========================================================
+
+Done: 5/5 succeeded.

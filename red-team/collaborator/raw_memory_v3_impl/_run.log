@@ -1,0 +1,18 @@
+bundle chars=59586  models=['deepseek/deepseek-v4-pro', 'x-ai/grok-4.5', 'mistralai/mistral-medium-3-5', 'moonshotai/kimi-k3', 'z-ai/glm-5.2']
+[ OK ] mistralai/mistral-medium-3-5  59.8s  finish=stop  chars=12482  cost=$0.0545
+[FAIL] x-ai/grok-4.5: JSONDecodeError: Expecting value: line 441 column 1 (char 2420)
+[ OK ] deepseek/deepseek-v4-pro  154.0s  finish=stop  chars=6020  cost=$0.0049
+[ OK ] z-ai/glm-5.2  181.1s  finish=stop  chars=10261  cost=$0.0089
+[ OK ] moonshotai/kimi-k3  338.8s  finish=length  chars=64683  cost=$0.2878
+
+=========== API COST — ④ memory v3 CODE review ===========
+  deepseek/deepseek-v4-pro              $0.0049   16632->12415 tok
+  x-ai/grok-4.5                             n/a   
+  mistralai/mistral-medium-3-5          $0.0545   16754->3917 tok
+  moonshotai/kimi-k3                    $0.2878   15925->16000 tok
+  z-ai/glm-5.2                          $0.0089   15782->15312 tok
+  ------------------------------------------------------
+  TOTAL                                 $0.3561
+==========================================================
+
+Done: 4/5 succeeded.

@@ -15,6 +15,7 @@ touch leash, capability, or budget.
 from __future__ import annotations
 
 import json
+import os.path
 from dataclasses import dataclass
 
 COLLABORATOR_VETO_VERSION = "0.1.0"
@@ -33,10 +34,19 @@ def normalize_intent(tool: str, args: dict) -> str:
     tool = str(tool or "")
     args = args or {}
     if tool in ("write_file", "read_file"):
-        ident = str(args.get("path") or "")
+        # Canonicalize the path so `./a.txt`, `a/../a.txt`, trailing slashes and (on a
+        # case-insensitive FS) `A.TXT` all collapse to the SAME key — otherwise a trivial
+        # alias re-surfaces a vetoed action past the inhibitor.
+        ident = os.path.normcase(os.path.normpath(str(args.get("path") or "")))
     elif tool == "run_command":
+        # Canonicalize a command: drop empty args, and SORT the args after the program so
+        # option-reordering (`ls -a -l` vs `ls -l -a`) maps to the same key. This can slightly
+        # over-inhibit a positional-arg command (`mv a b` ~ `mv b a`), which is acceptable for
+        # a soft, decaying SURFACING control (over-suppressing a re-nag is the safe direction).
         cmd = args.get("command")
-        ident = json.dumps(cmd, sort_keys=True, default=str) if cmd is not None else ""
+        toks = ([str(x) for x in cmd if str(x).strip() != ""]
+                if isinstance(cmd, (list, tuple)) else str(cmd or "").split())
+        ident = " ".join(toks[:1] + sorted(toks[1:]))
     else:
         try:
             ident = json.dumps(args, sort_keys=True, default=str)[:256]
