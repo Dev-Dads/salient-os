@@ -147,7 +147,7 @@ def approve(session, decision: Decision) -> Decision:
                         decision.leash, directive=decision.directive, args=decision.args,
                         origin=decision.origin)
     decision.consumed = True     # claim it before running, so no concurrent/second path re-runs
-    # Pass the held decision's EFFECTIVE leash (propose_first for a human-gated emission) so the
-    # emission audit path is correct (human-gated -> bounded body preview; ADR 0003 Tier 2).
+    # human_gated=True: this IS the human-approval path, so the emission keeps a bounded body preview
+    # regardless of how a signed cap rewrote the recorded leash (ADR 0003 Tier 2; red-team F3).
     return execute_and_verify(session, tool, decision.directive, decision.action_id,
-                              decision.args, leash=decision.leash)
+                              decision.args, leash=decision.leash, human_gated=True)

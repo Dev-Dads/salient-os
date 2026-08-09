@@ -26,7 +26,6 @@ from collaborator.governance import (
     RAN,
     UNKNOWN_TOOL,
     Decision,
-    execute_and_verify,
     govern_action,
 )
 from collaborator.loop import TurnResult, approve, run_turn
@@ -76,7 +75,6 @@ __all__ = [
     "approve",
     "TurnResult",
     "govern_action",
-    "execute_and_verify",
     "Decision",
     "RAN",
     "FAILED",

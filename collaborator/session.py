@@ -62,7 +62,16 @@ class Session:
         self.policy_key = policy_key
         self.executor_id = executor_id
         self.executor_key = executor_key
+        # Host per-tool leash overrides — validated like proactivity/research_trust, because an
+        # unrecognised leash string (a typo, "propose-first" for "propose_first") otherwise flows
+        # verbatim through the seam and fails OPEN (red-team F0). Fail LOUD at construction instead.
+        from collaborator.tools import ACT_THEN_REPORT, NOTIFY_ONLY, PROPOSE_FIRST
+        _valid_leashes = {ACT_THEN_REPORT, PROPOSE_FIRST, NOTIFY_ONLY}
         self.leash_overrides = dict(leash_overrides or {})
+        for _tool, _level in self.leash_overrides.items():
+            if _level not in _valid_leashes:
+                raise ValueError(f"leash_overrides[{_tool!r}] must be one of "
+                                 f"{tuple(sorted(_valid_leashes))}, got {_level!r}")
         self.allow_adaptation = bool(allow_adaptation)
         self.default_importance = float(default_importance)
         # How eagerly the propose channel (Step 1) surfaces unprompted proposals —

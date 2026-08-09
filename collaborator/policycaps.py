@@ -68,10 +68,17 @@ def sign(caps: PolicyCaps, key: bytes) -> str:
 
 def mint(capabilities, leash_caps, issuer: str, subject: str, key: bytes) -> SignedPolicyCaps:
     """Mint a signed grant. ``leash_caps`` is a {tool: max_looseness_leash} mapping. Only
-    the policy authority (holder of ``key``) can mint or re-sign a grant."""
+    the policy authority (holder of ``key``) can mint or re-sign a grant. A leash-cap value must
+    be one of the three defined levels — an unrecognised string is rejected at mint time (red-team
+    F0: an invalid leash inside a correctly-SIGNED grant must never reach the seam, where it could
+    slip past the ``== PROPOSE_FIRST`` checks), matching Session's own leash validation."""
+    items = sorted((str(k), str(v)) for k, v in dict(leash_caps or {}).items())
+    for _name, level in items:
+        if level not in _LEASH_RANK:
+            raise ValueError(f"leash_cap must be one of {tuple(_LEASH_RANK)}, got {level!r}")
     caps = PolicyCaps(
         capabilities=tuple(str(c) for c in capabilities),
-        leash_caps=tuple(sorted((str(k), str(v)) for k, v in dict(leash_caps or {}).items())),
+        leash_caps=tuple(items),
         issuer=str(issuer), subject=str(subject),
     )
     return SignedPolicyCaps(caps=caps, signature=sign(caps, key))
@@ -125,6 +132,13 @@ def _enforced(session) -> bool:
     return bool(getattr(session, "enforce_caps", False))
 
 
+def enforced(session) -> bool:
+    """Public: is this session governed by a SIGNED grant (vs the legacy mutable-config path)?
+    The seam requires this before honouring the highest-stakes signal — an autonomous-emission
+    lift — so it can never rest on mutable ``session.capabilities`` (red-team F5)."""
+    return _enforced(session)
+
+
 def granted_capabilities(session) -> tuple:
     """The capabilities the worker actually holds. Under enforcement, the VERIFIED caps are
     authoritative — the mutable ``session.capabilities`` cannot widen them, and a grant that
@@ -150,11 +164,28 @@ def leash_cap(session, tool_name: str):
     return cap if cap is not None else NOTIFY_ONLY
 
 
+def signed_leash_cap(session, tool_name: str):
+    """The signed max-looseness a grant EXPLICITLY set for ``tool_name`` — or None if unlisted /
+    not enforced / no valid grant. Unlike ``leash_cap`` (which defaults an unlisted tool to
+    NOTIFY_ONLY), this distinguishes 'the operator did not pin this tool' (None) from a real cap,
+    so the emission auto-lift can let a per-host ``net.post.auto`` grant permit act_then_report
+    UNLESS the operator ALSO explicitly capped the tool tighter (red-team F2)."""
+    if not _enforced(session):
+        return None
+    grant = _valid_grant(session)
+    return grant.caps.leash_cap_for(tool_name) if grant is not None else None
+
+
 def apply_cap(leash: str, cap) -> str:
-    """The stricter of ``leash`` and ``cap`` (cap = 'no looser than this'). cap None ->
-    leash unchanged. An unknown value on either side is treated as strictest."""
+    """The stricter of ``leash`` and ``cap`` (cap = 'no looser than this'). cap None -> leash
+    unchanged (no ceiling). An UNRECOGNISED value on EITHER side fails closed to NOTIFY_ONLY —
+    never returned verbatim (red-team F0: the old code ranked an unknown strictest but RETURNED it,
+    so a typo'd 'propose-first' slipped past every downstream `== PROPOSE_FIRST`/`== NOTIFY_ONLY`
+    check and ran autonomously, and a signed ceiling could never tighten it)."""
+    if leash not in _LEASH_RANK:
+        return NOTIFY_ONLY
     if cap is None:
         return leash
-    lr = _LEASH_RANK.get(leash, 2)
-    cr = _LEASH_RANK.get(cap, 2)
-    return leash if lr >= cr else cap
+    if cap not in _LEASH_RANK:
+        return NOTIFY_ONLY
+    return leash if _LEASH_RANK[leash] >= _LEASH_RANK[cap] else cap
