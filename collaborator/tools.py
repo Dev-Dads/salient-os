@@ -109,6 +109,11 @@ def _exec_write(workspace, args: dict) -> Execution:
     rel = str(args.get("path") or "")
     content = str(args.get("content") or "")
     target = resolve_in_workspace(workspace, rel)  # raises WorkspaceError -> denied upstream
+    # Create the parent directory (WITHIN the resolved workspace path, so still fenced) so a
+    # write to a nested path like `.github/workflows/ci.yml` succeeds instead of failing on a
+    # missing dir — a real failure class found live (the proposer correctly wanted to write a
+    # CI workflow but write_file couldn't create the dir, so it retried 9× and failed).
+    target.parent.mkdir(parents=True, exist_ok=True)
     # A real child process performs the write, so the supervisor observes an exit
     # status this process did not author. We write raw UTF-8 BYTES (not write_text)
     # so the file on disk is byte-for-byte the content we hashed — text mode would
