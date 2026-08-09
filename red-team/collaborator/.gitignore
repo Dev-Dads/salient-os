@@ -1,0 +1,3 @@
+# Local e2e run artifacts (scratch workspaces + logs), not part of the repo
+long_run_ws/
+*.log

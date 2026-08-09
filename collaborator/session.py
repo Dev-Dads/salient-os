@@ -45,6 +45,7 @@ class Session:
         research_budget: int = 4,
         controlled_paths=(".github",),
         proposal_pool=None,
+        egress_credentials=None,
     ) -> None:
         self.workspace = Path(workspace)
         self.capabilities = tuple(capabilities)
@@ -117,3 +118,10 @@ class Session:
         else:
             from collaborator.proposalpool import ProposalPool
             self.proposal_pool = ProposalPool()
+        # ADR 0003 Tier 2 — HOST-INJECTED egress credentials for outbound emission (net_post),
+        # keyed by CANONICAL host (e.g. {"openrouter.ai": "Bearer …"}), typically built from env.
+        # The seam looks one up for the consented host and sets it as the Authorization header
+        # itself; the model's args NEVER carry a credential and it is never logged. Authority
+        # (which hosts may be emitted-to) lives in the SIGNED caps — this map only supplies the
+        # secret for a host already authorized. Default empty = no credential injected.
+        self.egress_credentials = dict(egress_credentials or {})

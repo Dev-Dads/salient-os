@@ -15,6 +15,7 @@ from collaborator.egress import (
     EgressResult,
     canonical_host,
     fetch,
+    post,
     required_capability,
 )
 from collaborator.governance import (
@@ -113,6 +114,7 @@ __all__ = [
     "verify",
     "workspace_subject",
     "fetch",
+    "post",
     "canonical_host",
     "required_capability",
     "EgressRecord",

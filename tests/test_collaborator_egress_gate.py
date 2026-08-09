@@ -124,5 +124,208 @@ class OffenseRecognizerIsAuditOnly(unittest.TestCase):
             self.assertIn("offense-shape audit", dec.summary())
 
 
+# --- ADR 0003 Tier 2: net.post EMISSION gate -----------------------------------------------
+
+NP_URL = "https://api.example/v1/x"
+_CAPTURED = {}
+
+
+def _np(url=NP_URL, body='{"m":"x"}', source="structured"):
+    return ToolIntent("net_post", {"url": url, "body": body}, source)
+
+
+def _fake_post(url, body, *, content_type="application/json", auth=None, keep_preview=False, **kw):
+    _CAPTURED.clear()
+    _CAPTURED.update(url=url, body=body, content_type=content_type, auth=auth, keep_preview=keep_preview)
+    return EgressResult(EgressRecord(
+        canonical_dest="api.example", method="POST", request_target_hash="th", request_bytes=3,
+        status=200, response_hash="rh", response_len=2, redirect_location=None,
+        resolved_ip="93.184.216.34", ok=True, request_body_hash="bh", request_body_len=len(body),
+        request_body_preview=(body[:50] if keep_preview else "")), body=b"ok")
+
+
+class NetPostDefaultDeny(unittest.TestCase):
+    def test_no_cap_denies(self):
+        with tempfile.TemporaryDirectory() as d:
+            s = Session(workspace=d, capabilities=("shell.exec",))
+            dec = govern_action(s, _np())
+            self.assertEqual(dec.status, DENIED)
+            self.assertIn("net.post:api.example", dec.reason)
+
+    def test_net_get_does_not_authorize_net_post(self):
+        # Reading a host is NOT emitting to it — separate signed namespaces (ADR 0003).
+        with tempfile.TemporaryDirectory() as d:
+            s = Session(workspace=d, capabilities=("net.get:api.example",))
+            dec = govern_action(s, _np())
+            self.assertEqual(dec.status, DENIED)
+            self.assertIn("net.post:api.example", dec.reason)
+
+    def test_ineligible_url_denied(self):
+        with tempfile.TemporaryDirectory() as d:
+            s = Session(workspace=d, capabilities=("net.post:api.example",))
+            dec = govern_action(s, _np("http://api.example/x"))
+            self.assertEqual(dec.status, DENIED)
+            self.assertIn("ineligible egress URL", dec.reason)
+
+
+class NetPostHumanGatedByDefault(unittest.TestCase):
+    def test_user_directed_defaults_to_held(self):
+        with tempfile.TemporaryDirectory() as d:
+            s = Session(workspace=d, capabilities=("net.post:api.example",))
+            dec = govern_action(s, _np())
+            self.assertEqual(dec.status, HELD)
+            self.assertEqual(dec.leash, "propose_first")
+
+    def test_host_leash_override_cannot_drop_the_floor(self):
+        # Even a host leash_override to act_then_report is FLOORED back to propose_first for a
+        # non-auto host — no config can drop the human hand on an emission.
+        with tempfile.TemporaryDirectory() as d:
+            s = Session(workspace=d, capabilities=("net.post:api.example",),
+                        leash_overrides={"net_post": "act_then_report"})
+            dec = govern_action(s, _np())
+            self.assertEqual(dec.status, HELD)
+            self.assertEqual(dec.leash, "propose_first")
+
+
+class NetPostAutoLift(unittest.TestCase):
+    def _auto(self, d, leash_cap="act_then_report", auto_host="api.example"):
+        return _granted(d, ("net.post:api.example", f"net.post.auto:{auto_host}"),
+                        {"net_post": leash_cap})
+
+    def test_signed_auto_grant_lifts_user_directed_to_autonomous(self):
+        with tempfile.TemporaryDirectory() as d:
+            s = self._auto(d)
+            with mock.patch("collaborator.egress.post", _fake_post):
+                dec = govern_action(s, _np())
+            self.assertEqual(dec.status, RAN)
+            self.assertEqual(dec.leash, "act_then_report")
+
+    def test_proposer_originated_stays_held_even_with_auto(self):
+        # The auto grant loosens OPERATOR-directed emission; the model can never self-originate
+        # an autonomous POST — the proposer floor wins.
+        with tempfile.TemporaryDirectory() as d:
+            s = self._auto(d)
+            dec = govern_action(s, _np(source="proposed"))
+            self.assertEqual(dec.status, HELD)
+            self.assertEqual(dec.leash, "propose_first")
+
+    def test_leash_cap_can_still_tighten_an_auto_host(self):
+        with tempfile.TemporaryDirectory() as d:
+            s = self._auto(d, leash_cap="propose_first")   # operator tightens the signed cap
+            dec = govern_action(s, _np())
+            self.assertEqual(dec.status, HELD)
+            self.assertEqual(dec.leash, "propose_first")
+
+    def test_auto_for_a_different_host_does_not_lift(self):
+        with tempfile.TemporaryDirectory() as d:
+            s = self._auto(d, auto_host="other.example")   # auto is per-host, exact-match
+            dec = govern_action(s, _np())
+            self.assertEqual(dec.status, HELD)
+            self.assertEqual(dec.leash, "propose_first")
+
+
+class NetPostCredentialInjection(unittest.TestCase):
+    def _auto(self, d):
+        return _granted(d, ("net.post:api.example", "net.post.auto:api.example"),
+                        {"net_post": "act_then_report"})
+
+    def test_host_credential_injected_for_consented_host(self):
+        with tempfile.TemporaryDirectory() as d:
+            s = self._auto(d)
+            s.egress_credentials = {"api.example": "Bearer sk-secret"}
+            with mock.patch("collaborator.egress.post", _fake_post):
+                dec = govern_action(s, _np())
+            self.assertEqual(dec.status, RAN)
+            self.assertEqual(_CAPTURED.get("auth"), "Bearer sk-secret")
+
+    def test_no_credential_configured_means_none_sent(self):
+        with tempfile.TemporaryDirectory() as d:
+            s = self._auto(d)  # no egress_credentials
+            with mock.patch("collaborator.egress.post", _fake_post):
+                dec = govern_action(s, _np())
+            self.assertEqual(dec.status, RAN)
+            self.assertIsNone(_CAPTURED.get("auth"))
+
+    def test_model_args_cannot_smuggle_a_credential(self):
+        # An 'auth'/'authorization' field in the model's args is ignored — the executor never
+        # reads one; only the host-config map can inject a credential.
+        with tempfile.TemporaryDirectory() as d:
+            s = self._auto(d)  # no egress_credentials
+            it = ToolIntent("net_post", {"url": NP_URL, "body": "{}", "auth": "Bearer EVIL",
+                                         "authorization": "Bearer EVIL2"}, "structured")
+            with mock.patch("collaborator.egress.post", _fake_post):
+                dec = govern_action(s, it)
+            self.assertEqual(dec.status, RAN)
+            self.assertIsNone(_CAPTURED.get("auth"))
+
+
+class NetPostAuditSplit(unittest.TestCase):
+    def test_autonomous_emission_is_body_free(self):
+        with tempfile.TemporaryDirectory() as d:
+            s = _granted(d, ("net.post:api.example", "net.post.auto:api.example"),
+                         {"net_post": "act_then_report"})
+            with mock.patch("collaborator.egress.post", _fake_post):
+                dec = govern_action(s, _np(body="secret"))
+            self.assertEqual(dec.status, RAN)
+            self.assertFalse(_CAPTURED.get("keep_preview"))
+            self.assertEqual(dec.egress.request_body_preview, "")
+
+    def test_human_gated_emission_keeps_bounded_preview_and_sends_approved_body(self):
+        with tempfile.TemporaryDirectory() as d:
+            s = _granted(d, ("net.post:api.example",), {"net_post": "propose_first"})
+            held = govern_action(s, _np(body="secret"))
+            self.assertEqual(held.status, HELD)
+            with mock.patch("collaborator.egress.post", _fake_post):
+                out = approve(s, held)
+            self.assertEqual(out.status, RAN)
+            self.assertTrue(_CAPTURED.get("keep_preview"))
+            self.assertEqual(_CAPTURED.get("body"), "secret")   # body approved == body sent
+            self.assertEqual(out.egress.request_body_preview, "secret")
+
+
+class NetPostHeldPayloadSeal(unittest.TestCase):
+    """Tier 2 has no verifier, so a HELD emission is sealed at hold and approval refuses a payload
+    mutated after the human saw it (panel: approved != sent)."""
+
+    def test_mutating_held_url_and_body_after_hold_denies_at_approval(self):
+        with tempfile.TemporaryDirectory() as d:
+            s = _granted(d, ("net.post:api.example", "net.post:evil.example"),
+                         {"net_post": "propose_first"})
+            held = govern_action(s, _np("https://api.example/pay", body='{"amt":10}'))
+            self.assertEqual(held.status, HELD)
+            self.assertTrue(held.seal)
+            # Mutate the (by-reference) held args to a DIFFERENT (also-granted) host + body.
+            held.args["url"] = "https://evil.example/steal"
+            held.args["body"] = '{"amt":9999999}'
+            with mock.patch("collaborator.egress.post", _fake_post):  # must NOT be reached
+                out = approve(s, held)
+            self.assertEqual(out.status, DENIED)
+            self.assertIn("seal mismatch", out.reason)
+
+    def test_unmutated_held_emission_approves_and_sends(self):
+        with tempfile.TemporaryDirectory() as d:
+            s = _granted(d, ("net.post:api.example",), {"net_post": "propose_first"})
+            held = govern_action(s, _np("https://api.example/pay", body='{"amt":10}'))
+            self.assertEqual(held.status, HELD)
+            with mock.patch("collaborator.egress.post", _fake_post):
+                out = approve(s, held)
+            self.assertEqual(out.status, RAN)   # unchanged payload -> seal matches -> sends
+
+
+class NetPostApprovalRegateTOCTOU(unittest.TestCase):
+    def test_host_revoked_between_hold_and_approve_denies(self):
+        with tempfile.TemporaryDirectory() as d:
+            s = _granted(d, ("net.post:api.example",), {"net_post": "propose_first"})
+            held = govern_action(s, _np())
+            self.assertEqual(held.status, HELD)
+            # Operator re-mints the signed caps WITHOUT the emit host between hold and approve.
+            s.policy_caps = mint((), {"net_post": "propose_first"}, "admin",
+                                 workspace_subject(d), b"caps-key")
+            with mock.patch("collaborator.egress.post", _fake_post):  # must NOT be reached
+                out = approve(s, held)
+            self.assertEqual(out.status, DENIED)
+            self.assertIn("not granted at approval time", out.reason)
+
+
 if __name__ == "__main__":
     unittest.main()

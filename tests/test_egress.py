@@ -123,6 +123,19 @@ class Capability(unittest.TestCase):
         self.assertIsNone(required_capability("http://example.com/"))
         self.assertIsNone(required_capability("https://a@b.com/"))
 
+    def test_required_capability_method_aware(self):
+        # ADR 0003 Tier 2: reading a host and emitting to it are SEPARATE capability namespaces.
+        self.assertEqual(required_capability("https://api.example/x", "GET"), "net.get:api.example")
+        self.assertEqual(required_capability("https://api.example/x", "POST"), "net.post:api.example")
+        self.assertEqual(required_capability("https://api.example/x"), "net.get:api.example")  # default GET
+
+    def test_net_get_and_net_post_are_distinct_namespaces(self):
+        g = required_capability("https://api.example/", "GET")
+        p = required_capability("https://api.example/", "POST")
+        self.assertNotEqual(g, p)
+        self.assertTrue(p.startswith(egress.EGRESS_POST_CAP_PREFIX))
+        self.assertTrue(g.startswith(egress.EGRESS_CAP_PREFIX))
+
 
 class SafePublicIP(unittest.TestCase):
     def test_blocks_the_dangerous_ranges(self):
@@ -226,6 +239,209 @@ class Fetch(unittest.TestCase):
         r = fetch("https://docs.example/", resolver=boom, connection_factory=_factory(_FakeResp(200), []))
         self.assertFalse(r.record.ok)
         self.assertIn("resolve failed", r.record.error)
+
+
+class _FakePostConn:
+    """Like _FakeConn but for the POST path: accepts skip_host, and captures the sent body."""
+
+    def __init__(self, host, pinned_ip, resp, sink):
+        self.host = host
+        self.pinned_ip = pinned_ip
+        self._resp = resp
+        self.sent = {"headers": {}}
+        self.body = b""
+        sink.append(self)
+
+    def putrequest(self, method, target, skip_host=False, **kw):
+        self.sent["method"] = method
+        self.sent["target"] = target
+        self.sent["skip_host"] = skip_host
+
+    def putheader(self, key, value):
+        self.sent["headers"][key] = value
+
+    def endheaders(self):
+        pass
+
+    def send(self, data):
+        self.body += data
+
+    def getresponse(self):
+        return self._resp
+
+    def close(self):
+        pass
+
+
+def _post_factory(resp, sink):
+    return lambda host, pinned_ip: _FakePostConn(host, pinned_ip, resp, sink)
+
+
+class Post(unittest.TestCase):
+    """ADR 0003 Tier 2 — the mediated EMISSION path reuses the whole Tier-1 contract and adds a
+    capped/hashed body, host-injected (never model, never logged) credentials, and a
+    body-free-vs-preview audit split."""
+
+    def _ok(self, url="https://api.example/x", body='{"a":1}', **kw):
+        sink = []
+        r = egress.post(url, body, resolver=lambda h: ["93.184.216.34"],
+                        connection_factory=_post_factory(_FakeResp(200, b'{"ok":true}'), sink), **kw)
+        return r, sink
+
+    def test_ineligible_url_refused_before_network(self):
+        for bad in ("http://api.example/", "https://u@api.example/", "https://api.example:8443/"):
+            r = egress.post(bad, "{}",
+                            resolver=lambda h: (_ for _ in ()).throw(AssertionError("resolved!")),
+                            connection_factory=_post_factory(_FakeResp(200), []))
+            self.assertFalse(r.record.ok, bad)
+            self.assertEqual(r.record.method, "POST")
+
+    def test_body_must_be_str_or_bytes(self):
+        r = egress.post("https://api.example/", {"a": 1}, resolver=lambda h: ["93.184.216.34"],
+                        connection_factory=_post_factory(_FakeResp(200), []))
+        self.assertFalse(r.record.ok)
+        self.assertIn("body must be str or bytes", r.record.error)
+
+    def test_body_cap(self):
+        r = egress.post("https://api.example/", "x" * (egress.MAX_POST_BODY + 1),
+                        resolver=lambda h: ["93.184.216.34"],
+                        connection_factory=_post_factory(_FakeResp(200), []))
+        self.assertFalse(r.record.ok)
+        self.assertIn("body exceeds cap", r.record.error)
+        self.assertEqual(r.record.request_body_len, egress.MAX_POST_BODY + 1)
+
+    def test_content_type_header_injection_rejected(self):
+        r = egress.post("https://api.example/", "{}", content_type="application/json\r\nX-Evil: 1",
+                        resolver=lambda h: ["93.184.216.34"],
+                        connection_factory=_post_factory(_FakeResp(200), []))
+        self.assertFalse(r.record.ok)
+        self.assertIn("content-type", r.record.error)
+
+    def test_auth_value_injection_rejected(self):
+        r = egress.post("https://api.example/", "{}", auth="Bearer x\r\nX-Evil: 1",
+                        resolver=lambda h: ["93.184.216.34"],
+                        connection_factory=_post_factory(_FakeResp(200), []))
+        self.assertFalse(r.record.ok)
+        self.assertIn("authorization", r.record.error)
+
+    def test_private_and_metadata_ip_blocked(self):
+        for ip in ("10.0.0.5", "169.254.169.254", "100.64.0.1"):
+            r = egress.post("https://rebind.example/", "{}", resolver=lambda h, ip=ip: [ip],
+                            connection_factory=_post_factory(_FakeResp(200), []))
+            self.assertFalse(r.record.ok, ip)
+
+    def test_pins_safe_ip_and_canonical_host(self):
+        r, sink = self._ok()
+        self.assertTrue(r.record.ok)
+        self.assertEqual(r.record.resolved_ip, "93.184.216.34")
+        self.assertEqual(sink[0].pinned_ip, "93.184.216.34")   # connected to the pinned safe IP
+        self.assertEqual(sink[0].host, "api.example")          # SNI/cert = canonical host
+        self.assertTrue(sink[0].sent["skip_host"])             # single canonical Host header
+        self.assertEqual(sink[0].sent["headers"].get("Host"), "api.example")
+
+    def test_body_sent_exactly_and_content_length_matches(self):
+        r, sink = self._ok(body="hello-world")
+        self.assertEqual(sink[0].body, b"hello-world")          # byte-identical to args (no re-encode)
+        self.assertEqual(sink[0].sent["headers"].get("Content-Length"), str(len(b"hello-world")))
+        self.assertEqual(sink[0].sent["method"], "POST")
+
+    def test_host_injected_auth_sent_no_cookie(self):
+        r, sink = self._ok(auth="Bearer sk-secret")
+        self.assertEqual(sink[0].sent["headers"].get("Authorization"), "Bearer sk-secret")
+        self.assertNotIn("Cookie", sink[0].sent["headers"])
+
+    def test_no_auth_means_no_authorization_header(self):
+        r, sink = self._ok()
+        self.assertNotIn("Authorization", sink[0].sent["headers"])
+
+    def test_auth_and_preview_never_logged_in_record(self):
+        # The audit record is body-free-by-default and NEVER carries the credential.
+        r, sink = self._ok(auth="Bearer sk-secret", keep_preview=True, body="payload")
+        blob = repr(r.record)
+        self.assertNotIn("sk-secret", blob)
+        self.assertNotIn("Authorization", blob)
+
+    def test_redirect_fails_closed_no_second_connection(self):
+        sink = []
+        r = egress.post("https://api.example/", "payload", auth="Bearer sk",
+                        resolver=lambda h: ["93.184.216.34"],
+                        connection_factory=_post_factory(
+                            _FakeResp(302, headers={"Location": "https://evil.com/"}), sink))
+        self.assertFalse(r.record.ok)
+        self.assertEqual(r.record.status, 302)
+        self.assertEqual(r.record.redirect_location, "https://evil.com/")
+        self.assertIn("redirect not followed", r.record.error)
+        self.assertEqual(len(sink), 1)  # NEVER opened a second connection to re-POST to the target
+
+    def test_record_body_free_by_default(self):
+        r, sink = self._ok(body="secret-payload", keep_preview=False)
+        self.assertTrue(r.record.request_body_hash)              # linkable by hash
+        self.assertEqual(r.record.request_body_len, len(b"secret-payload"))
+        self.assertEqual(r.record.request_body_preview, "")      # body-free (autonomous path)
+
+    def test_record_preview_when_kept(self):
+        r, sink = self._ok(body="secret-payload", keep_preview=True)
+        self.assertEqual(r.record.request_body_preview, "secret-payload")  # human-gated path
+
+    def test_preview_is_bounded(self):
+        big = "P" * (egress._BODY_PREVIEW_BYTES + 50)
+        r, sink = self._ok(body=big, keep_preview=True)
+        self.assertEqual(len(r.record.request_body_preview), egress._BODY_PREVIEW_BYTES)
+
+    def test_success_returns_response_body_hashed(self):
+        r, sink = self._ok()
+        self.assertTrue(r.record.ok)
+        self.assertEqual(r.text(), '{"ok":true}')
+        self.assertIsNotNone(r.record.response_hash)
+        self.assertEqual(r.record.method, "POST")
+
+    def test_non_ascii_or_control_or_oversize_content_type_refused(self):
+        # panel: a non-latin-1 content_type would raise UnicodeEncodeError out of putheader; now
+        # a clean refusal (never an exception escaping post()).
+        for ct in ("application/json☃", "app/json\r\nX: 1", "x" * 300):
+            r = egress.post("https://api.example/", "{}", content_type=ct,
+                            resolver=lambda h: ["93.184.216.34"],
+                            connection_factory=_post_factory(_FakeResp(200), []))
+            self.assertFalse(r.record.ok, ct)
+
+    def test_non_ascii_or_control_auth_refused(self):
+        for a in ("Bearer ☃", "Bearer x\r\nX: 1"):
+            r = egress.post("https://api.example/", "{}", auth=a,
+                            resolver=lambda h: ["93.184.216.34"],
+                            connection_factory=_post_factory(_FakeResp(200), []))
+            self.assertFalse(r.record.ok, a)
+
+    def test_illegal_request_target_refused_never_raises(self):
+        # control / NUL / non-ascii in the path or query -> clean refusal, never an exception
+        for u in ("https://api.example/☃", "https://api.example/a\x00b",
+                  "https://api.example/x?q=☃"):
+            r = egress.post(u, "{}", resolver=lambda h: ["93.184.216.34"],
+                            connection_factory=_post_factory(_FakeResp(200), []))
+            self.assertFalse(r.record.ok, u)
+            self.assertIn("request target", r.record.error)
+
+
+class EmissionSeal(unittest.TestCase):
+    """The hold-time seal that binds an approved emission to what actually gets sent (Tier 2 has
+    no verifier — panel: approved != sent)."""
+
+    def test_seal_stable_and_sensitive_to_every_consequential_field(self):
+        base = egress.emission_seal("https://api.example/pay", '{"amt":10}', "application/json")
+        self.assertEqual(base, egress.emission_seal("https://api.example/pay", '{"amt":10}',
+                                                    "application/json"))
+        self.assertNotEqual(base, egress.emission_seal("https://evil.example/pay", '{"amt":10}',
+                                                       "application/json"))   # host
+        self.assertNotEqual(base, egress.emission_seal("https://api.example/steal", '{"amt":10}',
+                                                       "application/json"))   # target
+        self.assertNotEqual(base, egress.emission_seal("https://api.example/pay", '{"amt":9999}',
+                                                       "application/json"))   # body
+        self.assertNotEqual(base, egress.emission_seal("https://api.example/pay", '{"amt":10}',
+                                                       "text/plain"))          # content-type
+
+    def test_seal_canonicalizes_host_no_false_mismatch(self):
+        # a benign host-case difference is the SAME destination -> same seal (no false denial)
+        self.assertEqual(egress.emission_seal("https://API.Example/x", "b"),
+                         egress.emission_seal("https://api.example/x", "b"))
 
 
 if __name__ == "__main__":
