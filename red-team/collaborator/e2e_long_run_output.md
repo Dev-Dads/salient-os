@@ -1,51 +1,56 @@
 # ④ Memory — the long multi-turn e2e (all pieces, 26 turns, gpt-oss:120b)
 
-A proposer-driven working session against the destination model on Sparky's fast NVMe, with
-every piece live: doer + separate proposer, real gists (CDMS-A copy) + real curated facts
-(CDMS-D copy), ③ governance + leash + verifier, `ambiguous` ingest each turn, a midpoint
-consolidation. Harness: `e2e_long_run.py`; full transcript: `e2e_long_run_output.json`.
+A proposer-driven working session against the destination model on Sparky's fast NVMe, every
+piece live: doer + separate proposer, real gists (CDMS-A copy) + real curated facts (CDMS-D
+copy), ③ governance + leash + verifier, `ambiguous` ingest each turn, midpoint consolidation.
+Harness: `e2e_long_run.py`; transcript: `e2e_long_run_output.json`.
 
-## Result — the plumbing passed at scale; the PROPOSER degenerated
+## Run 1 — the plumbing passed; the proposer DEGENERATED
 
-**Infrastructure / memory / isolation — PASS.** 26 turns ran against gpt-oss:120b; **23 deeds
-ingested `ambiguous`** (all of them); the **midpoint consolidation grew the persona**
-(`gists_created: 4, gists_reinforced: 19, deduped: 11367, episodes_evicted: 51`; 110 → 114
-gists); **both live stores are byte-for-byte untouched** (`memory.db` + `world.db` md5 =
-pre-run baselines). The full system runs end-to-end, isolated, at length, against the 120b.
+Infra/memory/isolation PASS (23 `ambiguous` ingests, consolidation grew persona 110→114, both
+live stores untouched). But the proposer, after writing a README, proposed `read_file
+README.md` **~20 times in a row**. Root causes: no recent-action awareness; open-ended prompt +
+near-empty workspace + no goal → trivial convergence; auto-approve removed the veto brake.
 
-**The proposer collapsed into a degenerate loop — the finding.** After sensibly writing a
-`README.md` on turn 2 (shaped by the real fact "Tales of the Tao, wuxia 4X"), it proposed
-`read_file README.md` **~20 times in a row** — reading the file it just made, over and over,
-at a flat ~0.85 confidence, never proposing anything else, never triggering a held/denied path.
+## The fix — a prose/instruction-design panel
 
-## Diagnosis (why the open-ended prompt permits this)
+5 prose models (opus-4.1, sonnet-4.5, gpt-5.1, gemini-2.5-pro, grok-4.5; $0.1474) converged:
+feed a fenced `<<recent-actions>>` block + forbid re-proposing the same tool+arg on an unchanged
+workspace; enumerate a RICHER proposal space as examples-not-menu (keep "surprise me"); tie
+confidence to MARGINAL value; make decline competitive with trivial busywork. Applied: revised
+`_PROPOSER_SYSTEM` + `build_proposer_context(recent_actions=...)`.
 
-1. **No recent-action awareness.** The proposer reads consolidated *gists* (long-term persona)
-   + facts + the current workspace — but *not* "what I just proposed/did." It literally cannot
-   tell it read the README ten times. This is the core gap.
-2. **Open-ended + near-empty workspace + no goal → trivial convergence.** With only a README
-   present and "propose one useful safe next action," the safest useful action collapses to
-   "read the file that exists." A strong model doesn't get creative with no substrate.
-3. **Auto-approve removed the only brake.** In real use a human vetoes the repeat and the
-   decaying-veto inhibitor raises the bar; this controlled run auto-approved everything, so
-   nothing stopped it. (Relying on the human to veto 20 repeats is bad UX — the recent-action
-   fix is the right one.)
-4. **Governance was under-exercised.** Because the proposer only ever proposed safe in-workspace
-   file ops, no `run_command` HELD and no fence DENY fired — the governance paths held but were
-   never stressed this run.
+## Run 2 — the fix worked, and it surfaced the research gap
 
-## On the "personality develops → better proposals" hypothesis
+Outcomes: **ran 6 / failed 10 / declined 10** (both live stores untouched).
 
-The persona **did** grow across the midpoint consolidation (+4 gists, 19 reinforced), but the
-proposals **did not improve** — so **this run does not confirm the hypothesis.** The
-degeneration comes from a more basic gap (no recent-action memory + no goal), which extra
-persona can't fix. The hypothesis may still hold, but it is confounded here; testing it cleanly
-requires fixing the recent-action gap first.
+**The repetition is gone, and the outputs are genuinely good.** The proposer produced a coherent
+project-scaffolding sequence — README, PROJECT_PLAN, SETUP_GUIDE, .gitignore, LICENSE,
+CONTRIBUTING — grounded in the real memory. The README used the actual facts (Tales of the Tao,
+wuxia 4X, Unity 6, `D:\Repo\tales-of-tao`), pulled the **jcode reference from the gists**, and
+folded in the **3D-printing note from the user prefs**. The `.gitignore` is a proper Unity one;
+the generated `GameManager.cs` is clean idiomatic Unity C#. Real, useful, memory-shaped work.
 
-## Next step (in progress)
+**The research gap, demonstrated (turns 8–26).** It tried to write
+`Assets/Scripts/GameManager.cs` and **failed 10 times** — the parent dir doesn't exist and
+`write_file` doesn't create parents. The proposer *saw* the failures (recent-actions showed
+`failed`; a rationale literally reads "addressing repeated write failures") but **could not
+diagnose why**, because it cannot research (list the dir, see `Assets/` is absent). So it retried
+the same failing write, blind. The code was fine; the failure was environmental; a research-
+capable proposer would have listed the workspace and proposed `mkdir` first (or a flat path).
 
-The run pointed straight at the work: **revise the proposer's instructions** (a prose /
-instruction-design panel is analyzing the failure and proposing a revision that keeps the
-open-ended "surprise me" mandate while producing varied, valuable, non-repetitive proposals),
-and **feed the proposer recent-action awareness** (its last N governed deeds) so it stops
-repeating itself. Then re-run — and re-test the persona hypothesis cleanly.
+The 10 declines are a WIN of the revised prompt — it declined rather than manufacture busywork.
+
+## What this establishes
+
+- **The proposer's instructions are fixed** (variety + substance + anti-repetition + honest
+  decline), validated live at 26 turns against 120b.
+- **The proposer is single-shot and blind** — one LLM call, seeing only fenced memory/facts + a
+  file *list*, never actual state. Its recommendations are not researched. This is the next gap.
+- **Next build: a governed read-only RESEARCH loop** — let the proposer read/list within the
+  workspace + recall memory itself, for a budgeted few steps, before emitting a grounded
+  proposal. Bounded by a per-proposal **trust-level config** (local-only / read-only research /
+  sandboxed creation) and a **salience-modulated budget** (importance buys research depth). Also
+  a candidate quick complement: `write_file` could `mkdir -p` its parent, but research is the
+  principled fix (understand the workspace, don't paper over it).
+- **Output legibility** (the human-facing rationale/presentation) is a separate, later pass.

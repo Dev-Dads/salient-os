@@ -472,5 +472,20 @@ class VerifyPassHardening(unittest.TestCase):
         self.assertEqual(te["session_id"], "collaborator_deed:sess_123")
 
 
+class RecentActionsContext(unittest.TestCase):
+    def test_recent_actions_are_fenced(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = build_proposer_context(
+                Session(workspace=tmp),
+                recent_actions=["write_file(a.txt) -> ran", "read_file(a.txt) -> ran"])
+            self.assertIn("<<recent-actions", ctx)
+            self.assertIn("write_file(a.txt)", ctx)
+            self.assertIn("<<end recent-actions>>", ctx)
+
+    def test_no_recent_actions_no_block(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(build_proposer_context(Session(workspace=tmp)), "")
+
+
 if __name__ == "__main__":
     unittest.main()
