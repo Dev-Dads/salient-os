@@ -12,9 +12,10 @@ place — the pool never needs to be told twice. Host-side bookkeeping, influenc
 pool grants NO authority (approval still runs the full capability gate); it only guarantees a
 pending proposal is remembered and surfaced, never silently dropped.
 
-Bounded: PENDING is never auto-evicted (that is the point), but growth IS capped
-(``max_pending``) so a flooding proposer cannot exhaust memory — once full, NEW enrollments are
-refused (existing pending are preserved) rather than silently dropped-and-forgotten.
+Bounded on BOTH axes so a flooding proposer (or a host that never prunes) cannot exhaust memory:
+PENDING is capped at ``max_pending`` (never auto-evicted — once full, NEW enrollments are refused,
+existing pending preserved), and RESOLVED is retained only up to ``max_resolved`` as an audit tail
+(oldest dropped first). Total ``_items`` is therefore ≤ ``max_pending + max_resolved``.
 
 Durability note: v0 is in-memory (per live session). Cross-restart persistence — so a pending
 proposal survives a box restart — is the deferred follow-up, kept under the single-trust-
@@ -28,6 +29,7 @@ from collaborator.propose import PROPOSED
 COLLABORATOR_PROPOSALPOOL_VERSION = "0.1.0"
 
 DEFAULT_MAX_PENDING = 256
+DEFAULT_MAX_RESOLVED = 256
 
 
 def _safe_args(args) -> dict:
@@ -53,9 +55,11 @@ def _safe_args(args) -> dict:
 class ProposalPool:
     """An insertion-ordered, size-bounded pool of surfaced proposals, keyed by proposal_id."""
 
-    def __init__(self, max_pending: int = DEFAULT_MAX_PENDING) -> None:
+    def __init__(self, max_pending: int = DEFAULT_MAX_PENDING,
+                 max_resolved: int = DEFAULT_MAX_RESOLVED) -> None:
         self._items: dict = {}  # proposal_id -> Proposal (insertion order preserved)
         self.max_pending = max(1, int(max_pending))
+        self.max_resolved = max(0, int(max_resolved))
 
     def add(self, proposal) -> bool:
         """Enroll a surfaced proposal. Idempotent by proposal_id (re-adding the same proposal is
@@ -69,7 +73,19 @@ class ProposalPool:
         if self.pending_count() >= self.max_pending:
             return False  # full: refuse the NEW one, keep every existing pending proposal
         self._items[pid] = proposal
+        self._evict_resolved_overflow()
         return True
+
+    def _evict_resolved_overflow(self) -> None:
+        """Bound TOTAL memory: a propose→approve/veto loop that never calls ``prune_resolved``
+        would otherwise grow ``_items`` without bound (only PENDING was capped — a red-team
+        finding). Retain at most ``max_resolved`` resolved proposals as an audit tail, dropping
+        the OLDEST resolved first (insertion order). PENDING is never evicted — that is the point."""
+        resolved_ids = [pid for pid, p in self._items.items()
+                        if getattr(p, "status", None) != PROPOSED]
+        overflow = len(resolved_ids) - self.max_resolved
+        for pid in resolved_ids[:max(0, overflow)]:
+            del self._items[pid]
 
     def get(self, proposal_id: str):
         return self._items.get(proposal_id)

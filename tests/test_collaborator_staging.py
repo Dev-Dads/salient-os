@@ -25,7 +25,7 @@ from collaborator.propose import PROPOSED, approve_proposal, propose, veto_propo
 from collaborator.proposalpool import ProposalPool
 from collaborator.session import Session
 from collaborator.toolcall import ToolIntent
-from collaborator.tools import is_controlled_location
+from collaborator.tools import ACT_THEN_REPORT, PROPOSE_FIRST, is_controlled_location
 
 
 def _write_resp(confidence=0.9, path="todo.txt", content="draft\n"):
@@ -79,14 +79,18 @@ class ControlledLocationDeny(unittest.TestCase):
             got = propose(s, ScriptedClient([_write_resp(0.9, path=".github/workflows/ci.yml")]), "ctx")
             self.assertEqual(len(got), 1)  # nothing is controlled -> surfaces (still HELD)
 
-    @unittest.skipUnless(os.name == "nt", "case/dot aliases only collapse onto .github on Windows")
-    def test_proposer_fs_alias_write_is_denied(self):
-        # End-to-end: a proposer write to a case/dot alias of the controlled dir is refused, not
-        # surfaced — the bypass the red-team found is closed through the real govern path.
+    def test_proposer_case_alias_write_is_denied(self):
+        # End-to-end: a proposer write to a CASE alias of the controlled dir is refused on every
+        # OS (case-fold is universal) — the macOS bypass the external panel found is closed.
         with tempfile.TemporaryDirectory() as tmp:
             s = Session(workspace=tmp, proactivity="eager")
-            for path in (".GitHub/workflows/ci.yml", ".github./workflows/ci.yml"):
-                self.assertEqual(propose(s, ScriptedClient([_write_resp(0.9, path=path)]), "ctx"), [])
+            self.assertEqual(propose(s, ScriptedClient([_write_resp(0.9, path=".GitHub/workflows/ci.yml")]), "ctx"), [])
+
+    @unittest.skipUnless(os.name == "nt", "trailing dot/space only collapse onto .github on Windows")
+    def test_proposer_trailing_alias_write_is_denied(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = Session(workspace=tmp, proactivity="eager")
+            self.assertEqual(propose(s, ScriptedClient([_write_resp(0.9, path=".github./workflows/ci.yml")]), "ctx"), [])
 
 
 class IsControlledLocation(unittest.TestCase):
@@ -108,19 +112,20 @@ class IsControlledLocation(unittest.TestCase):
             self.assertFalse(is_controlled_location(tmp, "../evil", (".github",)))  # escape -> False
 
     def test_fs_collapsing_aliases_are_caught(self):
-        # Red-team (subagent): case / trailing-dot / trailing-space variants that the OS collapses
-        # onto the real `.github` must not dodge the check. The correct answer is FS-accurate and
-        # therefore OS-dependent: on Windows these ARE `.github` on disk; on POSIX they are genuinely
-        # distinct directories the CI never reads (so not controlled is correct there).
+        # Red-team (subagent + external panel): aliases the filesystem collapses onto `.github`
+        # must not dodge the check.
         with tempfile.TemporaryDirectory() as tmp:
             c = (".github",)
-            aliases = [".GitHub/workflows/ci.yml", ".github./workflows/ci.yml", ".github /workflows/ci.yml"]
-            if os.name == "nt":
-                for p in aliases:
-                    self.assertTrue(is_controlled_location(tmp, p, c), p)
-            else:
-                for p in aliases:
-                    self.assertFalse(is_controlled_location(tmp, p, c), p)
+            # CASE aliases collapse on ANY case-insensitive FS (Windows, macOS/APFS, ...). We
+            # case-fold ALWAYS, so they are controlled on every OS (over-fold = safe direction:
+            # at worst a proposer stages instead of writes). Panel found the Windows-only fold
+            # let `.GitHub` through on macOS.
+            self.assertTrue(is_controlled_location(tmp, ".GitHub/workflows/ci.yml", c))
+            self.assertTrue(is_controlled_location(tmp, ".GITHUB/x", c))
+            # TRAILING dot/space are dropped by the Windows FS only -> controlled on Windows; on
+            # POSIX they are genuinely distinct dirs the CI never reads (correctly not controlled).
+            for p in (".github./workflows/ci.yml", ".github /x"):
+                self.assertEqual(is_controlled_location(tmp, p, c), os.name == "nt", p)
             # invariant on every OS: exact name controlled, a mere lookalike prefix is not
             self.assertTrue(is_controlled_location(tmp, ".github/x", c))
             self.assertFalse(is_controlled_location(tmp, "github/x", c))
@@ -276,6 +281,54 @@ class PoolHardening(unittest.TestCase):
         pool.add(_P("c", "weird-off-vocabulary"))  # must not vanish from BOTH views
         self.assertEqual(len(pool.pending()) + len(pool.resolved()), len(pool.all()))
         self.assertIn("c", [getattr(p, "proposal_id", "") for p in pool.resolved()])
+
+    def test_total_pool_is_bounded_by_resolved_retention(self):
+        # grok F3: capping only PENDING left total _items unbounded (approve/veto in a loop and
+        # never prune). Resolved is now retained only up to max_resolved.
+        pool = ProposalPool(max_pending=2, max_resolved=2)
+
+        class _P:
+            def __init__(self, pid):
+                self.proposal_id, self.status = pid, "proposed"
+
+        for i in range(20):
+            p = _P(f"p{i}")
+            pool.add(p)
+            p.status = "approved"  # resolve immediately so pending frees for the next add
+        # The DoS-relevant guarantee: total memory stays bounded no matter how many pass through
+        # (eviction is lazy on add, so resolved() can momentarily sit one over the cap).
+        self.assertLessEqual(len(pool), pool.max_pending + pool.max_resolved)
+        self.assertLess(len(pool), 20)  # did not retain all 20
+
+
+class ProposerShellAndApproveGates(unittest.TestCase):
+    """External-panel findings: proposer shell can't auto-run, and approval re-asserts the deny."""
+
+    def test_proposer_run_command_cannot_autorun_even_if_leash_loosened(self):
+        # grok F1: a proposer shell command must never auto-run — floored to propose_first (held)
+        # regardless of host leash config — so it can't silently place into a controlled tree.
+        with tempfile.TemporaryDirectory() as tmp:
+            s = Session(workspace=tmp,
+                        capabilities=("fs.read:project", "fs.write:project", "shell.exec"),
+                        leash_overrides={"run_command": ACT_THEN_REPORT})
+            d = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "proposed"))
+            self.assertEqual(d.leash, PROPOSE_FIRST)
+            self.assertEqual(d.status, HELD)
+            # a user-directed command keeps the host's chosen leash (unaffected)
+            d2 = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "structured"))
+            self.assertEqual(d2.leash, ACT_THEN_REPORT)
+
+    def test_approve_re_denies_a_mutated_controlled_path(self):
+        # grok F2: a held collaborator proposal whose path is mutated into a controlled tree after
+        # origination is refused at approval (defence-in-depth). A proposer can never originate
+        # such a write, so a mutated one is illegitimate.
+        with tempfile.TemporaryDirectory() as tmp:
+            s = Session(workspace=tmp, proactivity="eager")
+            p = propose(s, ScriptedClient([_write_resp(0.9, path="staged/ci.yml")]), "ctx")[0]
+            p.decision.args["path"] = ".github/workflows/ci.yml"  # host-side mutation of the hold
+            d = approve(s, p.decision)
+            self.assertEqual(d.status, DENIED)
+            self.assertFalse((Path(tmp) / ".github").exists())
 
 
 if __name__ == "__main__":

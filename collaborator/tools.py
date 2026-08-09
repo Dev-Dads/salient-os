@@ -18,6 +18,7 @@ from __future__ import annotations
 import os
 import shlex
 import sys
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -105,15 +106,17 @@ def resolve_in_workspace(workspace, rel: str) -> Path:
 
 
 def _fs_normcase(component: str) -> str:
-    """Normalize a path component the way the filesystem will actually name it, so a controlled
-    location cannot be dodged by an alias the OS silently collapses onto the same name.
-    ``os.path.normcase`` folds case per-OS (a no-op on POSIX, lowercasing on Windows); on Windows
-    the FS also STRIPS trailing dots and spaces from a name (``.github.`` and ``.github `` both
-    become ``.github`` on disk), so we strip those too. Same normcase discipline
-    ``vetoledger.normalize_intent`` already uses to keep a vetoed path from re-surfacing under a
-    trivial alias.
+    """Normalize a path component the way a case-insensitive filesystem will actually name it, so
+    a controlled location cannot be dodged by an alias the OS silently collapses onto the same
+    name. We ``casefold`` ALWAYS — not only on Windows — because case-insensitivity is a property
+    of the *filesystem*, not the OS: macOS (APFS/HFS+ default) is case-insensitive while
+    ``os.name`` is ``posix`` (a red-team finding: ``.GitHub`` bypassed a Windows-only fold), and
+    Linux can mount case-insensitive volumes/shares. Over-folding is the SAFE direction — at worst
+    a proposer STAGES a case-variant path instead of writing it (the deny is proposer-only), never
+    a bypass. NFC-normalize first (canonical-equivalence aliases on APFS/HFS+); on Windows also
+    strip trailing dots/spaces, which that FS drops from a name (``.github.``/``.github ``→``.github``).
     """
-    c = os.path.normcase(component)
+    c = unicodedata.normalize("NFC", component).casefold()
     if os.name == "nt":
         c = c.rstrip(". ")
     return c
