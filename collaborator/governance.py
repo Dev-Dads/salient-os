@@ -34,6 +34,7 @@ from salienceos.interpreter import Facet, SalienceSignal, interpret, issue_polic
 from salienceos.verifier import issue_envelope, issue_receipt
 from salienceos.verifier.observers import observe_action, snapshot_tree
 
+from collaborator import egress
 from collaborator.tools import (
     ACT_THEN_REPORT,
     NOTIFY_ONLY,
@@ -42,6 +43,7 @@ from collaborator.tools import (
     ToolResult,
     WorkspaceError,
     execute_tool,
+    flag_offense_shape,
     get_tool,
     is_controlled_location,
     resolve_in_workspace,
@@ -62,7 +64,7 @@ UNKNOWN_TOOL = "unknown_tool"
 
 # Host-computed risk per tool (INFLUENCE only — drives verification depth, never
 # authority). Not model-selectable.
-_TOOL_RISK = {"read_file": 0.0, "write_file": 0.1, "run_command": 0.5}
+_TOOL_RISK = {"read_file": 0.0, "write_file": 0.1, "run_command": 0.5, "web_fetch": 0.2}
 
 
 @dataclass
@@ -96,6 +98,10 @@ class Decision:
     # a second approve(), or approve() on a vetoed decision — can re-execute it or reuse its
     # action_id. A DENIED re-gate does NOT consume it (it stays retryable once authority holds).
     consumed: bool = False
+    # ADR 0003: the channel-integrity egress record for a net.get (audit only), and an
+    # AUDIT-ONLY offense-shape tag (never a deny — the boundary is structural default-deny).
+    egress: object = None
+    offense_flag: str = ""
 
     def summary(self) -> str:
         """The honest, human-facing line — derived from the real decision/result,
@@ -106,6 +112,8 @@ class Decision:
             tail = f"  ⚠ LEARNING ERROR — inhibitor may be lost: {self.learning_error}"
         else:
             tail = ""
+        if self.offense_flag:  # ADR 0003 audit-only tag — recorded, never a deny
+            tail += f"  ⚑ offense-shape audit: {self.offense_flag}"
         if self.status == RAN:
             out = (self.result.output if self.result else "") or "(no output)"
             return f"[{self.tool} ✓ ran, verified] {out}{tail}"
@@ -113,9 +121,9 @@ class Decision:
             err = (self.result.error if self.result else "") or "did not clear verification"
             return f"[{self.tool} ✗ FAILED — not verified] {err}{tail}"
         if self.status == HELD:
-            return f"[{self.tool} ⏸ HELD for your approval] would run: {self.preview}"
+            return f"[{self.tool} ⏸ HELD for your approval] would run: {self.preview}{tail}"
         if self.status == NOTIFIED:
-            return f"[{self.tool} · notify-only] worth doing: {self.args}"
+            return f"[{self.tool} · notify-only] worth doing: {self.args}{tail}"
         if self.status == DENIED:
             return f"[{self.tool} ⛔ DENIED] {self.reason}"
         return f"[{self.tool}] {self.reason}"
@@ -184,14 +192,14 @@ def govern_action(session, intent: ToolIntent, importance: "float | None" = None
     # ③ a signed grant caps how loose the leash may get: the host/view can tighten but
     # never loosen past the cap (fail-closed if the grant is present but invalid).
     leash = apply_cap(leash, leash_cap(session, tool.name))
-    # A PROPOSER-originated shell command must never AUTO-run: floor it at propose_first so it is
-    # always surfaced for a human hand, whatever the host leash config. run_command is the
-    # unbounded-reach mutator — it can write anywhere (including controlled trees the write_file
-    # hard-deny protects) and reach OUTSIDE the machine, and its verify_mode="exit" gives it no
-    # write-set floor — so the human is the control (red-team: hard-deny-and-stage was
-    # write_file-only; a loosened run_command leash could otherwise auto-place into `.github`).
-    if intent.name == "run_command" and getattr(intent, "source", "") == "proposed" \
-            and leash == ACT_THEN_REPORT:
+    # A PROPOSER-originated shell command OR network egress must never AUTO-run: floor it at
+    # propose_first so it is always surfaced for a human hand, whatever the host leash config.
+    # run_command is the unbounded-reach mutator (writes anywhere, reaches outside the machine,
+    # verify_mode="exit" gives it no write-set floor); an egress tool EMITS off the owned domain
+    # (ADR 0003 treats even a GET as an exfil channel). Both are the consequential emission the
+    # human must gate — a loosened leash config must not let either auto-fire.
+    if (getattr(intent, "source", "") == "proposed" and leash == ACT_THEN_REPORT
+            and (intent.name == "run_command" or getattr(tool, "egress", False))):
         leash = PROPOSE_FIRST
     imp = session.default_importance if importance is None else importance
     rk = _TOOL_RISK.get(tool.name, 0.3) if risk is None else risk
@@ -224,10 +232,26 @@ def govern_action(session, intent: ToolIntent, importance: "float | None" = None
                         reason=f"governance error: {type(exc).__name__}", leash=leash,
                         args=intent.args)
 
+    # --- CAPABILITY (ADR 0003: an egress tool DERIVES its capability from the destination) ---
+    # For an egress tool the authority is net.get:<canonical-host>, computed from the request —
+    # a "capability = f(intent)" shape the static gate does not have. Canonicalization is
+    # load-bearing: the SAME canonical host is the capability key here AND the connect host in
+    # egress.fetch, so authorize-one/connect-another cannot diverge. An ineligible URL (not
+    # https, userinfo, non-443 port, bad host) yields no capability -> DENY (fail closed).
+    if getattr(tool, "egress", False):
+        required_cap = egress.required_capability(str(intent.args.get("url") or ""))
+        if required_cap is None:
+            return Decision(action_id=action_id, tool=tool.name, status=DENIED,
+                            reason="ineligible egress URL (need https://, a plain host, no "
+                                   "credentials, port 443)", leash=leash, directive=directive,
+                            args=intent.args)
+    else:
+        required_cap = tool.capability
+
     # --- CAPABILITY GATE (the one core-enforced authority) -------------------
-    if not directive.grants_capability(tool.capability):
+    if not directive.grants_capability(required_cap):
         return Decision(action_id=action_id, tool=tool.name, status=DENIED,
-                        reason=f"policy does not grant '{tool.capability}'", leash=leash,
+                        reason=f"policy does not grant '{required_cap}'", leash=leash,
                         directive=directive, args=intent.args)
 
     # --- workspace pre-check for path tools (deny before running) ------------
@@ -254,14 +278,15 @@ def govern_action(session, intent: ToolIntent, importance: "float | None" = None
                         leash=leash, directive=directive, args=intent.args)
 
     # --- LEASH (second axis) --------------------------------------------------
+    offense_flag = flag_offense_shape(intent.name, intent.args)  # audit-only tag, never a deny
     if leash == NOTIFY_ONLY:
         return Decision(action_id=action_id, tool=tool.name, status=NOTIFIED,
                         reason="notify-only leash", leash=leash, directive=directive,
-                        args=intent.args)
+                        args=intent.args, offense_flag=offense_flag)
     if leash == PROPOSE_FIRST:
         return Decision(action_id=action_id, tool=tool.name, status=HELD,
                         reason="propose-first leash: awaiting approval", leash=leash,
-                        directive=directive, args=intent.args,
+                        directive=directive, args=intent.args, offense_flag=offense_flag,
                         preview={"tool": tool.name, "args": intent.args,
                                  "verification_depth": directive.verification_depth})
 
@@ -299,9 +324,21 @@ def reauthorized_or_denied(session, tool: Tool, action_id: str, args: dict, leas
         return Decision(action_id, tool.name, DENIED,
                         f"re-gate governance error: {type(exc).__name__}", leash,
                         directive=directive, args=args)
-    if not current.grants_capability(tool.capability):
+    # ADR 0003: an egress tool re-derives its capability from the destination frozen in the
+    # held decision, and re-checks the allowlist against CURRENT caps — so a host removed from
+    # the signed allowlist between stage and approval is denied at the moment of use (the
+    # panel's emission-TOCTOU), and a destination made ineligible fails closed.
+    if getattr(tool, "egress", False):
+        required_cap = egress.required_capability(str(args.get("url") or ""))
+        if required_cap is None:
+            return Decision(action_id, tool.name, DENIED,
+                            "ineligible egress URL at approval time", leash,
+                            directive=directive, args=args)
+    else:
+        required_cap = tool.capability
+    if not current.grants_capability(required_cap):
         return Decision(action_id, tool.name, DENIED,
-                        f"capability '{tool.capability}' not granted at approval time",
+                        f"capability '{required_cap}' not granted at approval time",
                         leash, directive=directive, args=args)
     if tool.name in ("write_file", "read_file"):
         try:
@@ -331,18 +368,36 @@ def execute_and_verify(session, tool: Tool, directive, action_id: str, args: dic
                         "read" if ok else "read failed", leash, cleared=ok,
                         result=execution.result, directive=directive, args=args)
 
+    # ADR 0003 egress: the mediated client already enforced the transport safety contract
+    # (canonical host == connect host, no redirect, IP-pinned + private-range blocked, HTTPS,
+    # bounds). "Clearance" here is the channel-integrity record's ok flag — NOT independent
+    # world-observation (the client both makes and records the request; same channel). The
+    # egress record is carried on the Decision for audit.
+    if tool.verify_mode == "egress_log":
+        execution = execute_tool(tool, session.workspace, args)
+        rec = execution.egress
+        ok = bool(execution.result.ok)
+        reason = (f"egress {rec.canonical_dest} [{rec.status}]" if ok
+                  else (rec.error if rec is not None else "egress failed"))
+        return Decision(action_id, tool.name, RAN if ok else FAILED, reason, leash,
+                        cleared=ok, result=execution.result, directive=directive, args=args,
+                        egress=rec)
+
     # Command with no declared artifact: clearance is the SUPERVISOR's exit code
     # (its own view of the child, not the tool's self-report) — a nonzero exit
     # can't be narrated as success.
     if tool.verify_mode == "exit":
+        offense_flag = flag_offense_shape(tool.name, args)  # audit-only tag, never a deny
         try:
             execution = execute_tool(tool, session.workspace, args)
         except WorkspaceError as exc:
-            return Decision(action_id, tool.name, DENIED, str(exc), leash, directive=directive, args=args)
+            return Decision(action_id, tool.name, DENIED, str(exc), leash, directive=directive,
+                            args=args, offense_flag=offense_flag)
         cleared = bool(execution.result.ok)
         return Decision(action_id, tool.name, RAN if cleared else FAILED,
                         "supervised exit 0" if cleared else f"exit {execution.exit_code}",
-                        leash, cleared=cleared, result=execution.result, directive=directive, args=args)
+                        leash, cleared=cleared, result=execution.result, directive=directive,
+                        args=args, offense_flag=offense_flag)
 
     # verify_mode == "artifact": build envelope BEFORE running, snapshot, execute
     # receipt from the REAL result, observe world independently, govern.

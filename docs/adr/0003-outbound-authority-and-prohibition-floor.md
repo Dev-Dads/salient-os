@@ -114,13 +114,22 @@ by how much of a human hand and how strong an out-of-band root they require.
 
 ### Tier 2 — Human-gated raw reach (already shipped, extended)
 
-- `run_command` stays floored to `propose_first` for proposer-originated intents
-  (`governance.py:193`) — the unbounded-reach tool always needs a hand.
+- A **proposer-originated** (`source=="proposed"`) `run_command` **or egress tool**
+  is floored to `propose_first` (`governance.py`) — the unbounded-reach tool and any
+  off-domain emission always need a hand, whatever the leash config.
 - **`net.post` / any side-effecting emission** defaults to `propose_first`.
-- **Egress that feeds *unsurfaced* perception is floored to `propose_first`** (or
-  surfaced in the judgment view) — see the `web_research` decision below. This is
-  the control that actually bounds the injection risk, since the structural default
-  cannot stop an emission to an *allowlisted-for-read* host.
+- **Perception egress (`web_research`) is *surfaced + bounded*, not held by default.**
+  The v0 build (code-panel decision) routes a research GET through the one governance
+  gate as a **governed, audited `web_fetch` Decision** (surfaced on the bus), default-
+  deny, **request-target-capped**, its body **`_neutralize`d before the model sees it**
+  (redacting secret-shaped tokens) and UNTRUSTED-tagged. It runs autonomously so it can
+  ground a proposal — the injection/exfil risk to an *allowlisted-for-read* host is
+  **bounded** by default-deny + the target cap + neutralization + audit rather than by a
+  pre-emption hold. An operator who wants the strict hold **can** cap `web_fetch` to
+  `propose_first` in the signed grant, which holds research egress too. (The earlier
+  "floored to `propose_first`" framing was tightened to this after the build red-team
+  showed a strict hold makes autonomous research near-redundant with proposing a
+  `web_fetch`; the honest bound is structural, not a hold.)
 
 ### Tier 3 — Scope-gated high-impact ops (designed here, unlocked later)
 
@@ -163,9 +172,13 @@ proposer context (`research.py:143-145`) → the proposer's user message
 (`propose.py:161`). So web content **can** induce the proposer to originate a
 `source="proposed"` action. Therefore:
 
-- Egress feeding unsurfaced perception is **`propose_first`** (or surfaced), so an
-  injected next-step cannot auto-emit.
-- Fetched content is tagged **adversarial-provenance** (a distinct fence class from
+- Research egress runs through the **one governance gate** (not a parallel authority
+  check) as a **surfaced, audited, bounded** `web_fetch` (see Tier 2): default-deny,
+  request-target-capped, `_neutralize`d, UNTRUSTED-tagged. An injected next-step is
+  bounded by those structural controls; it can still emit to an *allowlisted-for-read*
+  host (a stated non-goal), which is why the bound is default-deny + cap + neutralize +
+  audit rather than a claim that it "cannot auto-emit."
+- Fetched content is tagged **adversarial-provenance** (a distinct render class from
   workspace reads) and recorded in the audit, so a forensic reader can see what
   drove a proposal.
 - **The system is not injection-resistant, and this ADR does not claim it is.**
@@ -194,8 +207,9 @@ proposer context (`research.py:143-145`) → the proposer's user message
   hidden): exfil of the operator's *own* secret to an allowlisted-for-read host (the
   missing axis is *what leaves*, not *where to*); and offense *through* a sanctioned
   channel (harassment/spam via an allowlisted API — grantable reach, third-party
-  harm). Both are best-effort-mitigated (query/header caps, propose_first on
-  emission), not solved.
+  harm). Both are best-effort-mitigated (request-target cap, fixed header set,
+  `_neutralize` on research findings, and the `propose_first` floor on
+  proposer-originated emission), not solved.
 - **The new-channel flow is an operator caps re-mint, not a Collaborator emission.**
   The v1 "identical to controlled-location staging" claim was wrong: inward,
   `fs.write:project` is coarse and `is_controlled_location` denies a sub-region
@@ -213,17 +227,17 @@ proposer context (`research.py:143-145`) → the proposer's user message
 Host-side, core untouched.
 
 1. **`collaborator/egress.py` (new).** The single mediated client implementing the
-   Tier-1 mediation contract (canonical parse, no-redirect, IP-pin + private-range
-   block, HTTPS, bounds). Returns an egress record (canonical dest, method,
-   request-target hash, response hash/length, bytes, status). Only this module
-   touches the network. A companion constructor in
-   `salienceos/verifier/observers.py` reads that record as **egress logging**
-   (channel-integrity), explicitly not the independent-world observation used for
-   `verify_mode="artifact"`.
+   Tier-1 mediation contract (canonical parse, no-redirect, IP-pin + private/CGNAT/
+   metadata block, HTTPS, request-target + response bounds). Returns an `EgressRecord`
+   (canonical dest, method, request-target hash, response hash/length, bytes, status).
+   Only this module touches the network. The record is **channel-integrity logging**
+   (as-built it lives collaborator-side — **core untouched in v0**), explicitly not the
+   independent-world observation used for `verify_mode="artifact"`; graduating it into
+   `salienceos/verifier/observers.py` is a revisit item.
 2. **`collaborator/tools.py`.** Register `web_fetch` (`op="net.get"`,
-   `verify_mode="egress_log"`, default leash per Tier 2 for unsurfaced perception).
-   Keep the audit-only offense recognizer here as a predicate that *tags*, never
-   denies.
+   `verify_mode="egress_log"`, `egress=True`, an **un-grantable sentinel** static
+   capability so a dropped `egress=True` can never fall back to a wildcard). Keep the
+   audit-only offense recognizer here as a predicate that *tags*, never denies.
 3. **`collaborator/governance.py`.** Add the **capability-derivation step** for
    egress tools (compute `net.get:<canonical-host>` from `intent.args`, gate on it),
    and extend `reauthorized_or_denied` (`:306`) with an egress branch that
@@ -232,9 +246,11 @@ Host-side, core untouched.
 4. **`collaborator/policycaps.py` + `session.py`.** `net.get:<host>` capabilities
    ride the existing signed-caps path; the allowlist *is* those caps (default empty
    = default-deny). No mutable session allowlist.
-5. **`collaborator/research.py`.** `web_research` calls the mediated client for
-   read-only GET within the allowlist; findings carry adversarial-provenance tags
-   and the egress that produced them is Tier-2-floored.
+5. **`collaborator/research.py`.** `web_research` performs a read-only GET by routing
+   through the **one governance gate** (`govern_action` on a `web_fetch` intent) — a
+   surfaced, audited, bounded Decision, not a parallel authority check. Findings render
+   through `_neutralize` (redacting secret-shaped tokens before the model sees them) and
+   carry the UNTRUSTED tag applied at the tool.
 
 ## Verification (when it builds — both passes are a gate, not a suggestion)
 
