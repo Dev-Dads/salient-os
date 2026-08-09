@@ -12,7 +12,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from salienceos.verifier import Status, issue_receipt
+from salienceos.verifier import Stakes, Status, issue_envelope, issue_receipt
 from salienceos.verifier.observers import (
     entailed_ancestors,
     observe_action,
@@ -21,7 +21,7 @@ from salienceos.verifier.observers import (
     snapshot_tree,
 )
 from salienceos.verifier.signing import sha256_bytes
-from tests.helpers import EXECUTOR_ID, EXECUTOR_KEY, make_verifier, write_envelope
+from tests.helpers import EXECUTOR_ID, EXECUTOR_KEY, POLICY_KEY, make_verifier, write_envelope
 
 _CONTENT = "line1\nline2\n"
 
@@ -92,6 +92,52 @@ class NestedWriteVerifies(unittest.TestCase):
             world = observe_action(env, ws, pre, res)
             v = make_verifier().verify(env, self._receipt(env, "a/b/c.txt", _CONTENT), world)
             self.assertIsNot(v.status, Status.VERIFIED)  # undeclared sibling still fails closed
+
+
+class ExemptionByTransitionNotName(unittest.TestCase):
+    """Red-team F1/F3: the ancestor exemption must key on TRANSITION (absent->dir here), not on
+    name — else a destructive type-change of a PRE-EXISTING ancestor (whose path has no other
+    observer for file.write) verifies while a real file is destroyed."""
+
+    def _receipt(self, env, path, content, write_set=None):
+        return issue_receipt("r-" + env.envelope_id, env.envelope_id, 0,
+                             {path: sha256_bytes(content.encode("utf-8"))},
+                             (path,) if write_set is None else write_set,
+                             True, EXECUTOR_ID, EXECUTOR_KEY)
+
+    def test_file_to_dir_ancestor_replacement_is_caught(self):
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d)
+            (ws / "logs").mkdir()
+            (ws / "logs" / "app").write_text("IMPORTANT pre-existing data")  # ancestor is a FILE
+            env = write_envelope("env-f1", "logs/app/run.txt", _CONTENT)
+            pre = snapshot_tree(ws)
+            # Executor "clears the blocker": destroy the file at logs/app, make it a dir, write child.
+            code = ("import pathlib\n"
+                    "p = pathlib.Path('logs/app'); p.unlink(); p.mkdir(parents=True)\n"
+                    "(p / 'run.txt').write_bytes(%r)\n" % _CONTENT.encode("utf-8"))
+            res = run_supervised([sys.executable, "-c", code], cwd=ws)
+            world = observe_action(env, ws, pre, res)
+            v = make_verifier().verify(env, self._receipt(env, "logs/app/run.txt", _CONTENT), world)
+            # The child hash matches, exit is 0 — only the write-set boundary can catch the
+            # destroyed file at logs/app. With the transition check it does.
+            self.assertIsNot(v.status, Status.VERIFIED)
+
+    def test_delete_that_removes_an_ancestor_dir_is_caught(self):
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d)
+            (ws / "a" / "b").mkdir(parents=True)
+            (ws / "a" / "b" / "c.txt").write_text("x")
+            (ws / "a" / "b" / "keep.txt").write_text("collateral")  # would be destroyed with a/b
+            env = issue_envelope("env-f3", "file.delete", {"path": "a/b/c.txt"},
+                                 "project_mutation", Stakes.NORMAL, "policy-0.1.0", POLICY_KEY)
+            pre = snapshot_tree(ws)
+            res = run_supervised([sys.executable, "-c", "import shutil; shutil.rmtree('a/b')"], cwd=ws)
+            receipt = issue_receipt("r-f3", "env-f3", 0, {}, ("a/b/c.txt",),
+                                    True, EXECUTOR_ID, EXECUTOR_KEY)
+            world = observe_action(env, ws, pre, res)
+            v = make_verifier().verify(env, receipt, world)
+            self.assertIsNot(v.status, Status.VERIFIED)  # undeclared removal of a/b is caught
 
 
 if __name__ == "__main__":

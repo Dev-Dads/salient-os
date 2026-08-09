@@ -105,11 +105,19 @@ def approve(session, decision: Decision) -> Decision:
     recorded directive."""
     if decision.status != HELD:
         return decision
+    # Single-use: a HELD decision may run at most once, through ANY approval path. Without this
+    # the same held decision (held by the proposal pool by reference, and reachable as
+    # ``proposal.decision``) could be re-run — running a VETOED action, or double-executing an
+    # approved one under a REUSED action_id (a one-id/one-action audit break). Both were proven
+    # by the red-team; the flag closes them at the decision layer, below the wrapper's status.
+    if getattr(decision, "consumed", False):
+        return decision
     tool = get_tool(decision.tool)
     if tool is None:
         return decision
     denied = reauthorized_or_denied(session, tool, decision.action_id, decision.args,
                                     decision.leash, decision.directive)
     if denied is not None:
-        return denied
+        return denied            # authority no longer holds: NOT consumed -> retryable later
+    decision.consumed = True     # claim it before running, so no concurrent/second path re-runs
     return execute_and_verify(session, tool, decision.directive, decision.action_id, decision.args)

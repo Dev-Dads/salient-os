@@ -15,6 +15,7 @@ says so (never a fabricated success).
 
 from __future__ import annotations
 
+import os
 import shlex
 import sys
 from dataclasses import dataclass, field
@@ -103,6 +104,21 @@ def resolve_in_workspace(workspace, rel: str) -> Path:
     return target
 
 
+def _fs_normcase(component: str) -> str:
+    """Normalize a path component the way the filesystem will actually name it, so a controlled
+    location cannot be dodged by an alias the OS silently collapses onto the same name.
+    ``os.path.normcase`` folds case per-OS (a no-op on POSIX, lowercasing on Windows); on Windows
+    the FS also STRIPS trailing dots and spaces from a name (``.github.`` and ``.github `` both
+    become ``.github`` on disk), so we strip those too. Same normcase discipline
+    ``vetoledger.normalize_intent`` already uses to keep a vetoed path from re-surfacing under a
+    trivial alias.
+    """
+    c = os.path.normcase(component)
+    if os.name == "nt":
+        c = c.rstrip(". ")
+    return c
+
+
 def is_controlled_location(workspace, rel: str, controlled: "tuple[str, ...]") -> bool:
     """True if ``rel`` resolves into a CONTROLLED subtree of the workspace.
 
@@ -117,6 +133,11 @@ def is_controlled_location(workspace, rel: str, controlled: "tuple[str, ...]") -
     ``.github`` tree (covering all of ``.github/**``), not a nested lookalike like
     ``src/.github`` (which GitHub never reads, so it is harmless scratch). Returns False on an
     empty/escaping path — the workspace fence already refuses those on its own.
+
+    Each component is normalized the way the filesystem will actually name it (``_fs_normcase``)
+    before matching, so an alias the OS silently collapses onto the controlled name — a CASE
+    variant (``.GitHub``) or a Windows trailing-dot/space (``.github.``, ``.github ``) — cannot
+    dodge the check while the write still lands in the real controlled directory.
     """
     if not controlled:
         return False
@@ -126,11 +147,11 @@ def is_controlled_location(workspace, rel: str, controlled: "tuple[str, ...]") -
         return False
     root = Path(workspace).resolve()
     try:
-        parts = target.relative_to(root).parts
+        parts = tuple(_fs_normcase(p) for p in target.relative_to(root).parts)
     except ValueError:
         return False
     for pref in controlled:
-        pref_parts = tuple(p for p in Path(str(pref)).parts if p not in ("", "."))
+        pref_parts = tuple(_fs_normcase(p) for p in Path(str(pref)).parts if p not in ("", "."))
         if pref_parts and parts[:len(pref_parts)] == pref_parts:
             return True
     return False

@@ -91,6 +91,11 @@ class Decision:
     # forensic reader can tell "the user asked for this" from "the agent suggested it and
     # the user approved" (panel F5/F6). Bus-level provenance tagging is a later add.
     origin: str = "direct"
+    # Single-use guard for a HELD decision (red-team: a pooled/held decision was re-runnable
+    # via approve()). Set True the moment approve() runs it OR a veto retires it, so no path —
+    # a second approve(), or approve() on a vetoed decision — can re-execute it or reuse its
+    # action_id. A DENIED re-gate does NOT consume it (it stays retryable once authority holds).
+    consumed: bool = False
 
     def summary(self) -> str:
         """The honest, human-facing line — derived from the real decision/result,

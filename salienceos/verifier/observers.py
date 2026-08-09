@@ -246,15 +246,24 @@ def observe_action(envelope, root, pre_snapshot, supervised_result, provenance: 
     kind, subjects = (None, [])
     if builder is not None:
         kind, subjects = builder(envelope.args)
-    # A directory that is an ANCESTOR of a declared subject path is entailed by that
-    # declaration (you cannot write `a/b/c.txt` without `a/` and `a/b/`), so it is not an
-    # undeclared mutation — exempt it from the write-set boundary. Bounded and safe: only the
-    # declared path's own parent chain is exempt (each subject separately re-hashed/stat'd), so
-    # nothing outside that chain can be hidden. Without this, an honest nested write false-fails
-    # the boundary because the auto-created parents show up as "extra" changed paths.
+    # A directory this action itself brings into being as an ANCESTOR of a declared subject path
+    # is entailed by that declaration (you cannot write `a/b/c.txt` without `a/` and `a/b/`), so
+    # it is not an undeclared mutation — exempt it from the write-set boundary. Without this an
+    # honest nested write false-fails the boundary because the auto-created parents show up as
+    # "extra" changed paths.
+    #
+    # The exemption is by TRANSITION, not by name: an ancestor is exempt ONLY when it was absent
+    # in `pre` and is a directory in `post` (genuinely created here). Exempting by name alone
+    # would blind the boundary to a destructive TYPE CHANGE of a pre-existing ancestor — a file
+    # or symlink replaced by a directory, or a directory removed — and for file.write / shell.run
+    # the ancestor paths have NO other observer, so such a change would wrongly verify. A path
+    # that is itself a declared subject is never exempt (it must still be diffed).
+    subject_set = set(subjects)
     exempt = set()
     for sp in subjects:
-        exempt.update(entailed_ancestors(sp))
+        for anc in entailed_ancestors(sp):
+            if anc not in subject_set and anc not in pre_snapshot and post.get(anc) == "dir":
+                exempt.add(anc)
     world = [
         exit_evidence(eid, supervised_result, provenance),
         write_set_evidence(eid, pre_snapshot, post, provenance, exempt=exempt),

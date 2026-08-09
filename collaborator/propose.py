@@ -20,7 +20,7 @@ import json
 import uuid
 from dataclasses import dataclass
 
-from collaborator.governance import HELD, NOTIFIED, Decision, govern_action
+from collaborator.governance import DENIED, HELD, NOTIFIED, Decision, govern_action
 from collaborator.loop import approve
 from collaborator.toolcall import ToolIntent
 from collaborator.tools import PROPOSE_FIRST
@@ -29,6 +29,11 @@ COLLABORATOR_PROPOSE_VERSION = "0.1.0"
 
 # proactivity level -> minimum model confidence to SURFACE; None = dormant (never).
 _PROACTIVITY_THRESHOLDS = {"off": None, "conservative": 0.80, "eager": 0.40}
+
+# Upper bound on a single proposal's write content (defence-in-depth against a flood of huge
+# pending proposals; the model's max_tokens already bounds this in practice). Oversized content
+# DROPS the proposal — never truncates, since a truncated write would silently corrupt the file.
+_MAX_PROPOSAL_CONTENT = 262144
 
 PROPOSED = "proposed"
 APPROVED = "approved"
@@ -99,10 +104,11 @@ class Proposal:
 
         d = self.decision
         tail = "approve to run" if d.status == HELD else "FYI only (nothing to run)"
-        # Flatten the model-authored rationale: it is prose (and, if the proposer was
-        # memory-injected, attacker-influenced), so it must not carry newlines/control chars
-        # that could forge UI structure in the human-facing surface.
-        return (f"[proposal {self.confidence:.2f} · {d.leash}] {d.tool}({d.args}) — "
+        # Flatten BOTH the model-authored rationale AND the args render: both are proposer-
+        # authored (and, if the proposer was memory-injected, attacker-influenced), so neither
+        # may carry newlines / control chars / fence markers that could forge UI structure in the
+        # human-facing surface.
+        return (f"[proposal {self.confidence:.2f} · {d.leash}] {d.tool}({_flatten(str(d.args))}) — "
                 f"{_flatten(self.rationale)}  ⟨{tail}⟩")
 
 
@@ -148,6 +154,9 @@ def _candidate_from_response(content: str):
         args = action.get("args")
     if not isinstance(name, str) or not name or not isinstance(args, dict):
         return None
+    content = args.get("content")
+    if isinstance(content, str) and len(content) > _MAX_PROPOSAL_CONTENT:
+        return None  # oversized content: DROP (never truncate — a truncated write corrupts the file)
     return _clamp01(obj.get("confidence")), str(obj.get("rationale") or "")[:200], \
         ToolIntent(name=name, args=args, source="proposed")
 
@@ -197,7 +206,7 @@ def propose(session, client, context: str, *, importance=None, leash: str = PROP
     if d.status not in (HELD, NOTIFIED):
         return []
     d.origin = "collaborator"  # provenance: the Collaborator raised this, not the user
-    prop = Proposal(proposal_id="prop-" + uuid.uuid4().hex[:12], decision=d,
+    prop = Proposal(proposal_id="prop-" + uuid.uuid4().hex[:16], decision=d,
                     rationale=rationale, confidence=confidence)
     # Enroll into the stage pool so a surfaced-but-undecided proposal is never lost — it
     # stays PENDING and findable until explicitly approved/vetoed (the pool holds it by
@@ -222,9 +231,15 @@ def approve_proposal(session, proposal: Proposal) -> Decision:
     is returned unchanged (its status is still HELD/NOTIFIED — clearly not RAN)."""
     if proposal.status != PROPOSED:
         return proposal.decision
-    proposal.status = APPROVED
     d = approve(session, proposal.decision)
     d.origin = "collaborator"  # the run record keeps the proposal's provenance
+    # Mark APPROVED only when the approval actually got PAST the re-gate. A DENIED approval
+    # (capability revoked between surfacing and now — TOCTOU) must leave the proposal PROPOSED
+    # and pending, so it stays visible and is re-approvable once authority is restored — rather
+    # than being flipped to APPROVED, dropped from the pending queue, and stuck forever (a
+    # red-team finding: the status was flipped BEFORE the re-gate ran).
+    if d.status != DENIED:
+        proposal.status = APPROVED
     return d
 
 
@@ -233,6 +248,13 @@ def veto_proposal(session, proposal: Proposal) -> Proposal:
     intent is recorded in the decaying veto inhibitor so a re-proposal of the SAME action
     must clear a higher (decaying) surfacing bar — learn from the "no", don't just drop it."""
     proposal.status = VETOED
+    # Retire the underlying decision too, not just the wrapper: mark it consumed so it can
+    # never be run through the bare approve() path (a red-team veto-bypass — the pool holds the
+    # decision by reference and approve(session, proposal.decision) guarded only on HELD).
+    try:
+        proposal.decision.consumed = True
+    except Exception:  # noqa: BLE001 — never let bookkeeping fail the veto itself
+        pass
     ledger = getattr(session, "veto_ledger", None)
     if ledger is not None:
         d = proposal.decision
