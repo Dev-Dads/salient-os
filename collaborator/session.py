@@ -45,6 +45,7 @@ class Session:
         research_budget: int = 4,
         controlled_paths=(".github",),
         proposal_pool=None,
+        egress_credentials=None,
     ) -> None:
         self.workspace = Path(workspace)
         self.capabilities = tuple(capabilities)
@@ -61,7 +62,16 @@ class Session:
         self.policy_key = policy_key
         self.executor_id = executor_id
         self.executor_key = executor_key
+        # Host per-tool leash overrides — validated like proactivity/research_trust, because an
+        # unrecognised leash string (a typo, "propose-first" for "propose_first") otherwise flows
+        # verbatim through the seam and fails OPEN (red-team F0). Fail LOUD at construction instead.
+        from collaborator.tools import ACT_THEN_REPORT, NOTIFY_ONLY, PROPOSE_FIRST
+        _valid_leashes = {ACT_THEN_REPORT, PROPOSE_FIRST, NOTIFY_ONLY}
         self.leash_overrides = dict(leash_overrides or {})
+        for _tool, _level in self.leash_overrides.items():
+            if _level not in _valid_leashes:
+                raise ValueError(f"leash_overrides[{_tool!r}] must be one of "
+                                 f"{tuple(sorted(_valid_leashes))}, got {_level!r}")
         self.allow_adaptation = bool(allow_adaptation)
         self.default_importance = float(default_importance)
         # How eagerly the propose channel (Step 1) surfaces unprompted proposals —
@@ -117,3 +127,10 @@ class Session:
         else:
             from collaborator.proposalpool import ProposalPool
             self.proposal_pool = ProposalPool()
+        # ADR 0003 Tier 2 — HOST-INJECTED egress credentials for outbound emission (net_post),
+        # keyed by CANONICAL host (e.g. {"openrouter.ai": "Bearer …"}), typically built from env.
+        # The seam looks one up for the consented host and sets it as the Authorization header
+        # itself; the model's args NEVER carry a credential and it is never logged. Authority
+        # (which hosts may be emitted-to) lives in the SIGNED caps — this map only supplies the
+        # secret for a host already authorized. Default empty = no credential injected.
+        self.egress_credentials = dict(egress_credentials or {})

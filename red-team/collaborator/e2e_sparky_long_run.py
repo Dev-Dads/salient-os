@@ -90,6 +90,26 @@ def _newstack_checks(label, checks):
         checks.append((f"[{label}] web_fetch NON-allowlisted host DEFAULT-DENIED",
                        d.status == DENIED and "does not grant" in d.reason))
 
+        # ADR 0003 Tier 2 — net_post EMISSION. The session grants net.get:<ALLOW_HOST> but NOT
+        # net.post:<ALLOW_HOST>, so an emission to the SAME host is DENIED: reading a host is not
+        # emitting to it (separate signed namespaces).
+        d = govern_action(s, ToolIntent("net_post", {"url": f"https://{ALLOW_HOST}/", "body": "{}"},
+                                        "structured"))
+        checks.append((f"[{label}] net_post to net.get-only host DENIED (net.get != net.post)",
+                       d.status == DENIED and "net.post:" in d.reason))
+
+        # With net.post GRANTED, an emission is HELD by default (a human hand on every send), and a
+        # PROPOSER-originated emission stays HELD even so — the model never auto-emits.
+        s_np = Session(workspace=tmp, capabilities=("net.post:" + ALLOW_HOST,))
+        d = govern_action(s_np, ToolIntent("net_post", {"url": f"https://{ALLOW_HOST}/", "body": "{}"},
+                                           "structured"))
+        checks.append((f"[{label}] net_post granted + user-directed HELD (human-gated default)",
+                       d.status == HELD and d.leash == "propose_first"))
+        d = govern_action(s_np, ToolIntent("net_post", {"url": f"https://{ALLOW_HOST}/", "body": "{}"},
+                                           "proposed"))
+        checks.append((f"[{label}] net_post proposer-originated HELD (never auto-emits)",
+                       d.status == HELD and d.leash == "propose_first"))
+
         d = govern_action(s, ToolIntent("write_file", {"path": "../escape.txt", "content": "x"},
                                         "structured"))
         checks.append((f"[{label}] workspace-escape write DENIED", d.status == DENIED))

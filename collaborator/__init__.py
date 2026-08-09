@@ -15,6 +15,7 @@ from collaborator.egress import (
     EgressResult,
     canonical_host,
     fetch,
+    post,
     required_capability,
 )
 from collaborator.governance import (
@@ -25,7 +26,6 @@ from collaborator.governance import (
     RAN,
     UNKNOWN_TOOL,
     Decision,
-    execute_and_verify,
     govern_action,
 )
 from collaborator.loop import TurnResult, approve, run_turn
@@ -75,7 +75,6 @@ __all__ = [
     "approve",
     "TurnResult",
     "govern_action",
-    "execute_and_verify",
     "Decision",
     "RAN",
     "FAILED",
@@ -113,6 +112,7 @@ __all__ = [
     "verify",
     "workspace_subject",
     "fetch",
+    "post",
     "canonical_host",
     "required_capability",
     "EgressRecord",

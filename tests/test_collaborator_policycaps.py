@@ -179,7 +179,14 @@ class ApplyCap(unittest.TestCase):
         self.assertEqual(apply_cap("act_then_report", "propose_first"), "propose_first")
         self.assertEqual(apply_cap("notify_only", "propose_first"), "notify_only")
         self.assertEqual(apply_cap("act_then_report", None), "act_then_report")
-        self.assertEqual(apply_cap("act_then_report", "bogus"), "bogus")  # unknown cap -> strictest
+
+    def test_unknown_fails_closed_never_returned_verbatim(self):
+        # red-team F0: an unrecognised value on EITHER side must resolve to NOTIFY_ONLY, never be
+        # returned as-is (the old code returned the unknown string, which then ran because it
+        # matched neither `== PROPOSE_FIRST` nor `== NOTIFY_ONLY` downstream).
+        self.assertEqual(apply_cap("act_then_report", "bogus"), "notify_only")
+        self.assertEqual(apply_cap("propose-first", "notify_only"), "notify_only")  # hyphen typo
+        self.assertEqual(apply_cap("bogus", None), "notify_only")
 
 
 if __name__ == "__main__":

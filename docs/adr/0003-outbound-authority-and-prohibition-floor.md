@@ -117,7 +117,35 @@ by how much of a human hand and how strong an out-of-band root they require.
 - A **proposer-originated** (`source=="proposed"`) `run_command` **or egress tool**
   is floored to `propose_first` (`governance.py`) — the unbounded-reach tool and any
   off-domain emission always need a hand, whatever the leash config.
-- **`net.post` / any side-effecting emission** defaults to `propose_first`.
+- **`net.post` / any side-effecting emission** defaults to `propose_first`. **SHIPPED
+  (revisit #2, `collaborator/egress.post` + the `net_post` tool):** a mediated POST reusing the
+  whole Tier-1 transport contract (canonical host == connect host, IP-pin + private/CGNAT/metadata
+  block, HTTPS, no-redirect-fail-closed — now also so the body **and** a credential can never be
+  re-sent to a redirect). Authority is a **separate namespace** `net.post:<host>` (a `net.get:<host>`
+  read grant does **not** confer emit). It is FLOORED to `propose_first` and lifts a host to
+  `act_then_report` ONLY when THREE positive, non-model-reachable conditions all hold: (1) the session
+  is under a **signed** grant (not mutable legacy caps); (2) that grant names the exact host
+  `net.post.auto:<host>`; and (3) the **host is directing this specific call** via the keyword
+  `leash=act_then_report` (caller authority — `run_turn` and the tool-call parser never set it).
+  **The red-team corrected a critical mistake here:** the first cut lifted on `source != "proposed"`,
+  but `source` is a *parse-channel* label (`"structured"`/`"content_block"`/…), not provenance — so
+  every model-emitted tool call looked "operator-directed", and a model steered by injected web
+  content could self-originate a credentialed autonomous emission. Gating on the keyword leash means a
+  **model-emitted emission is ALWAYS human-gated even to an auto host**; autonomy takes a deliberate
+  host-directed call. (Josh's steer — "loosen only the standard stuff I direct, like an OpenRouter
+  panel; the rest propose-first" — is honored by making 'I direct' an explicit host signal, not one
+  inferred from model output.) An explicit host tighten and a signed `leash_cap` still win.
+  Credentials are **host-injected** from host config (`session.egress_credentials`, keyed by canonical
+  host) — never from model args, never logged. The audit is **body-free for autonomous** emissions and
+  keeps a **bounded body preview for human-gated** ones. A held emission has **no verifier**, so its
+  consequential payload (dest + target + content-type + body) is **sealed at hold time** and
+  re-checked at approval — a payload mutated after the human saw it is refused (`approved == sent` is
+  bound, not observed). Both red-team passes ran (external 5-vendor panel + two internal adversarial,
+  reproduce-before-accept); findings converged on the sealed-payload gap (closed), a leash-dispatch
+  **fail-open on any unrecognised leash string** (closed — allowlist dispatch + validated leashes +
+  `apply_cap` never returns an unknown), the **`source`-as-provenance mistake above** (closed), a
+  content-type covert/unaudited channel (closed — ASCII-only + recorded), a lone-surrogate-body crash
+  (closed — refusal + backstop), and smaller audit/leash-hygiene items.
 - **Perception egress (`web_research`) is *surfaced + bounded*, not held by default.**
   The v0 build (code-panel decision) routes a research GET through the one governance
   gate as a **governed, audited `web_fetch` Decision** (surfaced on the bus), default-
@@ -284,9 +312,12 @@ re-derives and re-checks the allowlist; audit-only recognizer never denies.
    *further* hardening of an **independent** egress observer (a proxy outside the executor)
    — now optional rather than prerequisite, since with `run_command` isolated the
    same-channel log has no other channel to miss.
-2. **Side-effecting egress (`net.post`) is actually needed** — build the Tier-2
-   emission flow (the read/write split is drawn here; the write path is not built
-   until required).
+2. **Side-effecting egress (`net.post`) — DONE (`collaborator/egress.post` + `net_post`).**
+   The Tier-2 emission flow shipped: separate `net.post:<host>` authority, human-gated by default
+   with a signed per-host `net.post.auto:<host>` autonomy lift (operator-directed only), host-injected
+   credentials, a body-free-vs-preview audit split, and a hold-time payload seal (no verifier exists
+   for an emission, so approved==sent is bound). Remaining under this trigger: `net.put`/`net.delete`
+   and other verbs (only `net.post` was needed); a richer per-destination emission quota.
 3. **A legitimate authorized-offense workflow is actually requested** — design the
    Tier-3 target-scope artifact, honoring the trust-root invariant (rooted in a key
    the operator does not hold). Until then Tier 3 stays locked.

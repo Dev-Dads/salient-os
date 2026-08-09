@@ -48,7 +48,13 @@ from collaborator.tools import (
     is_controlled_location,
     resolve_in_workspace,
 )
-from collaborator.policycaps import apply_cap, granted_capabilities, leash_cap
+from collaborator.policycaps import (
+    apply_cap,
+    enforced,
+    granted_capabilities,
+    leash_cap,
+    signed_leash_cap,
+)
 from collaborator.toolcall import ToolIntent
 
 COLLABORATOR_GOVERNANCE_VERSION = "0.1.0"
@@ -64,7 +70,11 @@ UNKNOWN_TOOL = "unknown_tool"
 
 # Host-computed risk per tool (INFLUENCE only — drives verification depth, never
 # authority). Not model-selectable.
-_TOOL_RISK = {"read_file": 0.0, "write_file": 0.1, "run_command": 0.5, "web_fetch": 0.2}
+# net_post is the least-reversible tool (an emission cannot be recalled and cannot be verified),
+# so it scores the HIGHEST — never below run_command (red-team minor: an unlisted net_post defaulted
+# to 0.3, i.e. less risky than run_command, understating the scrutiny/verification-depth it drives).
+_TOOL_RISK = {"read_file": 0.0, "write_file": 0.1, "web_fetch": 0.2, "run_command": 0.5,
+              "net_post": 0.6}
 
 
 @dataclass
@@ -105,6 +115,11 @@ class Decision:
     # ADR 0003 revisit #1: whether a run_command ran network-isolated (netns). None for tools
     # that are not network-isolable; True/False honestly reflects whether isolation applied.
     network_isolated: "bool | None" = None
+    # ADR 0003 Tier 2 (panel: approved != sent): a seal over a HELD EMISSION's consequential
+    # payload (canonical dest + request target + content-type + body), captured at hold time. An
+    # emission has no verifier, so approval re-checks this seal and REFUSES if the held args were
+    # mutated after the human saw them (a shared-by-reference dict). Empty for non-emissions.
+    seal: str = ""
 
     def summary(self) -> str:
         """The honest, human-facing line — derived from the real decision/result,
@@ -121,7 +136,11 @@ class Decision:
             tail += "  🔒 net-isolated" if self.network_isolated else "  ⚠ net NOT isolated (raw reach)"
         if self.status == RAN:
             out = (self.result.output if self.result else "") or "(no output)"
-            return f"[{self.tool} ✓ ran, verified] {out}{tail}"
+            # An egress action is channel-LOGGED, not world-verified (the mediated client both makes
+            # AND records the request; ADR 0003 — no independent observer). Don't claim verification
+            # it doesn't have; this line is fed back into the model's history (red-team minor).
+            claim = "ran, channel-logged (NOT world-verified)" if self.egress is not None else "ran, verified"
+            return f"[{self.tool} ✓ {claim}] {out}{tail}"
         if self.status == FAILED:
             err = (self.result.error if self.result else "") or "did not clear verification"
             return f"[{self.tool} ✗ FAILED — not verified] {err}{tail}"
@@ -139,7 +158,10 @@ _VALID_LEASHES = (ACT_THEN_REPORT, PROPOSE_FIRST, NOTIFY_ONLY)
 
 def _leash_for(session, tool: Tool) -> str:
     overrides = getattr(session, "leash_overrides", None) or {}
-    return overrides.get(tool.name, tool.default_leash)
+    leash = overrides.get(tool.name, tool.default_leash)
+    # Fail CLOSED on an unrecognised override (Session validates at construction, but a runtime
+    # mutation or an odd construction path must never leak an unknown string that runs — red-team F0).
+    return leash if leash in _VALID_LEASHES else PROPOSE_FIRST
 
 
 def _resolve_leash(session, tool: Tool, override: "str | None") -> str:
@@ -193,6 +215,12 @@ def govern_action(session, intent: ToolIntent, importance: "float | None" = None
                         reason=f"no such tool: {intent.name}", leash="", args=intent.args)
 
     action_id = "act-" + uuid.uuid4().hex[:16]
+    # The KEYWORD ``leash`` arg is CALLER authority (a host/UI directing this specific call) and is
+    # never threaded from model output (panel F4). Capture whether the host is explicitly directing
+    # THIS call to run autonomously BEFORE it is resolved/capped — it is the only positive
+    # "the operator asked for this emission" signal the emission auto-lift will accept (red-team F1:
+    # intent.source is a parse-channel label, NOT provenance, so it cannot stand in for it).
+    host_directed_atr = (leash == ACT_THEN_REPORT)
     leash = _resolve_leash(session, tool, leash)
     # ③ a signed grant caps how loose the leash may get: the host/view can tighten but
     # never loosen past the cap (fail-closed if the grant is present but invalid).
@@ -244,7 +272,10 @@ def govern_action(session, intent: ToolIntent, importance: "float | None" = None
     # egress.fetch, so authorize-one/connect-another cannot diverge. An ineligible URL (not
     # https, userinfo, non-443 port, bad host) yields no capability -> DENY (fail closed).
     if getattr(tool, "egress", False):
-        required_cap = egress.required_capability(str(intent.args.get("url") or ""))
+        # Method-aware (ADR 0003): net.get:<host> for a read, net.post:<host> for an emission —
+        # separate namespaces, so a read grant never confers emit authority to the same host.
+        required_cap = egress.required_capability(
+            str(intent.args.get("url") or ""), getattr(tool, "egress_method", "GET"))
         if required_cap is None:
             return Decision(action_id=action_id, tool=tool.name, status=DENIED,
                             reason="ineligible egress URL (need https://, a plain host, no "
@@ -282,21 +313,59 @@ def govern_action(session, intent: ToolIntent, importance: "float | None" = None
                                 "placement here requires explicit approval"),
                         leash=leash, directive=directive, args=intent.args)
 
-    # --- LEASH (second axis) --------------------------------------------------
+    # --- EMISSION FLOOR / auto-lift (ADR 0003 Tier 2) ------------------------
+    # A side-effecting egress (net_post) is "acting on the world" — the less-reversible,
+    # un-verifiable channel — so it is HUMAN-GATED by default. It may run autonomously
+    # (act_then_report) ONLY when ALL of these positive, non-model-reachable conditions hold:
+    #   1. a SIGNED grant governs the session (enforced) — never mutable legacy caps (F5);
+    #   2. that grant names THIS exact host for autonomous emission (net.post.auto:<host>);
+    #   3. the HOST is directing THIS specific call autonomously (keyword leash=act_then_report),
+    #      AND the intent is not proposer-originated.
+    # Condition 3 is the fix for red-team F1: the model can NEVER self-originate an autonomous
+    # emission, because run_turn/the parser never set the keyword leash — every model tool-call
+    # (source "structured"/"content_block"/…) is therefore gated even to an auto host. Absent any
+    # condition -> FLOOR to propose_first; an explicit host tighten (e.g. notify_only) survives,
+    # since host_directed_atr is then false (F2). An EXPLICIT signed net_post leash_cap still
+    # tightens an auto host; an unlisted one lets the per-host auto grant permit act_then_report.
+    if getattr(tool, "egress", False) and tool.mutating:
+        emit_host = egress.canonical_host(str(intent.args.get("url") or ""))
+        auto = (emit_host is not None and host_directed_atr and enforced(session)
+                and getattr(intent, "source", "") != "proposed"
+                and directive.grants_capability(egress.EGRESS_AUTO_PREFIX + emit_host))
+        leash = (apply_cap(ACT_THEN_REPORT, signed_leash_cap(session, tool.name)) if auto
+                 else apply_cap(leash, PROPOSE_FIRST))
+
+    # --- LEASH (second axis) — ALLOWLIST dispatch (red-team F0) ---------------
+    # Run ONLY on the explicit act_then_report; notify_only notifies; EVERYTHING ELSE (propose_first
+    # and any unrecognised string) fails CLOSED to HELD. The old denylist ran on the `else` branch,
+    # so a typo'd leash slipped through and ran autonomously.
     offense_flag = flag_offense_shape(intent.name, intent.args)  # audit-only tag, never a deny
+    if leash == ACT_THEN_REPORT:
+        return execute_and_verify(session, tool, directive, action_id, intent.args,
+                                  leash=leash, human_gated=False)
     if leash == NOTIFY_ONLY:
         return Decision(action_id=action_id, tool=tool.name, status=NOTIFIED,
                         reason="notify-only leash", leash=leash, directive=directive,
                         args=intent.args, offense_flag=offense_flag)
-    if leash == PROPOSE_FIRST:
-        return Decision(action_id=action_id, tool=tool.name, status=HELD,
-                        reason="propose-first leash: awaiting approval", leash=leash,
-                        directive=directive, args=intent.args, offense_flag=offense_flag,
-                        preview={"tool": tool.name, "args": intent.args,
-                                 "verification_depth": directive.verification_depth})
-
-    # leash == ACT_THEN_REPORT -> run it
-    return execute_and_verify(session, tool, directive, action_id, intent.args)
+    # PROPOSE_FIRST or any unrecognised leash -> HELD (awaiting a human hand).
+    # Seal a HELD EMISSION's consequential payload now, while it is exactly what the human is about
+    # to be shown — approval re-checks it so a later mutation of the (by-reference) args cannot
+    # change the destination/body that actually gets sent (Tier 2 has no verifier).
+    seal = (egress.emission_seal(str(intent.args.get("url") or ""), intent.args.get("body"),
+                                 str(intent.args.get("content_type") or ""))
+            if (getattr(tool, "egress", False) and tool.mutating) else "")
+    # Surface the CANONICAL destination for an egress action, so the one human hand on an emission
+    # reads the host bytes actually leave for — not the raw model string, which canonicalization may
+    # quietly rewrite (soft hyphen, ideographic dot; transport red-team M6).
+    preview = {"tool": tool.name, "args": intent.args,
+               "verification_depth": directive.verification_depth}
+    if getattr(tool, "egress", False):
+        preview["canonical_dest"] = egress.canonical_host(str(intent.args.get("url") or ""))
+    reason = ("propose-first leash: awaiting approval" if leash == PROPOSE_FIRST
+              else f"unrecognised leash {leash!r} -> held (fail-closed)")
+    return Decision(action_id=action_id, tool=tool.name, status=HELD, reason=reason, leash=leash,
+                    directive=directive, args=intent.args, offense_flag=offense_flag,
+                    seal=seal, preview=preview)
 
 
 def reauthorized_or_denied(session, tool: Tool, action_id: str, args: dict, leash: str,
@@ -334,7 +403,8 @@ def reauthorized_or_denied(session, tool: Tool, action_id: str, args: dict, leas
     # the signed allowlist between stage and approval is denied at the moment of use (the
     # panel's emission-TOCTOU), and a destination made ineligible fails closed.
     if getattr(tool, "egress", False):
-        required_cap = egress.required_capability(str(args.get("url") or ""))
+        required_cap = egress.required_capability(
+            str(args.get("url") or ""), getattr(tool, "egress_method", "GET"))
         if required_cap is None:
             return Decision(action_id, tool.name, DENIED,
                             "ineligible egress URL at approval time", leash,
@@ -351,17 +421,37 @@ def reauthorized_or_denied(session, tool: Tool, action_id: str, args: dict, leas
         except WorkspaceError as exc:
             return Decision(action_id, tool.name, DENIED, str(exc), leash,
                             directive=directive, args=args)
+    # A signed leash cap tightened to NOTIFY_ONLY between hold and approve means the operator now
+    # says "never run this" — refuse rather than execute a held action the CURRENT policy forbids
+    # (red-team F3: the re-gate checked capability + workspace but never the leash).
+    if apply_cap(leash, leash_cap(session, tool.name)) == NOTIFY_ONLY:
+        return Decision(action_id, tool.name, DENIED,
+                        "leash tightened to notify_only since hold — refusing to run", leash,
+                        directive=directive, args=args)
     return None
 
 
-def execute_and_verify(session, tool: Tool, directive, action_id: str, args: dict) -> Decision:
+def execute_and_verify(session, tool: Tool, directive, action_id: str, args: dict,
+                       leash: "str | None" = None, human_gated: bool = False) -> Decision:
     """Run a permitted, unleashed action and (for mutating tools) verify the claim
     against the observed world. Used both for act_then_report and for an approved
-    propose_first action."""
-    # The signed leash cap applies here too (the terminal enforcement point), so the
-    # recorded leash is the EFFECTIVE (capped) one and no future caller can reach this
-    # path with an un-capped leash (panel: leash cap must hold at the moment of use).
-    leash = apply_cap(_leash_for(session, tool), leash_cap(session, tool.name))
+    propose_first action. INTERNAL: assumes the capability gate already passed (call
+    ``govern_action``/``approve``, not this directly).
+
+    ``leash`` is the EFFECTIVE leash the caller resolved. ``human_gated`` is True only on the
+    approve() path — it, not the leash string, decides the emission audit split (a HAND-approved
+    emission keeps a bounded body preview; an autonomous one is body-free), so a signed cap that
+    tightens the recorded leash can't silently drop the preview (red-team F3)."""
+    # The signed leash cap applies here too (the terminal enforcement point), so the recorded
+    # leash is the EFFECTIVE (capped) one and no future caller can reach this path with an
+    # un-capped leash (panel: leash cap must hold at the moment of use).
+    leash = apply_cap(leash if leash is not None else _leash_for(session, tool),
+                      leash_cap(session, tool.name))
+    # If the effective leash is NOTIFY_ONLY the operator said "never run this" — do NOT execute,
+    # whatever path reached here (red-team F3: execute_and_verify used to run regardless of leash).
+    if leash == NOTIFY_ONLY:
+        return Decision(action_id, tool.name, NOTIFIED,
+                        "notify-only leash — not executed", leash, directive=directive, args=args)
     # Read-only: gate already passed; execute and report (nothing is mutated).
     if tool.verify_mode == "none":
         try:
@@ -379,11 +469,34 @@ def execute_and_verify(session, tool: Tool, directive, action_id: str, args: dic
     # world-observation (the client both makes and records the request; same channel). The
     # egress record is carried on the Decision for audit.
     if tool.verify_mode == "egress_log":
-        execution = execute_tool(tool, session.workspace, args)
+        # ADR 0003 Tier 2: for a side-effecting emission (net_post) thread the HOST-INJECTED
+        # credential — looked up from host config by the consented canonical host that already
+        # passed the net.post gate, never sourced from model args, never logged — and record a
+        # bounded body preview ONLY when human-gated (leash == propose_first); an autonomous
+        # emission is body-free (Josh's steer). A GET (web_fetch) has no body and no credential.
+        egress_auth = None
+        egress_preview = False
+        if getattr(tool, "egress", False) and tool.mutating:
+            emit_host = egress.canonical_host(str(args.get("url") or ""))
+            creds = getattr(session, "egress_credentials", None) or {}
+            egress_auth = creds.get(emit_host) if emit_host is not None else None
+            # A HAND-approved emission keeps a bounded preview; an autonomous one is body-free. Keyed
+            # on the FACT of human approval, not the leash string, so a cap can't drop it (F3).
+            egress_preview = human_gated
+        try:
+            execution = execute_tool(tool, session.workspace, args,
+                                     egress_preview=egress_preview, egress_auth=egress_auth)
+        except Exception as exc:  # noqa: BLE001 — egress must degrade to FAILED, never raise out of
+            # govern_action/approve (transport red-team S1 backstop: the mediated client's own input
+            # guards are belt; this is suspenders around the whole egress execute, like the artifact branch).
+            return Decision(action_id, tool.name, FAILED, f"egress error: {type(exc).__name__}", leash,
+                            cleared=False, directive=directive, args=args)
         rec = execution.egress
+        if rec is None:  # an egress executor must always attach a record; missing -> FAILED, never a raise
+            return Decision(action_id, tool.name, FAILED, "egress produced no record", leash,
+                            cleared=False, result=execution.result, directive=directive, args=args)
         ok = bool(execution.result.ok)
-        reason = (f"egress {rec.canonical_dest} [{rec.status}]" if ok
-                  else (rec.error if rec is not None else "egress failed"))
+        reason = f"egress {rec.canonical_dest} [{rec.status}]" if ok else rec.error
         return Decision(action_id, tool.name, RAN if ok else FAILED, reason, leash,
                         cleared=ok, result=execution.result, directive=directive, args=args,
                         egress=rec)

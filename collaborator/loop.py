@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from collaborator import egress
 from collaborator.governance import (
     DENIED,
     HELD,
@@ -116,6 +117,19 @@ def approve(session, decision: Decision) -> Decision:
     tool = get_tool(decision.tool)
     if tool is None:
         return decision
+    # ADR 0003 Tier 2 (panel: approved != sent): an EMISSION has no verifier, so bind approval to
+    # the EXACT payload the human saw. If the held args were mutated after the hold (a shared-by-
+    # reference dict — a pooled/UI-held decision), the seal captured at hold no longer matches;
+    # refuse rather than send an un-approved destination/body. Not consumed -> a restored payload
+    # could still be re-approved. (A full in-process rewriter is the ADR 0002 single-trust-domain
+    # limit, not this control's target — this closes the by-reference-mutation vector.)
+    if getattr(tool, "egress", False) and tool.mutating and decision.seal:
+        if egress.emission_seal(str(decision.args.get("url") or ""), decision.args.get("body"),
+                                str(decision.args.get("content_type") or "")) != decision.seal:
+            return Decision(decision.action_id, decision.tool, DENIED,
+                            "emission payload changed since approval (seal mismatch)",
+                            decision.leash, directive=decision.directive, args=decision.args,
+                            origin=decision.origin)
     denied = reauthorized_or_denied(session, tool, decision.action_id, decision.args,
                                     decision.leash, decision.directive)
     if denied is not None:
@@ -133,4 +147,7 @@ def approve(session, decision: Decision) -> Decision:
                         decision.leash, directive=decision.directive, args=decision.args,
                         origin=decision.origin)
     decision.consumed = True     # claim it before running, so no concurrent/second path re-runs
-    return execute_and_verify(session, tool, decision.directive, decision.action_id, decision.args)
+    # human_gated=True: this IS the human-approval path, so the emission keeps a bounded body preview
+    # regardless of how a signed cap rewrote the recorded leash (ADR 0003 Tier 2; red-team F3).
+    return execute_and_verify(session, tool, decision.directive, decision.action_id,
+                              decision.args, leash=decision.leash, human_gated=True)
