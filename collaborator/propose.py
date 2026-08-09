@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from collaborator.governance import DENIED, HELD, NOTIFIED, Decision, govern_action
 from collaborator.loop import approve
 from collaborator.toolcall import ToolIntent
-from collaborator.tools import PROPOSE_FIRST
+from collaborator.tools import PROPOSE_FIRST, get_tool
 
 COLLABORATOR_PROPOSE_VERSION = "0.1.0"
 
@@ -153,6 +153,15 @@ def _candidate_from_response(content: str):
     if args is None:
         args = action.get("args")
     if not isinstance(name, str) or not name or not isinstance(args, dict):
+        return None
+    # STRUCTURAL bar (red-team F-7): the proposer may NOT author an outbound EMISSION. net_post
+    # (egress + mutating) is operator-directed ONLY — via emit() — so the model can neither
+    # self-originate an autonomous emission (F1) NOR surface one as a one-click proposal that would
+    # send model-authored bytes + the operator's injected credential to the granted host. Emissions
+    # never come from the model's initiative. (A read-only egress GET or a local command may still be
+    # proposed, always human-gated.)
+    _tool = get_tool(name)
+    if _tool is not None and getattr(_tool, "egress", False) and _tool.mutating:
         return None
     content = args.get("content")
     if isinstance(content, str) and len(content) > _MAX_PROPOSAL_CONTENT:

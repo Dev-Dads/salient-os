@@ -53,7 +53,7 @@ from collaborator.policycaps import (
     enforced,
     granted_capabilities,
     leash_cap,
-    signed_leash_cap,
+    workspace_subject,
 )
 from collaborator.toolcall import ToolIntent
 
@@ -103,6 +103,12 @@ class Decision:
     # forensic reader can tell "the user asked for this" from "the agent suggested it and
     # the user approved" (panel F5/F6). Bus-level provenance tagging is a later add.
     origin: str = "direct"
+    # The workspace SUBJECT of the session that HELD this decision (red-team #5). A held emission
+    # carries an injected credential at approve time; approving it under a DIFFERENT session would
+    # silently send that session's credential + this payload. approve() refuses a cross-subject
+    # approval when this is set, binding a held decision to the session that created it. Empty for a
+    # decision built outside govern_action (then no cross-subject check applies).
+    origin_subject: str = ""
     # Single-use guard for a HELD decision (red-team: a pooled/held decision was re-runnable
     # via approve()). Set True the moment approve() runs it OR a veto retires it, so no path —
     # a second approve(), or approve() on a vetoed decision — can re-execute it or reuse its
@@ -154,6 +160,15 @@ class Decision:
 
 
 _VALID_LEASHES = (ACT_THEN_REPORT, PROPOSE_FIRST, NOTIFY_ONLY)
+
+
+def _subject(session) -> str:
+    """The workspace subject binding a held decision to its session (red-team #5). Empty if it
+    can't be resolved — then no cross-subject approval check applies (fail-safe, never raises)."""
+    try:
+        return workspace_subject(getattr(session, "workspace", ""))
+    except Exception:  # noqa: BLE001 — can't establish subject -> no binding
+        return ""
 
 
 def _leash_for(session, tool: Tool) -> str:
@@ -319,21 +334,34 @@ def govern_action(session, intent: ToolIntent, importance: "float | None" = None
     # (act_then_report) ONLY when ALL of these positive, non-model-reachable conditions hold:
     #   1. a SIGNED grant governs the session (enforced) — never mutable legacy caps (F5);
     #   2. that grant names THIS exact host for autonomous emission (net.post.auto:<host>);
-    #   3. the HOST is directing THIS specific call autonomously (keyword leash=act_then_report),
-    #      AND the intent is not proposer-originated.
-    # Condition 3 is the fix for red-team F1: the model can NEVER self-originate an autonomous
-    # emission, because run_turn/the parser never set the keyword leash — every model tool-call
-    # (source "structured"/"content_block"/…) is therefore gated even to an auto host. Absent any
-    # condition -> FLOOR to propose_first; an explicit host tighten (e.g. notify_only) survives,
-    # since host_directed_atr is then false (F2). An EXPLICIT signed net_post leash_cap still
-    # tightens an auto host; an unlisted one lets the per-host auto grant permit act_then_report.
+    #   3. the emit() ENTRY POINT is directing THIS specific call — BOTH the keyword
+    #      leash=act_then_report AND source=="host" (emit() sets both; run_turn/the parser set
+    #      NEITHER, and the parser can only ever stamp structured/content_block/content_json). These
+    #      are TWO independent, non-model-reachable barriers (red-team F-5 defence-in-depth): even in
+    #      a power-user config where a signed leash-cap satisfies cond-4, a model tool-call is still
+    #      gated on both. F1: the model can NEVER self-originate an autonomous emission;
+    #   4. the per-tool net_post leash-cap ALREADY permits act_then_report — i.e. `leash` is STILL
+    #      ACT_THEN_REPORT after the signed-leash-cap application above. This is the "require BOTH
+    #      signed signals" rule (Josh's steer): the per-host auto grant AND an explicit
+    #      net_post act_then_report leash-cap must AGREE. It also keeps this gate consistent with
+    #      the terminal re-cap in execute_and_verify (which re-applies the same leash_cap): the
+    #      two must never disagree on an unlisted tool, or an auto-lift here would silently become
+    #      a notify-only no-op there (red-team MINOR-A). An unlisted net_post is already capped to
+    #      notify_only here (leash_cap defaults unlisted→strictest under enforcement), so it can
+    #      never be lifted; an explicit net_post: propose_first (or tighter) also blocks autonomy.
+    # Absent any condition -> FLOOR to propose_first (never below the leash already computed); an
+    # explicit host tighten (e.g. notify_only) survives, since it is stricter than the floor (F2).
+    emit_host = None
+    auto_host = False   # net.post.auto:<host> is granted for THIS emission's destination
     if getattr(tool, "egress", False) and tool.mutating:
         emit_host = egress.canonical_host(str(intent.args.get("url") or ""))
-        auto = (emit_host is not None and host_directed_atr and enforced(session)
-                and getattr(intent, "source", "") != "proposed"
-                and directive.grants_capability(egress.EGRESS_AUTO_PREFIX + emit_host))
-        leash = (apply_cap(ACT_THEN_REPORT, signed_leash_cap(session, tool.name)) if auto
-                 else apply_cap(leash, PROPOSE_FIRST))
+        auto_host = (emit_host is not None
+                     and directive.grants_capability(egress.EGRESS_AUTO_PREFIX + emit_host))
+        auto = (auto_host and host_directed_atr and enforced(session)
+                and getattr(intent, "source", "") == "host"
+                and leash == ACT_THEN_REPORT)
+        if not auto:
+            leash = apply_cap(leash, PROPOSE_FIRST)
 
     # --- LEASH (second axis) — ALLOWLIST dispatch (red-team F0) ---------------
     # Run ONLY on the explicit act_then_report; notify_only notifies; EVERYTHING ELSE (propose_first
@@ -344,8 +372,20 @@ def govern_action(session, intent: ToolIntent, importance: "float | None" = None
         return execute_and_verify(session, tool, directive, action_id, intent.args,
                                   leash=leash, human_gated=False)
     if leash == NOTIFY_ONLY:
+        # Loud MINOR-A hint — but nudge the OPERATOR to add the missing signal ONLY when the OPERATOR
+        # is directing THIS emission (host_directed_atr) under an ENFORCED session with the auto grant.
+        # NOT on a model-originated intent (red-team F-3: model output must never prompt the operator
+        # to loosen a leash-cap for a model-chosen host — an in-band outbound-influence path), NOT on
+        # an unsigned session where autonomy is structurally unreachable (F-2b regression), and worded
+        # to be TRUE whether net_post is unlisted OR explicitly capped stricter — "not capped at
+        # act_then_report", never the false "has no leash-cap" (F-2a: leash_cap can't tell the two
+        # apart, and an explicit notify_only is a deliberate deny, not an omission).
+        reason = "notify-only leash"
+        if host_directed_atr and enforced(session) and auto_host:
+            reason = (f"notify-only: net.post.auto:{emit_host} is granted but net_post is not capped "
+                      "at act_then_report — autonomous emission requires BOTH signals")
         return Decision(action_id=action_id, tool=tool.name, status=NOTIFIED,
-                        reason="notify-only leash", leash=leash, directive=directive,
+                        reason=reason, leash=leash, directive=directive,
                         args=intent.args, offense_flag=offense_flag)
     # PROPOSE_FIRST or any unrecognised leash -> HELD (awaiting a human hand).
     # Seal a HELD EMISSION's consequential payload now, while it is exactly what the human is about
@@ -365,7 +405,7 @@ def govern_action(session, intent: ToolIntent, importance: "float | None" = None
               else f"unrecognised leash {leash!r} -> held (fail-closed)")
     return Decision(action_id=action_id, tool=tool.name, status=HELD, reason=reason, leash=leash,
                     directive=directive, args=intent.args, offense_flag=offense_flag,
-                    seal=seal, preview=preview)
+                    seal=seal, preview=preview, origin_subject=_subject(session))
 
 
 def reauthorized_or_denied(session, tool: Tool, action_id: str, args: dict, leash: str,

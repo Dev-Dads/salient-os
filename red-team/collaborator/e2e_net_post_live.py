@@ -18,8 +18,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from collaborator import egress, netns  # noqa: E402
 from collaborator.egress import EgressRecord, EgressResult  # noqa: E402
-from collaborator.governance import DENIED, FAILED, HELD, RAN, govern_action  # noqa: E402
-from collaborator.loop import approve  # noqa: E402
+from collaborator.governance import DENIED, FAILED, HELD, NOTIFIED, RAN, govern_action  # noqa: E402
+from collaborator.loop import approve, emit  # noqa: E402
 from collaborator.policycaps import mint, workspace_subject  # noqa: E402
 from collaborator.session import Session  # noqa: E402
 from collaborator.toolcall import ToolIntent  # noqa: E402
@@ -93,9 +93,31 @@ def main():
                          egress_credentials={ALLOW: "Bearer sk-test"})
         with mock.patch.object(egress, "post", _fake_post):
             d_model = govern_action(s_auto, _np(f"https://{ALLOW}/", "{}"))            # no keyword leash
-            d_host = govern_action(s_auto, _np(f"https://{ALLOW}/", "{}"), leash=ATR)  # host-directed
+            # host-directed = the emit() signature: BOTH source="host" AND keyword leash=ATR (F-5).
+            d_host = govern_action(s_auto, ToolIntent("net_post", {"url": f"https://{ALLOW}/",
+                                                                   "body": "{}"}, "host"), leash=ATR)
         checks.append(("model-emitted net_post to auto host stays HELD (F1)", d_model.status == HELD))
         checks.append(("host-directed + signed auto grant RUNS autonomously", d_host.status == RAN))
+
+        # --- PR A: the HOST ENTRY POINT that actually USES autonomous emission ---
+        # emit() is the operator API (sibling of approve, unreachable from run_turn). It requires
+        # BOTH signed signals for autonomy; the model can never reach it (F1).
+        with mock.patch.object(egress, "post", _fake_post):
+            d_emit = emit(s_auto, f"https://{ALLOW}/", "{}", autonomous=True)   # full grant
+            checks.append(("emit(autonomous=True) with full grant RUNS (host entry point)",
+                           d_emit.status == RAN and d_emit.leash == ATR))
+            d_hold = emit(s_auto, f"https://{ALLOW}/", "{}")                    # autonomous defaults False
+            checks.append(("emit(autonomous=False) HELD then approvable by a hand",
+                           d_hold.status == HELD
+                           and approve(s_auto, d_hold).status == RAN))
+            # require-both: auto cap but NO net_post leash-cap -> never emits, loud reason.
+            sp = mint((f"net.post:{ALLOW}", f"net.post.auto:{ALLOW}"), {}, "op",
+                      workspace_subject(tmp), KEY)
+            s_partial = Session(workspace=tmp, policy_caps=sp, caps_key=KEY,
+                                egress_credentials={ALLOW: "Bearer sk-test"})
+            d_partial = emit(s_partial, f"https://{ALLOW}/", "{}", autonomous=True)
+            checks.append(("emit with auto cap but NO leash-cap does NOT emit (require both, loud)",
+                           d_partial.status == NOTIFIED and "requires BOTH" in d_partial.reason))
 
         # --- fail-open leash hygiene (F0): a typo'd leash never runs ---
         s_typo = Session(workspace=tmp, capabilities=(f"net.post:{ALLOW}",))

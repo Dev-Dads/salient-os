@@ -28,7 +28,7 @@ from collaborator.governance import (
     Decision,
     govern_action,
 )
-from collaborator.loop import TurnResult, approve, run_turn
+from collaborator.loop import TurnResult, approve, emit, run_turn
 from collaborator.model_client import OllamaClient, ScriptedClient
 from collaborator.propose import (
     Proposal,
@@ -73,6 +73,7 @@ __all__ = [
     "DEFAULT_CAPABILITIES",
     "run_turn",
     "approve",
+    "emit",
     "TurnResult",
     "govern_action",
     "Decision",
