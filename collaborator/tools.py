@@ -103,6 +103,39 @@ def resolve_in_workspace(workspace, rel: str) -> Path:
     return target
 
 
+def is_controlled_location(workspace, rel: str, controlled: "tuple[str, ...]") -> bool:
+    """True if ``rel`` resolves into a CONTROLLED subtree of the workspace.
+
+    Controlled locations (default ``.github`` — CI workflows, hooks, actions) *configure* or
+    *execute* the project and carry repo-level authority (arbitrary code + secret access in
+    CI), so they are a class apart from ordinary scratch files. Under hard-deny-and-stage a
+    self-originated proposer write must never land here: the proposer stages the artifact to
+    reachable scratch and the PLACEMENT is a separate action a human approves and the
+    Collaborator executes — producing the file is the proposer's, placing it here is not.
+
+    Matched by ROOT-ANCHORED path prefix: ``.github`` means the workspace's top-level
+    ``.github`` tree (covering all of ``.github/**``), not a nested lookalike like
+    ``src/.github`` (which GitHub never reads, so it is harmless scratch). Returns False on an
+    empty/escaping path — the workspace fence already refuses those on its own.
+    """
+    if not controlled:
+        return False
+    try:
+        target = resolve_in_workspace(workspace, rel)
+    except WorkspaceError:
+        return False
+    root = Path(workspace).resolve()
+    try:
+        parts = target.relative_to(root).parts
+    except ValueError:
+        return False
+    for pref in controlled:
+        pref_parts = tuple(p for p in Path(str(pref)).parts if p not in ("", "."))
+        if pref_parts and parts[:len(pref_parts)] == pref_parts:
+            return True
+    return False
+
+
 # --- executors ---------------------------------------------------------------
 
 def _exec_write(workspace, args: dict) -> Execution:

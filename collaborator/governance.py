@@ -43,6 +43,7 @@ from collaborator.tools import (
     WorkspaceError,
     execute_tool,
     get_tool,
+    is_controlled_location,
     resolve_in_workspace,
 )
 from collaborator.policycaps import apply_cap, granted_capabilities, leash_cap
@@ -222,6 +223,21 @@ def govern_action(session, intent: ToolIntent, importance: "float | None" = None
         except WorkspaceError as exc:
             return Decision(action_id=action_id, tool=tool.name, status=DENIED,
                             reason=str(exc), leash=leash, directive=directive, args=intent.args)
+
+    # --- controlled-location hard-deny for PROPOSER-originated writes ---------
+    # Hard-deny-and-stage: the PROPOSER may not self-originate a write into a controlled
+    # location (CI/hooks — repo-level authority). Such a proposal is refused so the proposer
+    # stages the artifact to reachable scratch instead; the PLACEMENT into the controlled
+    # location is a separate action a human approves and the Collaborator executes. Keyed on
+    # the proposer origin (intent.source == "proposed", which propose.py hardcodes — the model
+    # cannot forge it), so a user-directed or approved placement is deliberately unaffected.
+    if (intent.name == "write_file" and getattr(intent, "source", "") == "proposed"
+            and is_controlled_location(session.workspace, str(intent.args.get("path") or ""),
+                                       tuple(getattr(session, "controlled_paths", ()) or ()))):
+        return Decision(action_id=action_id, tool=tool.name, status=DENIED,
+                        reason=("controlled location: the proposer must stage to scratch; "
+                                "placement here requires explicit approval"),
+                        leash=leash, directive=directive, args=intent.args)
 
     # --- LEASH (second axis) --------------------------------------------------
     if leash == NOTIFY_ONLY:

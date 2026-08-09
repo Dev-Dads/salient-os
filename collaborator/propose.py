@@ -51,6 +51,13 @@ The tools and their EXACT arguments (use these keys precisely):
   read_file   {"path": "<relative path in the workspace>"}
   run_command {"command": ["<program>", "<arg>", ...]}
 
+CONTROLLED LOCATIONS — you may NOT write directly into paths that CONFIGURE or EXECUTE the
+project (anything under `.github/` — CI workflows, hooks, actions). A proposal to write there
+is refused. When you want to produce such an artifact, WRITE IT TO A REACHABLE SCRATCH PATH
+instead (e.g. `staged/<name>`) with the full intended contents, and say in your rationale
+where it is meant to go. Producing the file is yours; PLACING it into a controlled location
+is a separate step a human approves and the Collaborator then performs.
+
 WHAT IS WORTH PROPOSING — keep an open mind ("surprise me"). The space is wide; these are
 examples, not a fixed menu: a genuine next step in the work, an efficiency improvement, a
 preemptive fix or guard, a research or exploration probe, documentation/hygiene that adds
@@ -190,8 +197,19 @@ def propose(session, client, context: str, *, importance=None, leash: str = PROP
     if d.status not in (HELD, NOTIFIED):
         return []
     d.origin = "collaborator"  # provenance: the Collaborator raised this, not the user
-    return [Proposal(proposal_id="prop-" + uuid.uuid4().hex[:12], decision=d,
-                     rationale=rationale, confidence=confidence)]
+    prop = Proposal(proposal_id="prop-" + uuid.uuid4().hex[:12], decision=d,
+                    rationale=rationale, confidence=confidence)
+    # Enroll into the stage pool so a surfaced-but-undecided proposal is never lost — it
+    # stays PENDING and findable until explicitly approved/vetoed (the pool holds it by
+    # reference, so those resolutions reflect in place). Bookkeeping only, never authority;
+    # a failure here must not sink the proposal itself.
+    pool = getattr(session, "proposal_pool", None)
+    if pool is not None:
+        try:
+            pool.add(prop)
+        except Exception:  # noqa: BLE001 — pooling is best-effort bookkeeping
+            pass
+    return [prop]
 
 
 def approve_proposal(session, proposal: Proposal) -> Decision:

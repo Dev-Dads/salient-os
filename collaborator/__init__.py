@@ -29,6 +29,7 @@ from collaborator.propose import (
     propose,
     veto_proposal,
 )
+from collaborator.proposalpool import ProposalPool
 from collaborator.policycaps import (
     PolicyCaps,
     SignedPolicyCaps,
@@ -92,6 +93,7 @@ __all__ = [
     "approve_proposal",
     "veto_proposal",
     "Proposal",
+    "ProposalPool",
     "JudgmentView",
     "JudgmentLedger",
     "set_leash",
