@@ -79,13 +79,36 @@ def snapshot_tree(root) -> dict:
     return snap
 
 
-def observed_write_set(pre: dict, post: dict) -> list:
-    """Paths added, removed, or changed between two snapshots."""
+def observed_write_set(pre: dict, post: dict, exempt=()) -> list:
+    """Paths added, removed, or changed between two snapshots.
+
+    ``exempt`` drops paths that are ENTAILED by a declared side effect (the ancestor
+    directories of a declared write path) rather than undeclared mutations — see
+    ``entailed_ancestors`` and ``observe_action``.
+    """
+    exempt = set(exempt)
     changed = []
     for path in set(pre) | set(post):
+        if path in exempt:
+            continue
         if pre.get(path) != post.get(path):
             changed.append(path)
     return sorted(changed)
+
+
+def entailed_ancestors(rel_path: str) -> list:
+    """The strict ancestor directories of a workspace-relative path, as posix rel-paths.
+
+    ``a/b/c.txt`` -> ``["a", "a/b"]``; a flat path -> ``[]``. These are the directories a
+    write of ``rel_path`` necessarily brings into being — creating ``a/b/c.txt`` cannot
+    happen without ``a/`` and ``a/b/`` — so they are entailed by declaring the write, not a
+    separate hidden side effect. Excludes the full path itself (that IS the declared subject).
+    """
+    rel = str(rel_path or "").replace("\\", "/").strip("/")
+    if not rel:
+        return []
+    parts = [p for p in rel.split("/") if p not in ("", ".")]
+    return ["/".join(parts[:i]) for i in range(1, len(parts))]
 
 
 def rehash(root, path: str) -> str:
@@ -174,11 +197,12 @@ def artifact_evidence(envelope_id: str, root, path: str, provenance: str) -> Wor
     )
 
 
-def write_set_evidence(envelope_id: str, pre: dict, post: dict, provenance: str) -> WorldEvidence:
+def write_set_evidence(envelope_id: str, pre: dict, post: dict, provenance: str,
+                       exempt=()) -> WorldEvidence:
     return WorldEvidence(
         obligation_id=obligation_id(envelope_id, "write_set"),
         kind="write_set",
-        value=write_set_value(observed_write_set(pre, post)),
+        value=write_set_value(observed_write_set(pre, post, exempt)),
         failure_mode="host_snapshot_diff",
         channel=SNAPSHOT_CHANNEL,
         provenance=provenance,
@@ -218,16 +242,35 @@ def observe_action(envelope, root, pre_snapshot, supervised_result, provenance: 
     """
     eid = envelope.envelope_id
     post = snapshot_tree(root)
-    world = [
-        exit_evidence(eid, supervised_result, provenance),
-        write_set_evidence(eid, pre_snapshot, post, provenance),
-    ]
     builder = _SIDE_EFFECT_OBSERVERS.get(envelope.op)
+    kind, subjects = (None, [])
     if builder is not None:
         kind, subjects = builder(envelope.args)
-        for path in subjects:
-            if kind == "artifact":
-                world.append(artifact_evidence(eid, root, path, provenance))
-            else:
-                world.append(path_state_evidence(eid, root, path, provenance))
+    # A directory this action itself brings into being as an ANCESTOR of a declared subject path
+    # is entailed by that declaration (you cannot write `a/b/c.txt` without `a/` and `a/b/`), so
+    # it is not an undeclared mutation — exempt it from the write-set boundary. Without this an
+    # honest nested write false-fails the boundary because the auto-created parents show up as
+    # "extra" changed paths.
+    #
+    # The exemption is by TRANSITION, not by name: an ancestor is exempt ONLY when it was absent
+    # in `pre` and is a directory in `post` (genuinely created here). Exempting by name alone
+    # would blind the boundary to a destructive TYPE CHANGE of a pre-existing ancestor — a file
+    # or symlink replaced by a directory, or a directory removed — and for file.write / shell.run
+    # the ancestor paths have NO other observer, so such a change would wrongly verify. A path
+    # that is itself a declared subject is never exempt (it must still be diffed).
+    subject_set = set(subjects)
+    exempt = set()
+    for sp in subjects:
+        for anc in entailed_ancestors(sp):
+            if anc not in subject_set and anc not in pre_snapshot and post.get(anc) == "dir":
+                exempt.add(anc)
+    world = [
+        exit_evidence(eid, supervised_result, provenance),
+        write_set_evidence(eid, pre_snapshot, post, provenance, exempt=exempt),
+    ]
+    for path in subjects:
+        if kind == "artifact":
+            world.append(artifact_evidence(eid, root, path, provenance))
+        else:
+            world.append(path_state_evidence(eid, root, path, provenance))
     return world

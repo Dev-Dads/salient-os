@@ -43,6 +43,8 @@ class Session:
         veto_half_life_days: float = 7.0,
         research_trust: str = "read_only_research",
         research_budget: int = 4,
+        controlled_paths=(".github",),
+        proposal_pool=None,
     ) -> None:
         self.workspace = Path(workspace)
         self.capabilities = tuple(capabilities)
@@ -101,3 +103,17 @@ class Session:
             raise ValueError(f"research_trust must be one of {TRUST_LEVELS}")
         self.research_trust = research_trust
         self.research_budget = max(0, int(research_budget))
+        # Controlled locations (host config, never model-chosen): workspace subtrees that
+        # CONFIGURE or EXECUTE the project — default ``.github`` (CI workflows/hooks/actions),
+        # which carry repo-level authority. A self-originated PROPOSER write into one is
+        # hard-denied so it stages to scratch instead; the placement is a separately-approved
+        # act the Collaborator executes. See collaborator/tools.is_controlled_location.
+        self.controlled_paths = tuple(controlled_paths or ())
+        # The proposal stage pool: a durable home for surfaced-but-undecided proposals, so a
+        # proposal the human neither approved nor vetoed is never lost — it stays PENDING and
+        # findable (the natural feed for a dashboard's pending queue). Grants no authority.
+        if proposal_pool is not None:
+            self.proposal_pool = proposal_pool
+        else:
+            from collaborator.proposalpool import ProposalPool
+            self.proposal_pool = ProposalPool()

@@ -1,0 +1,18 @@
+bundle chars=101967  models=['openai/gpt-5.1', 'google/gemini-2.5-pro', 'anthropic/claude-opus-4.1', 'x-ai/grok-4.5', 'qwen/qwen3-max']
+[ OK ] openai/gpt-5.1  36.3s  finish=stop  chars=10786  cost=$0.0578
+[ OK ] qwen/qwen3-max  38.7s  finish=stop  chars=8104  cost=$0.0267
+[ OK ] anthropic/claude-opus-4.1  62.2s  finish=stop  chars=4927  cost=$0.5365
+[ OK ] google/gemini-2.5-pro  156.1s  finish=error  chars=4792  cost=$0.0000
+[ OK ] x-ai/grok-4.5  213.6s  finish=stop  chars=9909  cost=$0.1146
+
+======= API COST — staging subsystem CODE red-team =======
+  openai/gpt-5.1                        $0.0578   24547->2711 tok
+  google/gemini-2.5-pro                 $0.0000   26836->1211 tok
+  anthropic/claude-opus-4.1             $0.5365   29301->1293 tok
+  x-ai/grok-4.5                         $0.1146   26723->10226 tok
+  qwen/qwen3-max                        $0.0267   24517->1939 tok
+  ------------------------------------------------------
+  TOTAL                                 $0.7356
+==========================================================
+
+Done: 5/5 succeeded.

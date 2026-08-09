@@ -15,8 +15,10 @@ says so (never a fabricated success).
 
 from __future__ import annotations
 
+import os
 import shlex
 import sys
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -101,6 +103,61 @@ def resolve_in_workspace(workspace, rel: str) -> Path:
     if target != root and root not in target.parents:
         raise WorkspaceError(f"path escapes workspace: {rel!r}")
     return target
+
+
+def _fs_normcase(component: str) -> str:
+    """Normalize a path component the way a case-insensitive filesystem will actually name it, so
+    a controlled location cannot be dodged by an alias the OS silently collapses onto the same
+    name. We ``casefold`` ALWAYS — not only on Windows — because case-insensitivity is a property
+    of the *filesystem*, not the OS: macOS (APFS/HFS+ default) is case-insensitive while
+    ``os.name`` is ``posix`` (a red-team finding: ``.GitHub`` bypassed a Windows-only fold), and
+    Linux can mount case-insensitive volumes/shares. Over-folding is the SAFE direction — at worst
+    a proposer STAGES a case-variant path instead of writing it (the deny is proposer-only), never
+    a bypass. NFC-normalize first (canonical-equivalence aliases on APFS/HFS+); on Windows also
+    strip trailing dots/spaces, which that FS drops from a name (``.github.``/``.github ``→``.github``).
+    """
+    c = unicodedata.normalize("NFC", component).casefold()
+    if os.name == "nt":
+        c = c.rstrip(". ")
+    return c
+
+
+def is_controlled_location(workspace, rel: str, controlled: "tuple[str, ...]") -> bool:
+    """True if ``rel`` resolves into a CONTROLLED subtree of the workspace.
+
+    Controlled locations (default ``.github`` — CI workflows, hooks, actions) *configure* or
+    *execute* the project and carry repo-level authority (arbitrary code + secret access in
+    CI), so they are a class apart from ordinary scratch files. Under hard-deny-and-stage a
+    self-originated proposer write must never land here: the proposer stages the artifact to
+    reachable scratch and the PLACEMENT is a separate action a human approves and the
+    Collaborator executes — producing the file is the proposer's, placing it here is not.
+
+    Matched by ROOT-ANCHORED path prefix: ``.github`` means the workspace's top-level
+    ``.github`` tree (covering all of ``.github/**``), not a nested lookalike like
+    ``src/.github`` (which GitHub never reads, so it is harmless scratch). Returns False on an
+    empty/escaping path — the workspace fence already refuses those on its own.
+
+    Each component is normalized the way the filesystem will actually name it (``_fs_normcase``)
+    before matching, so an alias the OS silently collapses onto the controlled name — a CASE
+    variant (``.GitHub``) or a Windows trailing-dot/space (``.github.``, ``.github ``) — cannot
+    dodge the check while the write still lands in the real controlled directory.
+    """
+    if not controlled:
+        return False
+    try:
+        target = resolve_in_workspace(workspace, rel)
+    except WorkspaceError:
+        return False
+    root = Path(workspace).resolve()
+    try:
+        parts = tuple(_fs_normcase(p) for p in target.relative_to(root).parts)
+    except ValueError:
+        return False
+    for pref in controlled:
+        pref_parts = tuple(_fs_normcase(p) for p in Path(str(pref)).parts if p not in ("", "."))
+        if pref_parts and parts[:len(pref_parts)] == pref_parts:
+            return True
+    return False
 
 
 # --- executors ---------------------------------------------------------------

@@ -13,6 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from collaborator.governance import (
+    DENIED,
     HELD,
     PAUSED,
     Decision,
@@ -21,7 +22,7 @@ from collaborator.governance import (
     reauthorized_or_denied,
 )
 from collaborator.toolcall import parse_message
-from collaborator.tools import get_tool
+from collaborator.tools import get_tool, is_controlled_location
 
 COLLABORATOR_LOOP_VERSION = "0.1.0"
 
@@ -105,11 +106,31 @@ def approve(session, decision: Decision) -> Decision:
     recorded directive."""
     if decision.status != HELD:
         return decision
+    # Single-use: a HELD decision may run at most once, through ANY approval path. Without this
+    # the same held decision (held by the proposal pool by reference, and reachable as
+    # ``proposal.decision``) could be re-run — running a VETOED action, or double-executing an
+    # approved one under a REUSED action_id (a one-id/one-action audit break). Both were proven
+    # by the red-team; the flag closes them at the decision layer, below the wrapper's status.
+    if getattr(decision, "consumed", False):
+        return decision
     tool = get_tool(decision.tool)
     if tool is None:
         return decision
     denied = reauthorized_or_denied(session, tool, decision.action_id, decision.args,
                                     decision.leash, decision.directive)
     if denied is not None:
-        return denied
+        return denied            # authority no longer holds: NOT consumed -> retryable later
+    # Defence-in-depth (red-team): re-assert the controlled-location hard-deny at the MOMENT OF
+    # USE for a COLLABORATOR-originated write. A proposer can never *originate* such a write (it
+    # is denied at govern time), so a held collaborator proposal whose path now lands in a
+    # controlled tree can only have been mutated after origination — refuse it, don't consume it.
+    # A user-directed placement (origin != "collaborator") is unaffected: approval is the human's.
+    if (decision.origin == "collaborator" and decision.tool == "write_file"
+            and is_controlled_location(session.workspace, str(decision.args.get("path") or ""),
+                                       tuple(getattr(session, "controlled_paths", ()) or ()))):
+        return Decision(decision.action_id, decision.tool, DENIED,
+                        "controlled location: proposer placement re-denied at approval",
+                        decision.leash, directive=decision.directive, args=decision.args,
+                        origin=decision.origin)
+    decision.consumed = True     # claim it before running, so no concurrent/second path re-runs
     return execute_and_verify(session, tool, decision.directive, decision.action_id, decision.args)

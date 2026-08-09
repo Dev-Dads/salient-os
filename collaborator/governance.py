@@ -43,6 +43,7 @@ from collaborator.tools import (
     WorkspaceError,
     execute_tool,
     get_tool,
+    is_controlled_location,
     resolve_in_workspace,
 )
 from collaborator.policycaps import apply_cap, granted_capabilities, leash_cap
@@ -90,6 +91,11 @@ class Decision:
     # forensic reader can tell "the user asked for this" from "the agent suggested it and
     # the user approved" (panel F5/F6). Bus-level provenance tagging is a later add.
     origin: str = "direct"
+    # Single-use guard for a HELD decision (red-team: a pooled/held decision was re-runnable
+    # via approve()). Set True the moment approve() runs it OR a veto retires it, so no path —
+    # a second approve(), or approve() on a vetoed decision — can re-execute it or reuse its
+    # action_id. A DENIED re-gate does NOT consume it (it stays retryable once authority holds).
+    consumed: bool = False
 
     def summary(self) -> str:
         """The honest, human-facing line — derived from the real decision/result,
@@ -178,6 +184,15 @@ def govern_action(session, intent: ToolIntent, importance: "float | None" = None
     # ③ a signed grant caps how loose the leash may get: the host/view can tighten but
     # never loosen past the cap (fail-closed if the grant is present but invalid).
     leash = apply_cap(leash, leash_cap(session, tool.name))
+    # A PROPOSER-originated shell command must never AUTO-run: floor it at propose_first so it is
+    # always surfaced for a human hand, whatever the host leash config. run_command is the
+    # unbounded-reach mutator — it can write anywhere (including controlled trees the write_file
+    # hard-deny protects) and reach OUTSIDE the machine, and its verify_mode="exit" gives it no
+    # write-set floor — so the human is the control (red-team: hard-deny-and-stage was
+    # write_file-only; a loosened run_command leash could otherwise auto-place into `.github`).
+    if intent.name == "run_command" and getattr(intent, "source", "") == "proposed" \
+            and leash == ACT_THEN_REPORT:
+        leash = PROPOSE_FIRST
     imp = session.default_importance if importance is None else importance
     rk = _TOOL_RISK.get(tool.name, 0.3) if risk is None else risk
 
@@ -222,6 +237,21 @@ def govern_action(session, intent: ToolIntent, importance: "float | None" = None
         except WorkspaceError as exc:
             return Decision(action_id=action_id, tool=tool.name, status=DENIED,
                             reason=str(exc), leash=leash, directive=directive, args=intent.args)
+
+    # --- controlled-location hard-deny for PROPOSER-originated writes ---------
+    # Hard-deny-and-stage: the PROPOSER may not self-originate a write into a controlled
+    # location (CI/hooks — repo-level authority). Such a proposal is refused so the proposer
+    # stages the artifact to reachable scratch instead; the PLACEMENT into the controlled
+    # location is a separate action a human approves and the Collaborator executes. Keyed on
+    # the proposer origin (intent.source == "proposed", which propose.py hardcodes — the model
+    # cannot forge it), so a user-directed or approved placement is deliberately unaffected.
+    if (intent.name == "write_file" and getattr(intent, "source", "") == "proposed"
+            and is_controlled_location(session.workspace, str(intent.args.get("path") or ""),
+                                       tuple(getattr(session, "controlled_paths", ()) or ()))):
+        return Decision(action_id=action_id, tool=tool.name, status=DENIED,
+                        reason=("controlled location: the proposer must stage to scratch; "
+                                "placement here requires explicit approval"),
+                        leash=leash, directive=directive, args=intent.args)
 
     # --- LEASH (second axis) --------------------------------------------------
     if leash == NOTIFY_ONLY:
