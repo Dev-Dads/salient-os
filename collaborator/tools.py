@@ -28,6 +28,7 @@ from salienceos.verifier.observers import SupervisedResult, run_supervised
 from salienceos.verifier.signing import sha256_bytes
 
 from collaborator import egress
+from collaborator.netns import isolation_unverified, wrap_no_network
 
 COLLABORATOR_TOOLS_VERSION = "0.1.0"
 
@@ -81,6 +82,8 @@ class Execution:
     write_set: tuple[str, ...] = ()
     artifact_hashes: dict = field(default_factory=dict)
     egress: "egress.EgressRecord | None" = None  # ADR 0003: channel-integrity audit of a net.get
+    network_isolated: "bool | None" = None  # ADR 0003 revisit #1: run_command ran in a netns
+                                            # (None = not a network-isolable tool)
 
 
 _TOOLS: dict[str, Tool] = {
@@ -256,7 +259,15 @@ def _exec_command(workspace, args: dict) -> Execution:
         return Execution(result=ToolResult(ok=False, error="command must be a string or list"))
     if not argv:
         return Execution(result=ToolResult(ok=False, error="empty command"))
-    res = run_supervised(argv, cwd=workspace)
+    # ADR 0003 revisit #1: run the shell inside a fresh network namespace with no route out, so
+    # a raw socket / curl / git can't egress — web_fetch (the mediated client) is the sole path
+    # off the machine. Fails closed to unisolated + a False flag where netns is unavailable.
+    run_argv, isolated = wrap_no_network(argv)
+    res = run_supervised(run_argv, cwd=workspace)
+    # If the per-run guard tripped (child was NOT in a fresh netns), the command did not run — no
+    # egress — and we correct the flag to False so it never falsely claims isolation (red-team).
+    if isolated and isolation_unverified(res.returncode, res.stderr):
+        isolated = False
     ok = res.returncode == 0
     out = (res.stdout or b"").decode("utf-8", "replace")
     err = (res.stderr or b"").decode("utf-8", "replace")
@@ -264,7 +275,7 @@ def _exec_command(workspace, args: dict) -> Execution:
         result=ToolResult(ok=ok, output=out, error=err),
         supervised=res, exit_code=res.returncode,
         write_set=(),  # nothing declared; observe_action's write-set diff catches undeclared writes
-        artifact_hashes={},
+        artifact_hashes={}, network_isolated=isolated,
     )
 
 

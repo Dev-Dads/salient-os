@@ -198,11 +198,20 @@ proposer context (`research.py:143-145`) → the proposer's user message
   renamed accordingly; it does **not** carry the "hands can't lie" property (the FS
   verifier re-observes independently of the executor; here the observer *is* the
   executor). Independent observation is a revisit trigger, not a v0 claim.
-- **`run_command`'s raw network reach is a real residual, and netns is a near-term
-  hard dependency — not a soft revisit.** Until `shell.exec` can egress only through
-  the mediated channel (a box/Spark network namespace), Tier-1 mediation and
-  allowlisting apply to `web_fetch` *only*. The "one seam" story is not complete
-  until then, and the ADR says so plainly rather than implying global coverage.
+- **`run_command`'s raw network reach is now ISOLATED on Linux (revisit #1 shipped).**
+  `run_command` executes inside a fresh, unprivileged **network namespace** with no route
+  out (`collaborator/netns.py`), so a raw socket / `curl` / `git push` fails closed and
+  **`egress.py` is the sole IP-network path off the machine** — which is what makes the
+  same-channel egress log *sound* for IP egress (no other IP channel for bytes to leave by).
+  Isolation is **verified, not trusted** — the probe and each run confirm the child is in a
+  genuinely distinct netns (`/proc/self/ns/net` inode), so a substituted / broken /
+  `LD_PRELOAD`-hooked `unshare` that exits 0 without isolating is caught (fail closed + honest
+  flag), never reported as isolated. It is **OS-gated**: where netns is unavailable (non-Linux,
+  no `unshare`, userns disabled) the shell runs unisolated and the run is **honestly flagged**
+  `network_isolated=False` — never a silent claim. Scope limit: a network namespace isolates
+  the *network*, not the filesystem or *pathname* UNIX-socket IPC — so a network-capable local
+  daemon socket (notably a Docker socket, `systemd-resolved`, a local proxy) is a residual
+  confused-deputy path on hosts that expose one; `--mount`/seccomp is the follow-up hardening.
 - **Known seam-fallers the tiered model does not fully close** (documented, not
   hidden): exfil of the operator's *own* secret to an allowlisted-for-read host (the
   missing axis is *what leaves*, not *where to*); and offense *through* a sanctioned
@@ -267,11 +276,14 @@ re-derives and re-checks the allowlist; audit-only recognizer never denies.
 
 ## Revisit triggers
 
-1. **netns / egress proxy on the box** — the near-term hard dependency: constrain
-   `run_command` to egress only through the mediated channel, and upgrade the
-   egress record from same-channel logging to independent observation (closing the
-   "bytes left by another path" gap). Until done, do not claim global egress
-   mediation.
+1. **netns for `run_command` — DONE on Linux (`collaborator/netns.py`).** `run_command`
+   now runs in a fresh network namespace with no route out, so `egress.py` is the sole
+   IP-network path off the machine and the "bytes left by another path" gap is closed for
+   IP egress. Remaining under this trigger: (a) the same guarantee on non-Linux hosts
+   (netns is Linux-only; today those honestly flag `network_isolated=False`); (b) the
+   *further* hardening of an **independent** egress observer (a proxy outside the executor)
+   — now optional rather than prerequisite, since with `run_command` isolated the
+   same-channel log has no other channel to miss.
 2. **Side-effecting egress (`net.post`) is actually needed** — build the Tier-2
    emission flow (the read/write split is drawn here; the write path is not built
    until required).

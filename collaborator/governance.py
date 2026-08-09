@@ -102,6 +102,9 @@ class Decision:
     # AUDIT-ONLY offense-shape tag (never a deny — the boundary is structural default-deny).
     egress: object = None
     offense_flag: str = ""
+    # ADR 0003 revisit #1: whether a run_command ran network-isolated (netns). None for tools
+    # that are not network-isolable; True/False honestly reflects whether isolation applied.
+    network_isolated: "bool | None" = None
 
     def summary(self) -> str:
         """The honest, human-facing line — derived from the real decision/result,
@@ -114,6 +117,8 @@ class Decision:
             tail = ""
         if self.offense_flag:  # ADR 0003 audit-only tag — recorded, never a deny
             tail += f"  ⚑ offense-shape audit: {self.offense_flag}"
+        if self.network_isolated is not None:  # ADR 0003 revisit #1 — honest per-run flag
+            tail += "  🔒 net-isolated" if self.network_isolated else "  ⚠ net NOT isolated (raw reach)"
         if self.status == RAN:
             out = (self.result.output if self.result else "") or "(no output)"
             return f"[{self.tool} ✓ ran, verified] {out}{tail}"
@@ -397,7 +402,8 @@ def execute_and_verify(session, tool: Tool, directive, action_id: str, args: dic
         return Decision(action_id, tool.name, RAN if cleared else FAILED,
                         "supervised exit 0" if cleared else f"exit {execution.exit_code}",
                         leash, cleared=cleared, result=execution.result, directive=directive,
-                        args=args, offense_flag=offense_flag)
+                        args=args, offense_flag=offense_flag,
+                        network_isolated=execution.network_isolated)
 
     # verify_mode == "artifact": build envelope BEFORE running, snapshot, execute
     # receipt from the REAL result, observe world independently, govern.
