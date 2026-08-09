@@ -44,7 +44,8 @@ from collaborator.governance import DENIED, HELD, NOTIFIED, RAN, FAILED  # noqa:
 from collaborator.memory import CdmsMemorySource  # noqa: E402
 from collaborator.memory_ingest import remember  # noqa: E402
 from collaborator.model_client import OllamaClient  # noqa: E402
-from collaborator.propose import approve_proposal, build_proposer_context, propose  # noqa: E402
+from collaborator.propose import approve_proposal, build_proposer_context  # noqa: E402
+from collaborator.research import propose_researched  # noqa: E402
 from collaborator.session import Session  # noqa: E402
 
 _USER_PROJECTS = {"user-preferences", "user_preferences"}
@@ -128,7 +129,7 @@ def main():
                                          recent_actions=recent[-6:])
             row = {"turn": turn}
             try:
-                props = propose(session, client, ctx, threshold=0.0)
+                props = propose_researched(session, client, ctx, threshold=0.0)
             except Exception as exc:  # noqa: BLE001
                 tally["error"] += 1
                 row.update(outcome="error", detail=str(exc)[:120])

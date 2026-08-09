@@ -41,6 +41,8 @@ class Session:
         veto_ledger=None,
         veto_bar_delta: float = 0.15,
         veto_half_life_days: float = 7.0,
+        research_trust: str = "read_only_research",
+        research_budget: int = 4,
     ) -> None:
         self.workspace = Path(workspace)
         self.capabilities = tuple(capabilities)
@@ -91,3 +93,11 @@ class Session:
         else:
             from collaborator.vetoledger import VetoLedger
             self.veto_ledger = VetoLedger(veto_bar_delta, veto_half_life_days)
+        # The proposer's research trust level + step budget (host config, never model-chosen):
+        # how far the proposer may INVESTIGATE (read-only) before proposing, and for how many
+        # steps. See collaborator/research.py. Default: local read-only research, 4 steps.
+        from collaborator.research import TRUST_LEVELS
+        if research_trust not in TRUST_LEVELS:
+            raise ValueError(f"research_trust must be one of {TRUST_LEVELS}")
+        self.research_trust = research_trust
+        self.research_budget = max(0, int(research_budget))
