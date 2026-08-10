@@ -23,6 +23,7 @@ from collaborator.governance import (
     govern_action,
     reauthorized_or_denied,
 )
+from collaborator.codefence import names_code_root
 from collaborator.toolcall import ToolIntent, parse_message
 from collaborator.tools import ACT_THEN_REPORT, get_tool, is_controlled_location
 
@@ -164,6 +165,18 @@ def approve(session, decision: Decision) -> Decision:
                                        tuple(getattr(session, "controlled_paths", ()) or ()))):
         return Decision(decision.action_id, decision.tool, DENIED,
                         "controlled location: proposer placement re-denied at approval",
+                        decision.leash, directive=decision.directive, args=args,
+                        origin=decision.origin)
+    # F-6 Harm A: re-assert the code-root deny at the MOMENT OF USE for a COLLABORATOR-originated
+    # held run_command. A proposer can never *originate* one naming the code root (denied at govern
+    # time), so a held collaborator run_command that now names it can only have been mutated after
+    # origination — refuse, don't consume. A user-directed command (origin != "collaborator") is
+    # the human's to approve. POROUS DiD (names_code_root is not the boundary), symmetric with the
+    # controlled-location re-deny above.
+    if (decision.origin == "collaborator" and decision.tool == "run_command"
+            and names_code_root(args.get("command"))):
+        return Decision(decision.action_id, decision.tool, DENIED,
+                        "code root: proposer-authored command re-denied at approval",
                         decision.leash, directive=decision.directive, args=args,
                         origin=decision.origin)
     decision.consumed = True     # claim it before running, so no concurrent/second path re-runs

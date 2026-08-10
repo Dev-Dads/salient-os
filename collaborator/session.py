@@ -48,6 +48,13 @@ class Session:
         egress_credentials=None,
     ) -> None:
         self.workspace = Path(workspace)
+        # F-6 Harm A: the workspace must be DISJOINT from the Collaborator's own code root
+        # (collaborator/ + salienceos/), both directions. Fail LOUD at construction — the fenced
+        # write_file/read_file already can't escape the workspace, so a disjoint workspace means
+        # they can never name the code, and a governed shell has no in-workspace path to the rules
+        # it runs under. See collaborator/codefence.py.
+        from collaborator.codefence import disjoint_from_code
+        disjoint_from_code(self.workspace)
         self.capabilities = tuple(capabilities)
         # ③ optional SIGNED authority grant. When present, the VERIFIED caps are
         # authoritative (the mutable .capabilities above cannot widen them) and each

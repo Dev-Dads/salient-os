@@ -17,6 +17,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from collaborator.governance import DENIED, HELD, RAN, govern_action
 from collaborator.loop import approve
@@ -314,9 +315,19 @@ class ProposerShellAndApproveGates(unittest.TestCase):
             d = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "proposed"))
             self.assertEqual(d.leash, PROPOSE_FIRST)
             self.assertEqual(d.status, HELD)
-            # a user-directed command keeps the host's chosen leash (unaffected)
-            d2 = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "structured"))
-            self.assertEqual(d2.leash, ACT_THEN_REPORT)
+            # F-6 Harm A: run_command autonomy is UNIVERSALLY withheld while code protection is
+            # unavailable, so a user-directed act_then_report shell is ALSO floored to propose_first.
+            d_user = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "structured"))
+            self.assertEqual(d_user.leash, PROPOSE_FIRST)
+            self.assertEqual(d_user.status, HELD)
+            # The PROPOSER floor is additionally proposer-SPECIFIC: with code protection available (so
+            # the autonomy floor stands down), a user-directed command keeps ACT_THEN_REPORT while a
+            # proposer-originated one is STILL floored to propose_first.
+            with patch("collaborator.governance.code_protection_available", return_value=True):
+                d2 = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "structured"))
+                self.assertEqual(d2.leash, ACT_THEN_REPORT)
+                d3 = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "proposed"))
+                self.assertEqual(d3.leash, PROPOSE_FIRST)
 
     def test_approve_re_denies_a_mutated_controlled_path(self):
         # grok F2: a held collaborator proposal whose path is mutated into a controlled tree after
