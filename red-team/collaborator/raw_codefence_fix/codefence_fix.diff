@@ -1,0 +1,85 @@
+commit 41969fda80d7528e3a312aebd2821d4eda8ce35a
+Author:     Chance6706 <josh.e.nissen@gmail.com>
+AuthorDate: Mon Aug 10 13:31:44 2026 -0500
+Commit:     GitHub <noreply@github.com>
+CommitDate: Mon Aug 10 13:31:44 2026 -0500
+
+    codefence: fail closed if PROTECTED_ROOTS is empty (PR #33 certification follow-up) (#34)
+    
+    The 5-vendor external certification panel on PR #33 (all 5 CERTIFIED the headline "no
+    autonomous run_command self-rewrite" claim) surfaced one convergent finding (4/5,
+    unanimous top-fix): if both packages' __file__ were unresolvable, PROTECTED_ROOTS becomes
+    () and disjoint_from_code silently no-ops — a governance guard failing OPEN.
+    
+    Not in-band reachable (collaborator/ __file__ always resolves, so there is always >=1
+    root), but a fail-closed codebase must never let a guard silently no-op. disjoint_from_code
+    now raises WorkspaceOverlapsCodeError when PROTECTED_ROOTS is empty (refuses every
+    workspace) instead of passing. + regression test; + the certification panel runner
+    (redteam_codefence.py) and raw 5-vendor outputs as provenance.
+    
+    Refuted (documented, not acted on): the origin-gated approve() re-deny (1/5; the intended
+    human-maintenance path — the by-reference TOCTOU's real fix is the deferred MINOR-B seal);
+    unresolvable-workspace and runtime-leash-mutation both already fail closed; the in-workspace
+    symlink is caught by resolve_in_workspace for write_file.
+    
+    Suite: 537 tests, 3 skipped, green.
+    
+    
+    Claude-Session: https://claude.ai/code/session_01Rpuvh681reoP8Xf53NfcGU
+    
+    Co-authored-by: Claude Opus 4.8 <noreply@anthropic.com>
+
+diff --git a/collaborator/codefence.py b/collaborator/codefence.py
+index 6a16ad0..0275e17 100644
+--- a/collaborator/codefence.py
++++ b/collaborator/codefence.py
+@@ -40,8 +40,10 @@ COLLABORATOR_CODEFENCE_VERSION = "0.1.0"
+ def _resolved_roots() -> "tuple[Path, ...]":
+     """The Collaborator's own code roots — ``collaborator/`` (this package) and ``salienceos/``
+     (the interpreter/verifier core the seam calls into). The F1 guarantee spans BOTH, so both are
+-    protected. Resolved once at import; a module whose path can't be resolved is skipped (the guard
+-    is a cheap layer, not the boundary — it fails open rather than raising at import)."""
++    protected. Resolved once at import; a module whose path can't be resolved is skipped. If that
++    leaves NO roots at all, ``disjoint_from_code`` fails CLOSED (refuses every workspace) rather than
++    silently protecting nothing — a governance guard must never no-op (the unanimous top-fix from the
++    5-vendor PR #33 certification panel)."""
+     roots: list[Path] = []
+     for mod_file in (__file__, getattr(salienceos, "__file__", None)):
+         if not mod_file:
+@@ -70,6 +72,15 @@ def disjoint_from_code(workspace) -> None:
+     any protected code root. Enforces the invariant ``tools.py`` already ASSUMES ("the Collaborator's
+     wiring lives OUTSIDE the workspace root"), so the fenced ``write_file``/``read_file`` can never
+     reach the code. Checked at Session construction — fail LOUD, like the leash/proactivity checks."""
++    if not PROTECTED_ROOTS:
++        # Fail CLOSED: we could not locate our own code roots, so refuse to construct a session
++        # rather than let this guard silently become a NO-OP (a governance guard must never fail
++        # OPEN — the unanimous top-fix from the 5-vendor PR #33 certification panel). Only reachable
++        # in a pathological import env (no resolvable __file__ on EITHER package); collaborator/
++        # normally always resolves, so this never fires in normal operation.
++        raise WorkspaceOverlapsCodeError(
++            "cannot locate the Collaborator's own code roots — refusing to construct a session "
++            "(structural code protection would otherwise be a silent no-op)")
+     try:
+         ws = Path(workspace).resolve()
+     except (OSError, ValueError, RuntimeError) as exc:
+diff --git a/tests/test_collaborator_codefence.py b/tests/test_collaborator_codefence.py
+index 01e8c0f..ed066e4 100644
+--- a/tests/test_collaborator_codefence.py
++++ b/tests/test_collaborator_codefence.py
+@@ -72,6 +72,16 @@ class DisjointnessGuard(unittest.TestCase):
+         with self.assertRaises(ValueError):
+             Session(workspace=str(_ROOT))
+ 
++    def test_empty_protected_roots_fails_closed(self):
++        # PR #33 certification panel (4/5): a governance guard must never silently no-op. If we
++        # can't locate our own code roots, refuse EVERY workspace rather than fail open.
++        with patch.object(codefence, "PROTECTED_ROOTS", ()):
++            with tempfile.TemporaryDirectory() as tmp:
++                with self.assertRaises(codefence.WorkspaceOverlapsCodeError):
++                    codefence.disjoint_from_code(tmp)
++                with self.assertRaises(ValueError):
++                    Session(workspace=tmp)
++
+ 
+ class NamesCodeRootRecognizer(unittest.TestCase):
+     """POROUS defence-in-depth — the negative cases ENCODE that it is not the boundary."""
