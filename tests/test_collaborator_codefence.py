@@ -72,6 +72,16 @@ class DisjointnessGuard(unittest.TestCase):
         with self.assertRaises(ValueError):
             Session(workspace=str(_ROOT))
 
+    def test_empty_protected_roots_fails_closed(self):
+        # PR #33 certification panel (4/5): a governance guard must never silently no-op. If we
+        # can't locate our own code roots, refuse EVERY workspace rather than fail open.
+        with patch.object(codefence, "PROTECTED_ROOTS", ()):
+            with tempfile.TemporaryDirectory() as tmp:
+                with self.assertRaises(codefence.WorkspaceOverlapsCodeError):
+                    codefence.disjoint_from_code(tmp)
+                with self.assertRaises(ValueError):
+                    Session(workspace=tmp)
+
 
 class NamesCodeRootRecognizer(unittest.TestCase):
     """POROUS defence-in-depth — the negative cases ENCODE that it is not the boundary."""

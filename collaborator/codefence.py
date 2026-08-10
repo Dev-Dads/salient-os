@@ -40,8 +40,10 @@ COLLABORATOR_CODEFENCE_VERSION = "0.1.0"
 def _resolved_roots() -> "tuple[Path, ...]":
     """The Collaborator's own code roots — ``collaborator/`` (this package) and ``salienceos/``
     (the interpreter/verifier core the seam calls into). The F1 guarantee spans BOTH, so both are
-    protected. Resolved once at import; a module whose path can't be resolved is skipped (the guard
-    is a cheap layer, not the boundary — it fails open rather than raising at import)."""
+    protected. Resolved once at import; a module whose path can't be resolved is skipped. If that
+    leaves NO roots at all, ``disjoint_from_code`` fails CLOSED (refuses every workspace) rather than
+    silently protecting nothing — a governance guard must never no-op (the unanimous top-fix from the
+    5-vendor PR #33 certification panel)."""
     roots: list[Path] = []
     for mod_file in (__file__, getattr(salienceos, "__file__", None)):
         if not mod_file:
@@ -70,6 +72,15 @@ def disjoint_from_code(workspace) -> None:
     any protected code root. Enforces the invariant ``tools.py`` already ASSUMES ("the Collaborator's
     wiring lives OUTSIDE the workspace root"), so the fenced ``write_file``/``read_file`` can never
     reach the code. Checked at Session construction — fail LOUD, like the leash/proactivity checks."""
+    if not PROTECTED_ROOTS:
+        # Fail CLOSED: we could not locate our own code roots, so refuse to construct a session
+        # rather than let this guard silently become a NO-OP (a governance guard must never fail
+        # OPEN — the unanimous top-fix from the 5-vendor PR #33 certification panel). Only reachable
+        # in a pathological import env (no resolvable __file__ on EITHER package); collaborator/
+        # normally always resolves, so this never fires in normal operation.
+        raise WorkspaceOverlapsCodeError(
+            "cannot locate the Collaborator's own code roots — refusing to construct a session "
+            "(structural code protection would otherwise be a silent no-op)")
     try:
         ws = Path(workspace).resolve()
     except (OSError, ValueError, RuntimeError) as exc:

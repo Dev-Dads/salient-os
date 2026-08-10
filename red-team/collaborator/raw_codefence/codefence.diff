@@ -1,0 +1,608 @@
+commit 4f457f6ab8f9c2cd1c4f6fbf3d09bdd75109ddb7
+Author:     Chance6706 <josh.e.nissen@gmail.com>
+AuthorDate: Mon Aug 10 13:15:45 2026 -0500
+Commit:     GitHub <noreply@github.com>
+CommitDate: Mon Aug 10 13:15:45 2026 -0500
+
+    F-6 Harm A: the Collaborator's own code as an un-rewritable rulebook (cheap cross-platform pass) (#33)
+    
+    run_command has no filesystem fence (write_file/read_file do), so a governed shell could overwrite
+    the Collaborator's own governance code and neuter F1 ("the model can never self-originate an
+    autonomous emission"). This closes the AUTONOMOUS self-rewrite path cross-platform, WITHOUT
+    hard-fencing run_command (which would kill the system maintenance the Collaborator is for):
+    
+    - collaborator/codefence.py (new): PROTECTED_ROOTS (collaborator/ + salienceos/), disjoint_from_code()
+      workspace guard, names_code_root() (porous DiD recognizer), code_protection_available() (False for
+      now — OS-level prevention is a deferred follow-up).
+    - Session construction refuses a workspace overlapping the code root (both directions).
+    - governance seam: a PROPOSER run_command naming the code root is hard-denied; run_command AUTONOMY
+      is withheld (act_then_report floored to propose_first) until code protection is verified, so an
+      unfenced shell can never AUTO-run — it always gets a human hand; honest code_protected flag +
+      names_code_root surfaced in the HELD preview; audit-only code-touch tag.
+    - approve() re-asserts the code-root deny for a collaborator-origin held run_command (moment-of-use).
+    - tools.py docstring made honest (no longer claims run_command containment).
+    
+    Deliberate behavior diff: an act_then_report run_command is now HELD, not auto-run (two tests updated
+    to route through approve()). OS-level structural prevention of a human-APPROVED rewrite (a read-only
+    bind of the code root / a separate maintenance trust domain) is the deferred follow-up, converging
+    with PR B and the third-agent arc.
+    
+    Internal red-team pass (reproduce-before-accept): all 6 guarantees held, no finding survived.
+    Suite: 536 tests, 3 skipped, green (python -m unittest discover -s tests).
+    
+    
+    Claude-Session: https://claude.ai/code/session_01Rpuvh681reoP8Xf53NfcGU
+    
+    Co-authored-by: Claude Opus 4.8 <noreply@anthropic.com>
+
+diff --git a/collaborator/codefence.py b/collaborator/codefence.py
+new file mode 100644
+index 0000000..6a16ad0
+--- /dev/null
++++ b/collaborator/codefence.py
+@@ -0,0 +1,123 @@
++"""Structural protection of the Collaborator's OWN code from ``run_command`` (F-6 "Harm A").
++
++`run_command` has **no filesystem fence** — ``write_file``/``read_file`` are workspace-fenced
++(``tools.resolve_in_workspace``), but ``_exec_command`` runs arbitrary argv with no containment. A
++governed shell could therefore overwrite the Collaborator's own governance code and neuter **F1**
++("the model can never self-originate an autonomous emission"): F1 holds only as long as the model
++never gets autonomous shell. This module is the single source of truth for "the Collaborator's own
++code root", plus the cheap, cross-platform layers that keep that code un-rewritable:
++
++  * ``PROTECTED_ROOTS`` — the ``collaborator/`` + ``salienceos/`` package dirs, resolved ONCE at
++    import (mirrors ``netns._resolve``: fixed at import, before any run_command could move things).
++  * ``disjoint_from_code()`` — a Session's workspace may never overlap a protected root (BOTH
++    directions), so the already-fenced ``write_file``/``read_file`` can never even name the code,
++    and the (future) read-only-bind protection can never foot-gun a workspace-inside-code layout.
++  * ``names_code_root()`` — a POROUS, best-effort recognizer used for a proposer hard-deny and to
++    surface a ⚠ in the human approval preview. **NOT a boundary** (a shell reaches the code without
++    naming it literally — a variable, base64, a symlink, ``python -c "open(p,'w')"``); labelled DiD.
++  * ``code_protection_available()`` — the govern-time predictor of whether ``run_command`` runs
++    with its write-reach to the code STRUCTURALLY prevented. **Returns False in this build**:
++    OS-level prevention (a read-only bind-mount of ``PROTECTED_ROOTS`` in a nested user namespace,
++    or bubblewrap — CVE-adjacent, see the F-6 plan) is a deferred follow-up. While it is False the
++    seam WITHHOLDS ``run_command`` autonomy (floors ``act_then_report`` → ``propose_first``), so an
++    unprotected shell can never AUTO-run — it always gets a human hand. When the follow-up lands
++    this becomes a real, cached host probe (mirroring ``netns.netns_available()``) and
++    ``run_command`` earns autonomy on hosts where protection verifies.
++
++Cross-platform, stdlib-only, NO new dependency. ``salienceos/`` core is untouched — this is a
++collaborator-side guard consulted by the seam; it merely *locates* the core to protect it.
++"""
++
++from __future__ import annotations
++
++from pathlib import Path
++
++import salienceos
++
++COLLABORATOR_CODEFENCE_VERSION = "0.1.0"
++
++
++def _resolved_roots() -> "tuple[Path, ...]":
++    """The Collaborator's own code roots — ``collaborator/`` (this package) and ``salienceos/``
++    (the interpreter/verifier core the seam calls into). The F1 guarantee spans BOTH, so both are
++    protected. Resolved once at import; a module whose path can't be resolved is skipped (the guard
++    is a cheap layer, not the boundary — it fails open rather than raising at import)."""
++    roots: list[Path] = []
++    for mod_file in (__file__, getattr(salienceos, "__file__", None)):
++        if not mod_file:
++            continue
++        try:
++            p = Path(mod_file).resolve().parent
++        except (OSError, ValueError, RuntimeError):
++            continue
++        if p.is_dir() and p not in roots:
++            roots.append(p)
++    return tuple(roots)
++
++
++PROTECTED_ROOTS: "tuple[Path, ...]" = _resolved_roots()
++
++
++class WorkspaceOverlapsCodeError(ValueError):
++    """A Session workspace equals/contains/is-contained-by the Collaborator's own code root.
++
++    A ``ValueError`` so it composes with the other fail-loud construction checks in ``Session``.
++    """
++
++
++def disjoint_from_code(workspace) -> None:
++    """Raise ``WorkspaceOverlapsCodeError`` if ``workspace`` equals, contains, or is contained by
++    any protected code root. Enforces the invariant ``tools.py`` already ASSUMES ("the Collaborator's
++    wiring lives OUTSIDE the workspace root"), so the fenced ``write_file``/``read_file`` can never
++    reach the code. Checked at Session construction — fail LOUD, like the leash/proactivity checks."""
++    try:
++        ws = Path(workspace).resolve()
++    except (OSError, ValueError, RuntimeError) as exc:
++        raise WorkspaceOverlapsCodeError(f"unresolvable workspace: {workspace!r}") from exc
++    for root in PROTECTED_ROOTS:
++        if ws == root or root in ws.parents or ws in root.parents:
++            raise WorkspaceOverlapsCodeError(
++                f"workspace {ws} overlaps the Collaborator's own code root {root} — choose a "
++                "workspace disjoint from the collaborator/ and salienceos/ packages (a governed "
++                "shell must never be able to reach the rules it runs under)")
++
++
++def names_code_root(command) -> str:
++    """POROUS, best-effort tag of a ``run_command`` whose ``command`` literally names a protected
++    code root. Returns the matched root path(s) joined by ``,`` (empty string = no literal match).
++
++    DEFENCE-IN-DEPTH ONLY — **NOT a boundary.** A shell can reach the code without naming it
++    literally (a variable, base64, a symlink, ``python -c "open(p,'w')"``), so this MUST NOT be
++    relied on to contain ``run_command``. It exists to hard-deny an obvious PROPOSER-authored
++    self-rewrite and to surface a ⚠ in the human approval preview. The real prevention is OS-level
++    and deferred (see ``code_protection_available``). Matching is a substring test on the
++    separator-normalized command text against each root's POSIX form, so it catches the naive
++    ``python -c "open('/abs/…/collaborator/governance.py','w')"`` and a bare path token alike."""
++    if isinstance(command, (list, tuple)):
++        text = " ".join(str(c) for c in command)
++    else:
++        text = str(command or "")
++    if not text:
++        return ""
++    hay = text.replace("\\", "/")
++    matched: list[str] = []
++    for root in PROTECTED_ROOTS:
++        needle = root.as_posix()
++        if needle and needle in hay and str(root) not in matched:
++            matched.append(str(root))
++    return ",".join(matched)
++
++
++def code_protection_available() -> bool:
++    """Govern-time predictor: does ``run_command`` run with its write-reach to the Collaborator's
++    own code STRUCTURALLY prevented?
++
++    **False in this build.** OS-level prevention (a read-only bind-mount of ``PROTECTED_ROOTS`` in a
++    nested user namespace, or bubblewrap ``--ro-bind``) is a deferred follow-up (the single-level
++    bind is defeatable by the mapped-root child — CVE-2014-5206 / ``MNT_LOCK_READONLY``; see the
++    F-6 plan). While this is False the seam withholds ``run_command`` autonomy so an unprotected
++    shell can never auto-run — it always gets a human hand. When the follow-up lands this becomes a
++    real, cached host probe (mirroring ``netns.netns_available()``), and ``run_command`` earns
++    autonomy on hosts where the read-only bind is verified. Kept as a function (not a constant) so
++    that landing is a one-body change and every call site is already wired."""
++    return False
+diff --git a/collaborator/governance.py b/collaborator/governance.py
+index f9569f2..d7189a7 100644
+--- a/collaborator/governance.py
++++ b/collaborator/governance.py
+@@ -35,6 +35,7 @@ from salienceos.verifier import issue_envelope, issue_receipt
+ from salienceos.verifier.observers import observe_action, snapshot_tree
+ 
+ from collaborator import egress
++from collaborator.codefence import code_protection_available, names_code_root
+ from collaborator.tools import (
+     ACT_THEN_REPORT,
+     NOTIFY_ONLY,
+@@ -121,6 +122,12 @@ class Decision:
+     # ADR 0003 revisit #1: whether a run_command ran network-isolated (netns). None for tools
+     # that are not network-isolable; True/False honestly reflects whether isolation applied.
+     network_isolated: "bool | None" = None
++    # F-6 Harm A: whether a run_command ran with its write-reach to the Collaborator's OWN code
++    # structurally prevented (None = not a code-reaching tool; False until OS-level protection ships).
++    code_protected: "bool | None" = None
++    # F-6 Harm A audit-only tag: the run_command's command literally named a protected code root —
++    # a POROUS recognizer, never a deny; the boundary is structural (see codefence.names_code_root).
++    code_touch: str = ""
+     # ADR 0003 Tier 2 (panel: approved != sent): a seal over a HELD EMISSION's consequential
+     # payload (canonical dest + request target + content-type + body), captured at hold time. An
+     # emission has no verifier, so approval re-checks this seal and REFUSES if the held args were
+@@ -140,6 +147,10 @@ class Decision:
+             tail += f"  ⚑ offense-shape audit: {self.offense_flag}"
+         if self.network_isolated is not None:  # ADR 0003 revisit #1 — honest per-run flag
+             tail += "  🔒 net-isolated" if self.network_isolated else "  ⚠ net NOT isolated (raw reach)"
++        if self.code_protected is not None:  # F-6 Harm A — honest per-run flag
++            tail += "  🔒 code-protected" if self.code_protected else "  ⚠ code NOT protected (unfenced shell)"
++        if self.code_touch:  # F-6 Harm A — audit-only tag (never a deny)
++            tail += f"  ⚑ code-touch audit: {self.code_touch}"
+         if self.status == RAN:
+             out = (self.result.output if self.result else "") or "(no output)"
+             # An egress action is channel-LOGGED, not world-verified (the mediated client both makes
+@@ -328,6 +339,20 @@ def govern_action(session, intent: ToolIntent, importance: "float | None" = None
+                                 "placement here requires explicit approval"),
+                         leash=leash, directive=directive, args=intent.args)
+ 
++    # --- code-root hard-deny for PROPOSER-originated run_command (F-6 Harm A) -
++    # A proposer must NEVER self-originate a shell command targeting the Collaborator's own code
++    # (governance/verifier/…) — the rulebook-rewrite path. Hard-denied outright (like the
++    # controlled-location deny above), not merely floored, because there is no legitimate
++    # proposer-authored reason to rewrite the rules it runs under. Keyed on the model-unforgeable
++    # intent.source == "proposed". POROUS (names_code_root is a literal recognizer, NOT the
++    # boundary) — defence-in-depth over the deferred OS-level structural protection.
++    if (intent.name == "run_command" and getattr(intent, "source", "") == "proposed"
++            and names_code_root(intent.args.get("command"))):
++        return Decision(action_id=action_id, tool=tool.name, status=DENIED,
++                        reason=("the proposer may not self-originate a command targeting the "
++                                "Collaborator's own code"),
++                        leash=leash, directive=directive, args=intent.args)
++
+     # --- EMISSION FLOOR / auto-lift (ADR 0003 Tier 2) ------------------------
+     # A side-effecting egress (net_post) is "acting on the world" — the less-reversible,
+     # un-verifiable channel — so it is HUMAN-GATED by default. It may run autonomously
+@@ -363,6 +388,18 @@ def govern_action(session, intent: ToolIntent, importance: "float | None" = None
+         if not auto:
+             leash = apply_cap(leash, PROPOSE_FIRST)
+ 
++    # --- run_command AUTONOMY-WITHHELD FLOOR (F-6 Harm A) --------------------
++    # run_command has NO filesystem fence: an autonomous shell could overwrite the Collaborator's
++    # own code and neuter F1. Until that write-reach is STRUCTURALLY prevented (an OS-level
++    # read-only bind of the code root — deferred), WITHHOLD autonomy — an act_then_report
++    # run_command floors to propose_first so it can never AUTO-run, only run under a human hand. An
++    # INDEPENDENT, monotonic floor: composes with the emission floor and PR B's (future) network
++    # floor by ANDing (stricter always wins, no shared mutable state); an explicit host tighten
++    # (notify_only) survives, being stricter than the floor.
++    if (intent.name == "run_command" and leash == ACT_THEN_REPORT
++            and not code_protection_available()):
++        leash = apply_cap(leash, PROPOSE_FIRST)
++
+     # --- LEASH (second axis) — ALLOWLIST dispatch (red-team F0) ---------------
+     # Run ONLY on the explicit act_then_report; notify_only notifies; EVERYTHING ELSE (propose_first
+     # and any unrecognised string) fails CLOSED to HELD. The old denylist ran on the `else` branch,
+@@ -401,6 +438,14 @@ def govern_action(session, intent: ToolIntent, importance: "float | None" = None
+                "verification_depth": directive.verification_depth}
+     if getattr(tool, "egress", False):
+         preview["canonical_dest"] = egress.canonical_host(str(intent.args.get("url") or ""))
++    if intent.name == "run_command":
++        # Surface the honest code-protection posture + any literal self-code reference to the human
++        # who holds the hand on this shell (F-6 Harm A). code_protection_available() is False in this
++        # build, so this reads "not protected" — the honest state until OS-level protection lands.
++        preview["code_protected"] = code_protection_available()
++        _named = names_code_root(intent.args.get("command"))
++        if _named:
++            preview["names_code_root"] = _named
+     reason = ("propose-first leash: awaiting approval" if leash == PROPOSE_FIRST
+               else f"unrecognised leash {leash!r} -> held (fail-closed)")
+     return Decision(action_id=action_id, tool=tool.name, status=HELD, reason=reason, leash=leash,
+@@ -546,17 +591,19 @@ def execute_and_verify(session, tool: Tool, directive, action_id: str, args: dic
+     # can't be narrated as success.
+     if tool.verify_mode == "exit":
+         offense_flag = flag_offense_shape(tool.name, args)  # audit-only tag, never a deny
++        code_touch = names_code_root(args.get("command"))   # F-6 audit-only tag (porous), never a deny
+         try:
+             execution = execute_tool(tool, session.workspace, args)
+         except WorkspaceError as exc:
+             return Decision(action_id, tool.name, DENIED, str(exc), leash, directive=directive,
+-                            args=args, offense_flag=offense_flag)
++                            args=args, offense_flag=offense_flag, code_touch=code_touch)
+         cleared = bool(execution.result.ok)
+         return Decision(action_id, tool.name, RAN if cleared else FAILED,
+                         "supervised exit 0" if cleared else f"exit {execution.exit_code}",
+                         leash, cleared=cleared, result=execution.result, directive=directive,
+                         args=args, offense_flag=offense_flag,
+-                        network_isolated=execution.network_isolated)
++                        network_isolated=execution.network_isolated,
++                        code_protected=execution.code_protected, code_touch=code_touch)
+ 
+     # verify_mode == "artifact": build envelope BEFORE running, snapshot, execute
+     # receipt from the REAL result, observe world independently, govern.
+diff --git a/collaborator/loop.py b/collaborator/loop.py
+index 8052ced..0ddbfd3 100644
+--- a/collaborator/loop.py
++++ b/collaborator/loop.py
+@@ -23,6 +23,7 @@ from collaborator.governance import (
+     govern_action,
+     reauthorized_or_denied,
+ )
++from collaborator.codefence import names_code_root
+ from collaborator.toolcall import ToolIntent, parse_message
+ from collaborator.tools import ACT_THEN_REPORT, get_tool, is_controlled_location
+ 
+@@ -166,6 +167,18 @@ def approve(session, decision: Decision) -> Decision:
+                         "controlled location: proposer placement re-denied at approval",
+                         decision.leash, directive=decision.directive, args=args,
+                         origin=decision.origin)
++    # F-6 Harm A: re-assert the code-root deny at the MOMENT OF USE for a COLLABORATOR-originated
++    # held run_command. A proposer can never *originate* one naming the code root (denied at govern
++    # time), so a held collaborator run_command that now names it can only have been mutated after
++    # origination — refuse, don't consume. A user-directed command (origin != "collaborator") is
++    # the human's to approve. POROUS DiD (names_code_root is not the boundary), symmetric with the
++    # controlled-location re-deny above.
++    if (decision.origin == "collaborator" and decision.tool == "run_command"
++            and names_code_root(args.get("command"))):
++        return Decision(decision.action_id, decision.tool, DENIED,
++                        "code root: proposer-authored command re-denied at approval",
++                        decision.leash, directive=decision.directive, args=args,
++                        origin=decision.origin)
+     decision.consumed = True     # claim it before running, so no concurrent/second path re-runs
+     # human_gated=True: this IS the human-approval path, so the emission keeps a bounded body preview
+     # regardless of how a signed cap rewrote the recorded leash (ADR 0003 Tier 2; red-team F3). The
+diff --git a/collaborator/session.py b/collaborator/session.py
+index bca8c4c..239ca6a 100644
+--- a/collaborator/session.py
++++ b/collaborator/session.py
+@@ -48,6 +48,13 @@ class Session:
+         egress_credentials=None,
+     ) -> None:
+         self.workspace = Path(workspace)
++        # F-6 Harm A: the workspace must be DISJOINT from the Collaborator's own code root
++        # (collaborator/ + salienceos/), both directions. Fail LOUD at construction — the fenced
++        # write_file/read_file already can't escape the workspace, so a disjoint workspace means
++        # they can never name the code, and a governed shell has no in-workspace path to the rules
++        # it runs under. See collaborator/codefence.py.
++        from collaborator.codefence import disjoint_from_code
++        disjoint_from_code(self.workspace)
+         self.capabilities = tuple(capabilities)
+         # ③ optional SIGNED authority grant. When present, the VERIFIED caps are
+         # authoritative (the mutable .capabilities above cannot widen them) and each
+diff --git a/collaborator/tools.py b/collaborator/tools.py
+index e6e232a..bf8bc78 100644
+--- a/collaborator/tools.py
++++ b/collaborator/tools.py
+@@ -1,10 +1,22 @@
+ """The Collaborator's small, honest, workspace-fenced toolset.
+ 
+-Every tool is confined to a declared workspace root. The Collaborator's own wiring
+-(its config, policy key, audit trail) lives OUTSIDE that root, so a governed tool
+-can never rewrite the rules it runs under (panel gap #1). Paths are resolved and
+-containment-checked BEFORE execution (defence in depth — the verifier's observers
+-also fail closed on an escaping path, but we refuse to even run one).
++``write_file``/``read_file`` are confined to a declared workspace root: paths are resolved and
++containment-checked BEFORE execution (defence in depth — the verifier's observers also fail closed
++on an escaping path, but we refuse to even run one). The Collaborator's own wiring (its config,
++policy key, audit trail, and CODE) lives OUTSIDE that root — enforced for the workspace by
++``codefence.disjoint_from_code`` — so a FENCED tool can never rewrite the rules it runs under.
++
++``run_command`` is the honest exception: it has NO filesystem fence (a shell may write anywhere,
++which is exactly what system maintenance NEEDS). So a governed shell COULD, unfenced, overwrite the
++Collaborator's own code and neuter F1 — the rulebook-rewrite path (red-team F-6 "Harm A"). Two
++cross-platform layers bound that today: a PROPOSER may never self-originate a ``run_command`` naming
++the code root (hard-denied in the seam), and ``run_command`` AUTONOMY is WITHHELD until its
++write-reach to the code is structurally prevented (``codefence.code_protection_available`` — False
++in this build), so an unfenced shell can never AUTO-run; it always gets a human hand, who sees a
++``⚠ code NOT protected`` flag. The STRUCTURAL guarantee for a human-APPROVED ``run_command`` (an
++OS-level read-only bind of the code, or a separate maintenance trust domain) is a deferred
++follow-up — until it lands, the "can never rewrite the rules" claim holds for ``write_file``, not
++for an approved ``run_command``. See ``collaborator/codefence.py``.
+ 
+ Mutating tools run under the verifier's supervisor (``run_supervised``) so the
+ world can be observed independently of what the tool reports — the basis for the
+@@ -28,6 +40,7 @@ from salienceos.verifier.observers import SupervisedResult, run_supervised
+ from salienceos.verifier.signing import sha256_bytes
+ 
+ from collaborator import egress
++from collaborator.codefence import code_protection_available
+ from collaborator.netns import isolation_unverified, wrap_no_network
+ 
+ COLLABORATOR_TOOLS_VERSION = "0.1.0"
+@@ -88,6 +101,9 @@ class Execution:
+     egress: "egress.EgressRecord | None" = None  # ADR 0003: channel-integrity audit of a net.get
+     network_isolated: "bool | None" = None  # ADR 0003 revisit #1: run_command ran in a netns
+                                             # (None = not a network-isolable tool)
++    code_protected: "bool | None" = None  # F-6 Harm A: run_command ran with its write-reach to the
++                                          # Collaborator's OWN code structurally prevented (None =
++                                          # not a code-reaching tool; False until OS protection ships)
+ 
+ 
+ _TOOLS: dict[str, Tool] = {
+@@ -291,6 +307,9 @@ def _exec_command(workspace, args: dict) -> Execution:
+         supervised=res, exit_code=res.returncode,
+         write_set=(),  # nothing declared; observe_action's write-set diff catches undeclared writes
+         artifact_hashes={}, network_isolated=isolated,
++        # F-6 Harm A: honest — False until the OS-level read-only-bind protection lands. While False
++        # the seam withholds run_command autonomy, so an unfenced shell never AUTO-runs.
++        code_protected=code_protection_available(),
+     )
+ 
+ 
+diff --git a/tests/test_collaborator_codefence.py b/tests/test_collaborator_codefence.py
+new file mode 100644
+index 0000000..01e8c0f
+--- /dev/null
++++ b/tests/test_collaborator_codefence.py
+@@ -0,0 +1,161 @@
++"""F-6 "Harm A" — the Collaborator's own code as an un-rewritable rulebook (cheap cross-platform).
++
++Pins the layers that stop a governed shell from rewriting the rules it runs under, WITHOUT
++hard-fencing run_command (which would kill system maintenance):
++
++* the code-root model (collaborator/ + salienceos/) + the workspace ⟂ code disjointness guard,
++* the POROUS recognizer (names_code_root) — explicitly NOT a boundary (negative cases encode that),
++* the proposer hard-deny + the approve-time re-deny,
++* the run_command AUTONOMY-WITHHELD floor (an unfenced shell can never AUTO-run) + honest flag.
++
++The STRUCTURAL guarantee for a human-APPROVED run_command (an OS-level read-only bind) is a deferred
++follow-up; here code_protection_available() is False, so autonomy is withheld everywhere.
++"""
++
++import sys
++import tempfile
++import unittest
++from pathlib import Path
++from unittest.mock import patch
++
++from collaborator import codefence
++from collaborator.governance import DENIED, HELD, RAN, govern_action
++from collaborator.loop import approve
++from collaborator.session import Session
++from collaborator.toolcall import ToolIntent
++from collaborator.tools import ACT_THEN_REPORT, PROPOSE_FIRST
++
++
++def _shell_session(tmp, **kw):
++    return Session(workspace=tmp, capabilities=("fs.read:project", "fs.write:project", "shell.exec"), **kw)
++
++
++# The collaborator/ package dir — a real protected root, resolved at import.
++_ROOT = codefence.PROTECTED_ROOTS[0]
++
++
++class CodeRootModel(unittest.TestCase):
++    def test_protected_roots_cover_both_packages_and_are_real_dirs(self):
++        self.assertTrue(codefence.PROTECTED_ROOTS, "expected at least the collaborator/ root")
++        names = {p.name for p in codefence.PROTECTED_ROOTS}
++        self.assertIn("collaborator", names)
++        self.assertIn("salienceos", names)  # the F1 guarantee spans the core too
++        for p in codefence.PROTECTED_ROOTS:
++            self.assertTrue(p.is_dir())
++            self.assertTrue(p.is_absolute())
++
++    def test_protection_is_unavailable_in_this_build(self):
++        # OS-level prevention is deferred; while False the seam withholds run_command autonomy.
++        self.assertFalse(codefence.code_protection_available())
++
++
++class DisjointnessGuard(unittest.TestCase):
++    def test_tempdir_is_disjoint(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            codefence.disjoint_from_code(tmp)  # must not raise
++
++    def test_workspace_equal_to_code_root_is_refused(self):
++        with self.assertRaises(codefence.WorkspaceOverlapsCodeError):
++            codefence.disjoint_from_code(_ROOT)
++
++    def test_workspace_inside_code_root_is_refused(self):
++        with self.assertRaises(codefence.WorkspaceOverlapsCodeError):
++            codefence.disjoint_from_code(_ROOT / "nested" / "ws")
++
++    def test_workspace_containing_code_root_is_refused(self):
++        # the repo root CONTAINS collaborator/ + salienceos/ — a shell there could reach the code
++        with self.assertRaises(codefence.WorkspaceOverlapsCodeError):
++            codefence.disjoint_from_code(_ROOT.parent)
++
++    def test_session_construction_refuses_overlap(self):
++        # a ValueError (WorkspaceOverlapsCodeError subclasses it) — fails LOUD at construction
++        with self.assertRaises(ValueError):
++            Session(workspace=str(_ROOT))
++
++
++class NamesCodeRootRecognizer(unittest.TestCase):
++    """POROUS defence-in-depth — the negative cases ENCODE that it is not the boundary."""
++
++    def test_matches_absolute_code_root_token_in_list(self):
++        cmd = ["python", "-c", f"open('{(_ROOT / 'governance.py').as_posix()}','w')"]
++        self.assertIn(str(_ROOT), codefence.names_code_root(cmd))
++
++    def test_matches_in_string_command(self):
++        cmd = f"echo x > {(_ROOT / 'tools.py').as_posix()}"
++        self.assertTrue(codefence.names_code_root(cmd))
++
++    def test_benign_command_not_matched(self):
++        self.assertEqual(codefence.names_code_root(["echo", "hello"]), "")
++        self.assertEqual(codefence.names_code_root(""), "")
++        self.assertEqual(codefence.names_code_root(None), "")
++
++    def test_porous_dynamic_construction_is_NOT_caught(self):
++        # A shell that builds the path at runtime (a var, no literal root substring) sails past —
++        # which is exactly why this is DiD and code_protection_available() (OS prevention) is the
++        # real boundary. This test PINS the porousness so nobody mistakes the recognizer for a fence.
++        self.assertEqual(codefence.names_code_root(["sh", "-c", 'd=/some/base; printf x > "$d/x"']), "")
++
++
++class GovernSlot(unittest.TestCase):
++    def test_proposer_command_naming_code_root_is_hard_denied(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            s = _shell_session(tmp)
++            d = govern_action(s, ToolIntent(
++                "run_command", {"command": ["echo", str(_ROOT / "governance.py")]}, "proposed"))
++            self.assertEqual(d.status, DENIED)
++            self.assertIn("own code", d.reason)
++
++    def test_user_directed_command_naming_code_root_is_not_denied_by_this_rule(self):
++        # maintenance preserved: a user/host-directed command naming the code root is NOT hard-denied
++        # (only the PROPOSER floor is); it is HELD by the autonomy floor and runs under a human hand.
++        with tempfile.TemporaryDirectory() as tmp:
++            s = _shell_session(tmp)
++            held = govern_action(s, ToolIntent(
++                "run_command", {"command": ["echo", str(_ROOT / "governance.py")]}, "structured"))
++            self.assertEqual(held.status, HELD)
++            self.assertNotEqual(held.status, DENIED)
++            d = approve(s, held)          # the human hand: echo runs (not re-denied for user origin)
++            self.assertEqual(d.status, RAN)
++
++    def test_autonomy_is_withheld_for_act_then_report(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            s = _shell_session(tmp, leash_overrides={"run_command": ACT_THEN_REPORT})
++            held = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "structured"))
++            self.assertEqual(held.status, HELD)              # floored — never auto-runs
++            self.assertEqual(held.leash, PROPOSE_FIRST)
++            self.assertIs(held.preview.get("code_protected"), False)  # honest posture in the preview
++
++    def test_held_preview_surfaces_named_code_root(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            s = _shell_session(tmp)
++            held = govern_action(s, ToolIntent(
++                "run_command", {"command": ["echo", str(_ROOT / "x.py")]}, "structured"))
++            self.assertEqual(held.status, HELD)
++            self.assertIn(str(_ROOT), held.preview.get("names_code_root", ""))
++
++    def test_executed_run_command_flag_is_honest(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            s = _shell_session(tmp)
++            held = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "structured"))
++            d = approve(s, held)
++            self.assertEqual(d.status, RAN)
++            self.assertIs(d.code_protected, False)               # never a silent claim of protection
++            self.assertIn("code NOT protected", d.summary())
++
++    def test_approve_re_denies_a_mutated_collaborator_command(self):
++        # a held COLLABORATOR-origin run_command mutated after origination to name the code root is
++        # refused at the moment of use (symmetric with the controlled-location re-deny), not consumed.
++        with tempfile.TemporaryDirectory() as tmp:
++            s = _shell_session(tmp)
++            held = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "structured"))
++            self.assertEqual(held.status, HELD)
++            held.origin = "collaborator"                         # as if a proposer raised the hold
++            held.args["command"] = ["echo", str(_ROOT / "governance.py")]  # mutated post-origination
++            d = approve(s, held)
++            self.assertEqual(d.status, DENIED)
++            self.assertIn("code root", d.reason)
++            self.assertFalse(held.consumed)                      # retryable, not burned
++
++
++if __name__ == "__main__":
++    sys.exit(unittest.main())
+diff --git a/tests/test_collaborator_governance.py b/tests/test_collaborator_governance.py
+index 58a4901..bb4d1c2 100644
+--- a/tests/test_collaborator_governance.py
++++ b/tests/test_collaborator_governance.py
+@@ -90,7 +90,12 @@ class HonestFailure(unittest.TestCase):
+         with tempfile.TemporaryDirectory() as tmp:
+             s = _session(tmp, caps=("fs.read:project", "fs.write:project", "shell.exec"),
+                          leash_overrides={"run_command": "act_then_report"})
+-            d = govern_action(s, ToolIntent("run_command", {"command": [sys.executable, "-c", "import sys;sys.exit(3)"]}, "structured"))
++            held = govern_action(s, ToolIntent("run_command", {"command": [sys.executable, "-c", "import sys;sys.exit(3)"]}, "structured"))
++            # F-6 Harm A: run_command autonomy is withheld until code protection is verified, so an
++            # act_then_report shell is HELD (not auto-run). The human hand approves; the honest exit
++            # code still drives the result — which is the point of THIS test.
++            self.assertEqual(held.status, HELD)
++            d = approve(s, held)
+             self.assertEqual(d.status, FAILED)  # real exit code drives the honest result
+             self.assertFalse(d.cleared)
+ 
+diff --git a/tests/test_collaborator_staging.py b/tests/test_collaborator_staging.py
+index 8f6c853..8613c6e 100644
+--- a/tests/test_collaborator_staging.py
++++ b/tests/test_collaborator_staging.py
+@@ -17,6 +17,7 @@ import os
+ import tempfile
+ import unittest
+ from pathlib import Path
++from unittest.mock import patch
+ 
+ from collaborator.governance import DENIED, HELD, RAN, govern_action
+ from collaborator.loop import approve
+@@ -314,9 +315,19 @@ class ProposerShellAndApproveGates(unittest.TestCase):
+             d = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "proposed"))
+             self.assertEqual(d.leash, PROPOSE_FIRST)
+             self.assertEqual(d.status, HELD)
+-            # a user-directed command keeps the host's chosen leash (unaffected)
+-            d2 = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "structured"))
+-            self.assertEqual(d2.leash, ACT_THEN_REPORT)
++            # F-6 Harm A: run_command autonomy is UNIVERSALLY withheld while code protection is
++            # unavailable, so a user-directed act_then_report shell is ALSO floored to propose_first.
++            d_user = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "structured"))
++            self.assertEqual(d_user.leash, PROPOSE_FIRST)
++            self.assertEqual(d_user.status, HELD)
++            # The PROPOSER floor is additionally proposer-SPECIFIC: with code protection available (so
++            # the autonomy floor stands down), a user-directed command keeps ACT_THEN_REPORT while a
++            # proposer-originated one is STILL floored to propose_first.
++            with patch("collaborator.governance.code_protection_available", return_value=True):
++                d2 = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "structured"))
++                self.assertEqual(d2.leash, ACT_THEN_REPORT)
++                d3 = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "proposed"))
++                self.assertEqual(d3.leash, PROPOSE_FIRST)
+ 
+     def test_approve_re_denies_a_mutated_controlled_path(self):
+         # grok F2: a held collaborator proposal whose path is mutated into a controlled tree after
