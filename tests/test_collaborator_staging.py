@@ -320,10 +320,14 @@ class ProposerShellAndApproveGates(unittest.TestCase):
             d_user = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "structured"))
             self.assertEqual(d_user.leash, PROPOSE_FIRST)
             self.assertEqual(d_user.status, HELD)
-            # The PROPOSER floor is additionally proposer-SPECIFIC: with code protection available (so
-            # the autonomy floor stands down), a user-directed command keeps ACT_THEN_REPORT while a
-            # proposer-originated one is STILL floored to propose_first.
-            with patch("collaborator.governance.code_protection_available", return_value=True):
+            # The PROPOSER floor is additionally proposer-SPECIFIC: with BOTH autonomy floors stood
+            # down — code protection available (Harm A) AND network isolation available (ADR 0003
+            # revisit #1a; netns is unavailable on this dev host, so patch it) — a user-directed
+            # command keeps ACT_THEN_REPORT while a proposer-originated one is STILL floored to
+            # propose_first. (The two floors are orthogonal; isolating the proposer floor requires
+            # neutralising both.)
+            with patch("collaborator.governance.code_protection_available", return_value=True), \
+                 patch("collaborator.governance.netns_available", return_value=True):
                 d2 = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "structured"))
                 self.assertEqual(d2.leash, ACT_THEN_REPORT)
                 d3 = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "proposed"))

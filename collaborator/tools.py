@@ -27,6 +27,7 @@ says so (never a fabricated success).
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shlex
@@ -165,6 +166,83 @@ def flag_offense_shape(name: str, args: dict) -> str:
     return ",".join(sorted(tokens & _OFFENSE_TOKENS))
 
 
+# The tools whose held approval is bound to an integrity seal (MINOR-B). SINGLE SOURCE OF TRUTH —
+# `held_action_seal` seals exactly these, and `loop.approve()` verifies exactly these. Deriving both
+# from one frozenset removes the two-hand-maintained-list drift that would otherwise be a silent
+# fail-open (a tool that gains a seal branch but is missing from the approve-time check would have a
+# seal MINTED but NEVER verified). Same lesson as codefence's `_code_slots()` single source (PR #35).
+SEALED_TOOLS = frozenset({"run_command", "write_file"})
+
+
+def held_action_seal(tool_name: str, args: dict) -> str:
+    """A stable digest binding a HELD run_command / write_file to the EXACT consequential args the
+    human saw at hold time, so ``approve()`` can REFUSE a payload mutated after origination — the
+    by-reference-mutation (TOCTOU) vector ``egress.emission_seal`` closes for net_post, now closed
+    UNIFORMLY for the other unbounded-reach tools (MINOR-B). run_command's exit-code check and
+    write_file's artifact verifier do NOT catch arg substitution (both re-derive from the SAME
+    mutated args), so this seal — over a FROZEN payload (see ``freeze_args``) — is the actual
+    approved==executed binding for these tools, not mere DiD. Returns "" for any tool not in
+    ``SEALED_TOOLS`` (read_file; the egress tools, which seal via ``emission_seal`` instead).
+
+    Framing mirrors ``emission_seal``: every field is LENGTH-PREFIXED (8-byte big-endian) so the
+    encoding is injective — no boundary shift can move bytes between fields and collide two distinct
+    actions to one seal. A leading TYPE TAG distinguishes shapes that EXECUTE differently (a string
+    command that ``_exec_command`` shlex-splits vs. a pre-split argv list) so they never seal alike;
+    ``surrogatepass`` keeps a lone-surrogate arg SEALABLE at hold time (validity is the executor's
+    job — the seal only needs consistency between hold and approve). Each field is coerced to str
+    EXACTLY as its executor will (``_exec_command`` / ``_exec_write``), so seal == what runs."""
+    if tool_name not in SEALED_TOOLS:
+        return ""
+    if tool_name == "run_command":
+        cmd = args.get("command")
+        if isinstance(cmd, (list, tuple)):
+            parts = [b"L"] + [str(c).encode("utf-8", "surrogatepass") for c in cmd]
+        elif isinstance(cmd, str):
+            parts = [b"S", cmd.encode("utf-8", "surrogatepass")]
+        else:
+            parts = [b"N"]  # None / other -> the executor refuses; seal a stable non-empty marker
+    else:  # write_file — the only other member of SEALED_TOOLS
+        parts = [b"W",
+                 str(args.get("path") or "").encode("utf-8", "surrogatepass"),
+                 str(args.get("content") or "").encode("utf-8", "surrogatepass")]
+    h = hashlib.sha256()
+    # Bind the TOOL IDENTITY into the seal as its first field (external panel / grok), so a
+    # Decision.tool rebind cannot replay one tool's sealed args as a different tool's action.
+    for part in [tool_name.encode("utf-8"), *parts]:
+        h.update(len(part).to_bytes(8, "big"))
+        h.update(part)
+    return h.hexdigest()
+
+
+def freeze_args(args: dict) -> dict:
+    """Return a shallow copy of ``args`` with its mutable CONSEQUENTIAL values made IMMUTABLE, so a
+    HELD action's payload cannot be swapped by reference between the moment the human sees/approves it
+    and the moment it runs — making ``approved == executed`` a STRUCTURAL property rather than a
+    digest re-check over a shared object (red-team: a shallow ``dict(args)`` still shares the
+    ``command`` LIST, and a concurrent / in-chain holder can mutate it in place after the seal check).
+    A ``run_command`` ``command`` list -> a str tuple (str() is evaluated ONCE here and frozen, so a
+    hostile ``__str__`` cannot return different bytes to the seal and the executor); a bytes-like
+    ``body`` -> ``bytes``. Everything else (str path/content/url, scalars) is already immutable. The
+    frozen forms seal and EXECUTE identically to the originals (``held_action_seal`` and
+    ``_exec_command`` both treat list/tuple alike; ``egress.post`` accepts bytes)."""
+    frozen = dict(args)
+    cmd = frozen.get("command")
+    if isinstance(cmd, (list, tuple)):
+        frozen["command"] = tuple(str(c) for c in cmd)
+    body = frozen.get("body")
+    if isinstance(body, (bytes, bytearray)):
+        frozen["body"] = bytes(body)
+    # write_file's path/content are usually str (immutable), but a JSON tool call can supply a list
+    # (e.g. "content": ["x"]) — a shared mutable — or a str SUBCLASS with a drifting __str__. Coerce
+    # UNCONDITIONALLY (str() on an exact str returns the same object, so it's free), EXACTLY as
+    # _exec_write will (str(x or "")), so the frozen value both seals and writes identically and no
+    # in-window mutation (including a subclass __str__ re-evaluated later) can reach the disk.
+    for key in ("path", "content"):
+        if key in frozen:
+            frozen[key] = str(frozen[key] or "")
+    return frozen
+
+
 def get_tool(name: str) -> "Tool | None":
     return _TOOLS.get(name)
 
@@ -280,7 +358,7 @@ def _exec_read(workspace, args: dict) -> Execution:
     return Execution(result=ToolResult(ok=True, output=target.read_text(encoding="utf-8", errors="replace")))
 
 
-def _exec_command(workspace, args: dict) -> Execution:
+def _exec_command(workspace, args: dict, *, require_isolation: bool = False) -> Execution:
     cmd = args.get("command")
     if isinstance(cmd, str):
         argv = shlex.split(cmd)
@@ -294,6 +372,15 @@ def _exec_command(workspace, args: dict) -> Execution:
     # a raw socket / curl / git can't egress — web_fetch (the mediated client) is the sole path
     # off the machine. Fails closed to unisolated + a False flag where netns is unavailable.
     run_argv, isolated = wrap_no_network(argv)
+    # ADR 0003 revisit #1a: when the caller REQUIRES isolation (an autonomous, un-opted-in shell) but
+    # this host cannot verifiably provide it, REFUSE to run — bind the run to the ACTUAL isolation
+    # result, not a govern-time belief (red-team F3). Prevention: the command never starts, so no raw
+    # egress can occur. A human-approved run or a signed raw-reach opt-in sets require_isolation False.
+    if require_isolation and not isolated:
+        return Execution(
+            result=ToolResult(ok=False,
+                              error="network isolation required but unavailable on this host — not run"),
+            network_isolated=False, code_protected=code_protection_available())
     res = run_supervised(run_argv, cwd=workspace)
     # If the per-run guard tripped (child was NOT in a fresh netns), the command did not run — no
     # egress — and we correct the flag to False so it never falsely claims isolation (red-team).
@@ -394,12 +481,16 @@ _EXECUTORS = {"write_file": _exec_write, "read_file": _exec_read,
 
 
 def execute_tool(tool: Tool, workspace, args: dict, *, egress_preview: bool = False,
-                 egress_auth: "str | None" = None) -> Execution:
+                 egress_auth: "str | None" = None, require_isolation: bool = False) -> Execution:
     """Run a resolved tool. Raises WorkspaceError on an escaping path (the caller turns that into
     a DENY); other failures come back as ``ok=False`` results. ``egress_preview``/``egress_auth``
     are host-side values the governance seam threads for net_post ONLY (the audit-preview flag and
     the host-injected credential); every other tool ignores them, so the model can never reach
-    them through ``args``."""
+    them through ``args``. ``require_isolation`` is threaded to run_command ONLY: when True the shell
+    REFUSES to run unless verified netns isolation is achieved (ADR 0003 #1a — an autonomous,
+    un-opted-in shell can never egress raw)."""
     if tool.name == "net_post":
         return _exec_net_post(workspace, args, keep_preview=egress_preview, auth=egress_auth)
+    if tool.name == "run_command":
+        return _exec_command(workspace, args, require_isolation=require_isolation)
     return _EXECUTORS[tool.name](workspace, args)

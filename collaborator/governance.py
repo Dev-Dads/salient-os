@@ -36,6 +36,7 @@ from salienceos.verifier.observers import observe_action, snapshot_tree
 
 from collaborator import egress
 from collaborator.codefence import code_protection_available, names_code_root
+from collaborator.netns import SHELL_RAW_NETWORK_CAP, netns_available
 from collaborator.tools import (
     ACT_THEN_REPORT,
     NOTIFY_ONLY,
@@ -45,7 +46,9 @@ from collaborator.tools import (
     WorkspaceError,
     execute_tool,
     flag_offense_shape,
+    freeze_args,
     get_tool,
+    held_action_seal,
     is_controlled_location,
     resolve_in_workspace,
 )
@@ -393,11 +396,31 @@ def govern_action(session, intent: ToolIntent, importance: "float | None" = None
     # own code and neuter F1. Until that write-reach is STRUCTURALLY prevented (an OS-level
     # read-only bind of the code root — deferred), WITHHOLD autonomy — an act_then_report
     # run_command floors to propose_first so it can never AUTO-run, only run under a human hand. An
-    # INDEPENDENT, monotonic floor: composes with the emission floor and PR B's (future) network
-    # floor by ANDing (stricter always wins, no shared mutable state); an explicit host tighten
-    # (notify_only) survives, being stricter than the floor.
+    # INDEPENDENT, monotonic floor: composes with the emission floor and the isolation-earns-autonomy
+    # network floor below by ANDing (stricter always wins, no shared mutable state); an explicit host
+    # tighten (notify_only) survives, being stricter than the floor.
     if (intent.name == "run_command" and leash == ACT_THEN_REPORT
             and not code_protection_available()):
+        leash = apply_cap(leash, PROPOSE_FIRST)
+
+    # --- run_command ISOLATION-EARNS-AUTONOMY FLOOR (ADR 0003 revisit #1a) ----
+    # run_command's raw network reach is isolated (netns) ONLY on Linux with VERIFIED netns. Where
+    # isolation is unavailable/unverifiable, an UNATTENDED shell would reach the network raw — so the
+    # autonomy that isolation would earn is WITHHELD: an act_then_report run_command floors to a human
+    # hand unless a signed, default-deny opt-in (shell.raw_network) explicitly accepts raw reach on
+    # this host. An INDEPENDENT, monotonic floor ORTHOGONAL to the code floor above (code protection
+    # != network isolation — they gate different reach), composing by ANDing (stricter always wins,
+    # no shared mutable state). NOTE: while the code floor withholds run_command autonomy
+    # unconditionally (OS code-protection deferred -> code_protection_available() is False), this
+    # floor is BEHAVIOR-MASKED — it is the pre-wired second axis that becomes live the moment code
+    # protection lands and lifts the code floor on a capable host. Tested in isolation by patching
+    # code_protection_available()=True.
+    # The raw-reach opt-in must be a SIGNED grant (enforced), never mutable session.capabilities —
+    # the same F5 rule the emission auto-lift follows: the highest-stakes "let this run raw
+    # unattended" signal can't rest on a legacy attribute a runtime widen could flip (red-team F1).
+    if (intent.name == "run_command" and leash == ACT_THEN_REPORT
+            and not netns_available()
+            and not (enforced(session) and directive.grants_capability(SHELL_RAW_NETWORK_CAP))):
         leash = apply_cap(leash, PROPOSE_FIRST)
 
     # --- LEASH (second axis) — ALLOWLIST dispatch (red-team F0) ---------------
@@ -425,31 +448,47 @@ def govern_action(session, intent: ToolIntent, importance: "float | None" = None
                         reason=reason, leash=leash, directive=directive,
                         args=intent.args, offense_flag=offense_flag)
     # PROPOSE_FIRST or any unrecognised leash -> HELD (awaiting a human hand).
-    # Seal a HELD EMISSION's consequential payload now, while it is exactly what the human is about
-    # to be shown — approval re-checks it so a later mutation of the (by-reference) args cannot
-    # change the destination/body that actually gets sent (Tier 2 has no verifier).
-    seal = (egress.emission_seal(str(intent.args.get("url") or ""), intent.args.get("body"),
-                                 str(intent.args.get("content_type") or ""))
-            if (getattr(tool, "egress", False) and tool.mutating) else "")
+    # FREEZE the consequential payload ONCE now, so the args the human is shown, the args the seal
+    # digests, and the args the executor runs are ONE immutable mapping — a shared-by-reference list
+    # command (or bytes-like body) can't be swapped between the human's view/approval and the run
+    # (red-team: approved != executed via an in-place list mutation). approved==executed is then
+    # STRUCTURAL; the seal below is the belt that also catches a whole-key REASSIGNMENT.
+    args = freeze_args(intent.args)
+    # Seal a HELD action's consequential payload — approval re-checks it so a mutation cannot change
+    # what actually gets sent/run. For an EMISSION the seal is mandatory (Tier 2 has no verifier);
+    # for run_command / write_file it is the approved==executed binding (their verifiers re-derive
+    # from the same args, so they do NOT catch substitution). Other tools -> "" (nothing to bind).
+    if getattr(tool, "egress", False) and tool.mutating:
+        seal = egress.emission_seal(str(args.get("url") or ""), args.get("body"),
+                                    str(args.get("content_type") or ""))
+    else:
+        seal = held_action_seal(tool.name, args)
     # Surface the CANONICAL destination for an egress action, so the one human hand on an emission
     # reads the host bytes actually leave for — not the raw model string, which canonicalization may
-    # quietly rewrite (soft hyphen, ideographic dot; transport red-team M6).
-    preview = {"tool": tool.name, "args": intent.args,
+    # quietly rewrite (soft hyphen, ideographic dot; transport red-team M6). The preview shows the
+    # FROZEN args, so what the human reads is exactly what a later approval will run.
+    preview = {"tool": tool.name, "args": args,
                "verification_depth": directive.verification_depth}
     if getattr(tool, "egress", False):
-        preview["canonical_dest"] = egress.canonical_host(str(intent.args.get("url") or ""))
+        preview["canonical_dest"] = egress.canonical_host(str(args.get("url") or ""))
     if intent.name == "run_command":
         # Surface the honest code-protection posture + any literal self-code reference to the human
         # who holds the hand on this shell (F-6 Harm A). code_protection_available() is False in this
         # build, so this reads "not protected" — the honest state until OS-level protection lands.
         preview["code_protected"] = code_protection_available()
-        _named = names_code_root(intent.args.get("command"))
+        _named = names_code_root(args.get("command"))
         if _named:
             preview["names_code_root"] = _named
+        # ADR 0003 revisit #1a: whether this shell will run with RAW network reach (no netns
+        # isolation on this host) — the honest posture the approving human sees. LIVE off-Linux
+        # (netns_available() is False), independent of whether the raw-reach opt-in was granted:
+        # the reach is raw either way; the opt-in only governs whether it may AUTO-run.
+        if not netns_available():
+            preview["raw_network"] = True
     reason = ("propose-first leash: awaiting approval" if leash == PROPOSE_FIRST
               else f"unrecognised leash {leash!r} -> held (fail-closed)")
     return Decision(action_id=action_id, tool=tool.name, status=HELD, reason=reason, leash=leash,
-                    directive=directive, args=intent.args, offense_flag=offense_flag,
+                    directive=directive, args=args, offense_flag=offense_flag,
                     seal=seal, preview=preview, origin_subject=_subject(session))
 
 
@@ -537,6 +576,24 @@ def execute_and_verify(session, tool: Tool, directive, action_id: str, args: dic
     if leash == NOTIFY_ONLY:
         return Decision(action_id, tool.name, NOTIFIED,
                         "notify-only leash — not executed", leash, directive=directive, args=args)
+    # ADR 0003 revisit #1a + F-6 Harm A — re-assert the run_command autonomy floors at the MOMENT OF
+    # USE (defence in depth, red-team F3/N1/N2): govern_action already withholds these, but binding
+    # them AT EXECUTION means no path — a direct internal caller, a future refactor — reaches a raw or
+    # unprotected autonomous run. Keyed on `not human_gated` (an AUTONOMOUS execution), NOT the leash
+    # string, so a propose_first-with-human_gated=False caller can't slip one notch over (N1). A
+    # human-approved run is the human's call, unaffected.
+    require_isolation = False
+    if tool.name == "run_command" and not human_gated:
+        # CODE floor: never AUTO-run a shell whose write-reach to its own code is unprevented —
+        # symmetric with the network floor below, and the floor doing all the work today (N2).
+        if not code_protection_available():
+            return Decision(action_id, tool.name, DENIED,
+                            "autonomous shell withheld at execution: code protection unavailable",
+                            leash, directive=directive, args=args)
+        # NETWORK floor: require ACTUAL isolation unless signed-opted-in. Threaded to the executor,
+        # which REFUSES to run when it cannot isolate — so the guarantee is bound to the executor's
+        # real isolation result (execution.network_isolated), not the govern-time belief (F3).
+        require_isolation = not (enforced(session) and directive.grants_capability(SHELL_RAW_NETWORK_CAP))
     # Read-only: gate already passed; execute and report (nothing is mutated).
     if tool.verify_mode == "none":
         try:
@@ -593,13 +650,27 @@ def execute_and_verify(session, tool: Tool, directive, action_id: str, args: dic
         offense_flag = flag_offense_shape(tool.name, args)  # audit-only tag, never a deny
         code_touch = names_code_root(args.get("command"))   # F-6 audit-only tag (porous), never a deny
         try:
-            execution = execute_tool(tool, session.workspace, args)
+            execution = execute_tool(tool, session.workspace, args, require_isolation=require_isolation)
         except WorkspaceError as exc:
             return Decision(action_id, tool.name, DENIED, str(exc), leash, directive=directive,
                             args=args, offense_flag=offense_flag, code_touch=code_touch)
+        except Exception as exc:  # noqa: BLE001 — a shell that can't even START (missing binary,
+            # unbalanced quotes -> shlex ValueError, NUL in argv) must FAIL honestly, never raise out
+            # of approve()/govern_action (which promise never to raise) and never burn the held
+            # action_id with no audit record. Mirrors the egress + artifact branches' broad backstop.
+            return Decision(action_id, tool.name, FAILED, f"command error: {type(exc).__name__}",
+                            leash, cleared=False, directive=directive, args=args,
+                            offense_flag=offense_flag, code_touch=code_touch)
         cleared = bool(execution.result.ok)
-        return Decision(action_id, tool.name, RAN if cleared else FAILED,
-                        "supervised exit 0" if cleared else f"exit {execution.exit_code}",
+        if cleared:
+            reason = "supervised exit 0"
+        elif execution.exit_code is None:
+            # No exit code == the command never ran (isolation refusal, empty/invalid argv) — surface
+            # the honest executor error in the reason field, not a bare "exit None" (red-team nit).
+            reason = execution.result.error or "did not run"
+        else:
+            reason = f"exit {execution.exit_code}"
+        return Decision(action_id, tool.name, RAN if cleared else FAILED, reason,
                         leash, cleared=cleared, result=execution.result, directive=directive,
                         args=args, offense_flag=offense_flag,
                         network_isolated=execution.network_isolated,

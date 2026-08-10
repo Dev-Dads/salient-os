@@ -10,6 +10,7 @@ a success (panel gap #4).
 
 from __future__ import annotations
 
+import hmac
 from dataclasses import dataclass, field
 
 from collaborator import egress
@@ -25,7 +26,14 @@ from collaborator.governance import (
 )
 from collaborator.codefence import names_code_root
 from collaborator.toolcall import ToolIntent, parse_message
-from collaborator.tools import ACT_THEN_REPORT, get_tool, is_controlled_location
+from collaborator.tools import (
+    ACT_THEN_REPORT,
+    SEALED_TOOLS,
+    freeze_args,
+    get_tool,
+    held_action_seal,
+    is_controlled_location,
+)
 
 COLLABORATOR_LOOP_VERSION = "0.1.0"
 
@@ -119,12 +127,14 @@ def approve(session, decision: Decision) -> Decision:
     tool = get_tool(decision.tool)
     if tool is None:
         return decision
-    # SNAPSHOT the held args ONCE (red-team #2: approved != sent via a multi-read TOCTOU). Every
-    # downstream read — the seal check here, the credential-host lookup and the wire inside
-    # execute_and_verify — MUST see the SAME mapping, so a mutable / proxy / UI-backed args view
-    # cannot return one payload to the seal check and another to the socket. Everything below reads
-    # this local ``args``, never the live ``decision.args``.
-    args = dict(decision.args)
+    # SNAPSHOT + FREEZE the held args ONCE (red-team #2 + external panel / gemini: approved != sent
+    # via a multi-read TOCTOU). Every downstream read — the seal check here, the credential-host
+    # lookup and the wire inside execute_and_verify — MUST see the SAME immutable mapping, so a
+    # mutable / proxy / UI-backed args view cannot return one payload to the seal check and another to
+    # the socket. Re-freezing HERE (not only at hold) makes approved==executed a property of approve()
+    # itself — self-contained, robust even for a held decision that did not pass through
+    # govern_action's freeze. Everything below reads this local ``args``, never the live decision.args.
+    args = freeze_args(dict(decision.args))
     # Bind a held decision to the session that HELD it (red-team #5): a held emission carries an
     # injected credential at approve time, so approving it under a DIFFERENT workspace subject would
     # silently send THAT session's credential with THIS payload. Refuse the cross-subject approval
@@ -179,6 +189,37 @@ def approve(session, decision: Decision) -> Decision:
                         "code root: proposer-authored command re-denied at approval",
                         decision.leash, directive=decision.directive, args=args,
                         origin=decision.origin)
+    # MINOR-B (ADR 0003; net.post-FIX red-team): bind approval of a held run_command / write_file to
+    # the EXACT consequential args the human saw — the by-reference-mutation (TOCTOU) vector the
+    # emission seal closes for net_post, now closed uniformly for the other unbounded-reach tools. A
+    # MISSING seal fails CLOSED (a govern_action-produced hold ALWAYS carries one; its absence means
+    # the decision was not minted through the seam — refuse rather than run something unbound); a
+    # MISMATCH means the args were mutated after origination — DENY. Neither consumes the decision
+    # (a restored payload stays retryable). Placed AFTER the origin-gated re-denies so their specific
+    # reasons surface first; this is the general backstop for ANY other mutation (incl. user-origin,
+    # which the origin-gated re-denies above deliberately do not cover). The SNAPSHOT ``args`` is what
+    # is re-sealed AND run — approved == executed.
+    # Verify the args seal for a sealed tool, OR for ANY non-egress decision that still CARRIES a seal
+    # — the latter catches a Decision.tool rebind that keeps a leftover seal but points at a
+    # non-sealed tool (external panel / grok): the recomputed seal for the new tool is "" and cannot
+    # match, so it DENIES. Egress decisions carry the EMISSION seal (checked above), so they are
+    # excluded here.
+    if decision.tool in SEALED_TOOLS or (decision.seal and not getattr(tool, "egress", False)):
+        # A MISSING / non-str / non-ASCII seal fails CLOSED. A real seal is always a hexdigest (ASCII
+        # str); requiring `.isascii()` both stops a hostile wildcard-__eq__ object from spoofing a
+        # match (isinstance) AND keeps hmac.compare_digest from RAISING on a tampered non-ASCII /
+        # lone-surrogate seal (compare_digest rejects non-ASCII str) — a tampered seal is a clean DENY,
+        # never an exception out of approve() (which promises never to raise).
+        if not (isinstance(decision.seal, str) and decision.seal and decision.seal.isascii()):
+            return Decision(decision.action_id, decision.tool, DENIED,
+                            f"{decision.tool} decision carries no valid args seal — refusing (fail closed)",
+                            decision.leash, directive=decision.directive, args=args,
+                            origin=decision.origin)
+        if not hmac.compare_digest(held_action_seal(decision.tool, args), decision.seal):
+            return Decision(decision.action_id, decision.tool, DENIED,
+                            f"{decision.tool} payload changed after it was held (seal mismatch)",
+                            decision.leash, directive=decision.directive, args=args,
+                            origin=decision.origin)
     decision.consumed = True     # claim it before running, so no concurrent/second path re-runs
     # human_gated=True: this IS the human-approval path, so the emission keeps a bounded body preview
     # regardless of how a signed cap rewrote the recorded leash (ADR 0003 Tier 2; red-team F3). The
