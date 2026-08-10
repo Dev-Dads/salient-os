@@ -39,7 +39,15 @@ import shutil
 import subprocess
 import sys
 
-COLLABORATOR_NETNS_VERSION = "0.2.0"
+COLLABORATOR_NETNS_VERSION = "0.3.0"
+
+# ADR 0003 revisit #1(a): the signed, DEFAULT-DENY opt-in that ACCEPTS raw (un-isolated) network
+# reach for run_command on a host where verified netns is unavailable. Absent it, an
+# act_then_report run_command floors to a human hand off-Linux ("isolation earns autonomy" — the
+# gate owns that floor). Granting it is the operator's explicit "I accept that this shell can reach
+# the network raw on this host". A separate namespace from the egress caps (net.get/net.post) — this
+# governs the SHELL's raw reach, not the mediated client's destinations.
+SHELL_RAW_NETWORK_CAP = "shell.raw_network"
 
 # Sentinel a per-run guard prints (with exit 44) when the child is NOT in a fresh netns, so the
 # caller can correct the flag to isolated=False rather than falsely claiming isolation.

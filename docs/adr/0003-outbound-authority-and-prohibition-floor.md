@@ -307,11 +307,36 @@ re-derives and re-checks the allowlist; audit-only recognizer never denies.
 1. **netns for `run_command` — DONE on Linux (`collaborator/netns.py`).** `run_command`
    now runs in a fresh network namespace with no route out, so `egress.py` is the sole
    IP-network path off the machine and the "bytes left by another path" gap is closed for
-   IP egress. Remaining under this trigger: (a) the same guarantee on non-Linux hosts
-   (netns is Linux-only; today those honestly flag `network_isolated=False`); (b) the
-   *further* hardening of an **independent** egress observer (a proxy outside the executor)
-   — now optional rather than prerequisite, since with `run_command` isolated the
-   same-channel log has no other channel to miss.
+   IP egress.
+   - **(a) non-Linux parity — DONE via "isolation earns autonomy" (revisit #1a).** Where
+     verified netns is unavailable (non-Linux / no `unshare` / userns disabled), the shell
+     still runs unisolated with an honest `network_isolated=False` flag — but an
+     **autonomous** (`act_then_report`) `run_command` no longer *auto-runs* raw: the govern
+     seam floors it to a human hand unless a **signed, default-deny** `shell.raw_network`
+     capability opts in (`enforced(session)` + the signed grant — never mutable
+     `session.capabilities`), and at the moment of use `execute_and_verify` threads
+     `require_isolation` into the executor, which **refuses to run** (fail closed, the child
+     never starts) when it cannot actually isolate and no opt-in is present — so the
+     guarantee is bound to the executor's *real* isolation result, not a govern-time belief.
+     The HELD preview honestly surfaces `raw_network` off-Linux. Two orthogonal, monotonic
+     floors share the slot (this network floor + the F-6 Harm A *code* floor); today the code
+     floor withholds all `run_command` autonomy, so this floor is the **pre-wired second axis**
+     that becomes live behavior once OS-level code protection lands. Alongside it, the
+     approved==executed **seal** (net.post's payload seal) was extended to held
+     `run_command`/`write_file` via a hold-time **freeze** of the consequential args + an
+     injective, tool-identity-bound seal re-verified self-containedly in `approve()`.
+   - **(b)** the *further* hardening of an **independent** egress observer (a proxy outside the
+     executor) — the deferred full-parity direction; now optional rather than prerequisite,
+     since with `run_command` isolated the same-channel log has no other channel to miss.
+   - **Deferred netns hardening (red-team, LOW):** the per-run guard is omitted when the
+     parent netns inode is unreadable and a `stat` failure fails open; `stat`/`ip` are bare
+     PATH names (unlike the absolutized `unshare`/`sh`); the probe verifies a *different*
+     netns, not a *routeless* one; the cached probe has no invalidation and can report
+     `net-isolated` on a failed-`unshare` run that never happened. And when OS-level code
+     protection lands, thread a `require_code_protection` into the executor the way
+     `require_isolation` is threaded — do NOT re-read the predicate govern-side, or the same
+     belief-vs-behaviour split reopens on the code axis. `read_file`/`web_fetch` holds carry
+     no args seal (bounded by the workspace / host re-checks at approval).
 2. **Side-effecting egress (`net.post`) — DONE (`collaborator/egress.post` + `net_post`).**
    The Tier-2 emission flow shipped: separate `net.post:<host>` authority, human-gated by default
    with a signed per-host `net.post.auto:<host>` autonomy lift (operator-directed only), host-injected

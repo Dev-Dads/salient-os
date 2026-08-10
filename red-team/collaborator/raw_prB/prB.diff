@@ -1,0 +1,907 @@
+diff --git a/collaborator/governance.py b/collaborator/governance.py
+index d7189a7..7a97216 100644
+--- a/collaborator/governance.py
++++ b/collaborator/governance.py
+@@ -36,6 +36,7 @@ from salienceos.verifier.observers import observe_action, snapshot_tree
+ 
+ from collaborator import egress
+ from collaborator.codefence import code_protection_available, names_code_root
++from collaborator.netns import SHELL_RAW_NETWORK_CAP, netns_available
+ from collaborator.tools import (
+     ACT_THEN_REPORT,
+     NOTIFY_ONLY,
+@@ -45,7 +46,9 @@ from collaborator.tools import (
+     WorkspaceError,
+     execute_tool,
+     flag_offense_shape,
++    freeze_args,
+     get_tool,
++    held_action_seal,
+     is_controlled_location,
+     resolve_in_workspace,
+ )
+@@ -393,13 +396,33 @@ def govern_action(session, intent: ToolIntent, importance: "float | None" = None
+     # own code and neuter F1. Until that write-reach is STRUCTURALLY prevented (an OS-level
+     # read-only bind of the code root — deferred), WITHHOLD autonomy — an act_then_report
+     # run_command floors to propose_first so it can never AUTO-run, only run under a human hand. An
+-    # INDEPENDENT, monotonic floor: composes with the emission floor and PR B's (future) network
+-    # floor by ANDing (stricter always wins, no shared mutable state); an explicit host tighten
+-    # (notify_only) survives, being stricter than the floor.
++    # INDEPENDENT, monotonic floor: composes with the emission floor and the isolation-earns-autonomy
++    # network floor below by ANDing (stricter always wins, no shared mutable state); an explicit host
++    # tighten (notify_only) survives, being stricter than the floor.
+     if (intent.name == "run_command" and leash == ACT_THEN_REPORT
+             and not code_protection_available()):
+         leash = apply_cap(leash, PROPOSE_FIRST)
+ 
++    # --- run_command ISOLATION-EARNS-AUTONOMY FLOOR (ADR 0003 revisit #1a) ----
++    # run_command's raw network reach is isolated (netns) ONLY on Linux with VERIFIED netns. Where
++    # isolation is unavailable/unverifiable, an UNATTENDED shell would reach the network raw — so the
++    # autonomy that isolation would earn is WITHHELD: an act_then_report run_command floors to a human
++    # hand unless a signed, default-deny opt-in (shell.raw_network) explicitly accepts raw reach on
++    # this host. An INDEPENDENT, monotonic floor ORTHOGONAL to the code floor above (code protection
++    # != network isolation — they gate different reach), composing by ANDing (stricter always wins,
++    # no shared mutable state). NOTE: while the code floor withholds run_command autonomy
++    # unconditionally (OS code-protection deferred -> code_protection_available() is False), this
++    # floor is BEHAVIOR-MASKED — it is the pre-wired second axis that becomes live the moment code
++    # protection lands and lifts the code floor on a capable host. Tested in isolation by patching
++    # code_protection_available()=True.
++    # The raw-reach opt-in must be a SIGNED grant (enforced), never mutable session.capabilities —
++    # the same F5 rule the emission auto-lift follows: the highest-stakes "let this run raw
++    # unattended" signal can't rest on a legacy attribute a runtime widen could flip (red-team F1).
++    if (intent.name == "run_command" and leash == ACT_THEN_REPORT
++            and not netns_available()
++            and not (enforced(session) and directive.grants_capability(SHELL_RAW_NETWORK_CAP))):
++        leash = apply_cap(leash, PROPOSE_FIRST)
++
+     # --- LEASH (second axis) — ALLOWLIST dispatch (red-team F0) ---------------
+     # Run ONLY on the explicit act_then_report; notify_only notifies; EVERYTHING ELSE (propose_first
+     # and any unrecognised string) fails CLOSED to HELD. The old denylist ran on the `else` branch,
+@@ -425,31 +448,47 @@ def govern_action(session, intent: ToolIntent, importance: "float | None" = None
+                         reason=reason, leash=leash, directive=directive,
+                         args=intent.args, offense_flag=offense_flag)
+     # PROPOSE_FIRST or any unrecognised leash -> HELD (awaiting a human hand).
+-    # Seal a HELD EMISSION's consequential payload now, while it is exactly what the human is about
+-    # to be shown — approval re-checks it so a later mutation of the (by-reference) args cannot
+-    # change the destination/body that actually gets sent (Tier 2 has no verifier).
+-    seal = (egress.emission_seal(str(intent.args.get("url") or ""), intent.args.get("body"),
+-                                 str(intent.args.get("content_type") or ""))
+-            if (getattr(tool, "egress", False) and tool.mutating) else "")
++    # FREEZE the consequential payload ONCE now, so the args the human is shown, the args the seal
++    # digests, and the args the executor runs are ONE immutable mapping — a shared-by-reference list
++    # command (or bytes-like body) can't be swapped between the human's view/approval and the run
++    # (red-team: approved != executed via an in-place list mutation). approved==executed is then
++    # STRUCTURAL; the seal below is the belt that also catches a whole-key REASSIGNMENT.
++    args = freeze_args(intent.args)
++    # Seal a HELD action's consequential payload — approval re-checks it so a mutation cannot change
++    # what actually gets sent/run. For an EMISSION the seal is mandatory (Tier 2 has no verifier);
++    # for run_command / write_file it is the approved==executed binding (their verifiers re-derive
++    # from the same args, so they do NOT catch substitution). Other tools -> "" (nothing to bind).
++    if getattr(tool, "egress", False) and tool.mutating:
++        seal = egress.emission_seal(str(args.get("url") or ""), args.get("body"),
++                                    str(args.get("content_type") or ""))
++    else:
++        seal = held_action_seal(tool.name, args)
+     # Surface the CANONICAL destination for an egress action, so the one human hand on an emission
+     # reads the host bytes actually leave for — not the raw model string, which canonicalization may
+-    # quietly rewrite (soft hyphen, ideographic dot; transport red-team M6).
+-    preview = {"tool": tool.name, "args": intent.args,
++    # quietly rewrite (soft hyphen, ideographic dot; transport red-team M6). The preview shows the
++    # FROZEN args, so what the human reads is exactly what a later approval will run.
++    preview = {"tool": tool.name, "args": args,
+                "verification_depth": directive.verification_depth}
+     if getattr(tool, "egress", False):
+-        preview["canonical_dest"] = egress.canonical_host(str(intent.args.get("url") or ""))
++        preview["canonical_dest"] = egress.canonical_host(str(args.get("url") or ""))
+     if intent.name == "run_command":
+         # Surface the honest code-protection posture + any literal self-code reference to the human
+         # who holds the hand on this shell (F-6 Harm A). code_protection_available() is False in this
+         # build, so this reads "not protected" — the honest state until OS-level protection lands.
+         preview["code_protected"] = code_protection_available()
+-        _named = names_code_root(intent.args.get("command"))
++        _named = names_code_root(args.get("command"))
+         if _named:
+             preview["names_code_root"] = _named
++        # ADR 0003 revisit #1a: whether this shell will run with RAW network reach (no netns
++        # isolation on this host) — the honest posture the approving human sees. LIVE off-Linux
++        # (netns_available() is False), independent of whether the raw-reach opt-in was granted:
++        # the reach is raw either way; the opt-in only governs whether it may AUTO-run.
++        if not netns_available():
++            preview["raw_network"] = True
+     reason = ("propose-first leash: awaiting approval" if leash == PROPOSE_FIRST
+               else f"unrecognised leash {leash!r} -> held (fail-closed)")
+     return Decision(action_id=action_id, tool=tool.name, status=HELD, reason=reason, leash=leash,
+-                    directive=directive, args=intent.args, offense_flag=offense_flag,
++                    directive=directive, args=args, offense_flag=offense_flag,
+                     seal=seal, preview=preview, origin_subject=_subject(session))
+ 
+ 
+@@ -537,6 +576,24 @@ def execute_and_verify(session, tool: Tool, directive, action_id: str, args: dic
+     if leash == NOTIFY_ONLY:
+         return Decision(action_id, tool.name, NOTIFIED,
+                         "notify-only leash — not executed", leash, directive=directive, args=args)
++    # ADR 0003 revisit #1a + F-6 Harm A — re-assert the run_command autonomy floors at the MOMENT OF
++    # USE (defence in depth, red-team F3/N1/N2): govern_action already withholds these, but binding
++    # them AT EXECUTION means no path — a direct internal caller, a future refactor — reaches a raw or
++    # unprotected autonomous run. Keyed on `not human_gated` (an AUTONOMOUS execution), NOT the leash
++    # string, so a propose_first-with-human_gated=False caller can't slip one notch over (N1). A
++    # human-approved run is the human's call, unaffected.
++    require_isolation = False
++    if tool.name == "run_command" and not human_gated:
++        # CODE floor: never AUTO-run a shell whose write-reach to its own code is unprevented —
++        # symmetric with the network floor below, and the floor doing all the work today (N2).
++        if not code_protection_available():
++            return Decision(action_id, tool.name, DENIED,
++                            "autonomous shell withheld at execution: code protection unavailable",
++                            leash, directive=directive, args=args)
++        # NETWORK floor: require ACTUAL isolation unless signed-opted-in. Threaded to the executor,
++        # which REFUSES to run when it cannot isolate — so the guarantee is bound to the executor's
++        # real isolation result (execution.network_isolated), not the govern-time belief (F3).
++        require_isolation = not (enforced(session) and directive.grants_capability(SHELL_RAW_NETWORK_CAP))
+     # Read-only: gate already passed; execute and report (nothing is mutated).
+     if tool.verify_mode == "none":
+         try:
+@@ -593,13 +650,27 @@ def execute_and_verify(session, tool: Tool, directive, action_id: str, args: dic
+         offense_flag = flag_offense_shape(tool.name, args)  # audit-only tag, never a deny
+         code_touch = names_code_root(args.get("command"))   # F-6 audit-only tag (porous), never a deny
+         try:
+-            execution = execute_tool(tool, session.workspace, args)
++            execution = execute_tool(tool, session.workspace, args, require_isolation=require_isolation)
+         except WorkspaceError as exc:
+             return Decision(action_id, tool.name, DENIED, str(exc), leash, directive=directive,
+                             args=args, offense_flag=offense_flag, code_touch=code_touch)
++        except Exception as exc:  # noqa: BLE001 — a shell that can't even START (missing binary,
++            # unbalanced quotes -> shlex ValueError, NUL in argv) must FAIL honestly, never raise out
++            # of approve()/govern_action (which promise never to raise) and never burn the held
++            # action_id with no audit record. Mirrors the egress + artifact branches' broad backstop.
++            return Decision(action_id, tool.name, FAILED, f"command error: {type(exc).__name__}",
++                            leash, cleared=False, directive=directive, args=args,
++                            offense_flag=offense_flag, code_touch=code_touch)
+         cleared = bool(execution.result.ok)
+-        return Decision(action_id, tool.name, RAN if cleared else FAILED,
+-                        "supervised exit 0" if cleared else f"exit {execution.exit_code}",
++        if cleared:
++            reason = "supervised exit 0"
++        elif execution.exit_code is None:
++            # No exit code == the command never ran (isolation refusal, empty/invalid argv) — surface
++            # the honest executor error in the reason field, not a bare "exit None" (red-team nit).
++            reason = execution.result.error or "did not run"
++        else:
++            reason = f"exit {execution.exit_code}"
++        return Decision(action_id, tool.name, RAN if cleared else FAILED, reason,
+                         leash, cleared=cleared, result=execution.result, directive=directive,
+                         args=args, offense_flag=offense_flag,
+                         network_isolated=execution.network_isolated,
+diff --git a/collaborator/loop.py b/collaborator/loop.py
+index 0ddbfd3..ee459b5 100644
+--- a/collaborator/loop.py
++++ b/collaborator/loop.py
+@@ -10,6 +10,7 @@ a success (panel gap #4).
+ 
+ from __future__ import annotations
+ 
++import hmac
+ from dataclasses import dataclass, field
+ 
+ from collaborator import egress
+@@ -25,7 +26,14 @@ from collaborator.governance import (
+ )
+ from collaborator.codefence import names_code_root
+ from collaborator.toolcall import ToolIntent, parse_message
+-from collaborator.tools import ACT_THEN_REPORT, get_tool, is_controlled_location
++from collaborator.tools import (
++    ACT_THEN_REPORT,
++    SEALED_TOOLS,
++    freeze_args,
++    get_tool,
++    held_action_seal,
++    is_controlled_location,
++)
+ 
+ COLLABORATOR_LOOP_VERSION = "0.1.0"
+ 
+@@ -119,12 +127,14 @@ def approve(session, decision: Decision) -> Decision:
+     tool = get_tool(decision.tool)
+     if tool is None:
+         return decision
+-    # SNAPSHOT the held args ONCE (red-team #2: approved != sent via a multi-read TOCTOU). Every
+-    # downstream read — the seal check here, the credential-host lookup and the wire inside
+-    # execute_and_verify — MUST see the SAME mapping, so a mutable / proxy / UI-backed args view
+-    # cannot return one payload to the seal check and another to the socket. Everything below reads
+-    # this local ``args``, never the live ``decision.args``.
+-    args = dict(decision.args)
++    # SNAPSHOT + FREEZE the held args ONCE (red-team #2 + external panel / gemini: approved != sent
++    # via a multi-read TOCTOU). Every downstream read — the seal check here, the credential-host
++    # lookup and the wire inside execute_and_verify — MUST see the SAME immutable mapping, so a
++    # mutable / proxy / UI-backed args view cannot return one payload to the seal check and another to
++    # the socket. Re-freezing HERE (not only at hold) makes approved==executed a property of approve()
++    # itself — self-contained, robust even for a held decision that did not pass through
++    # govern_action's freeze. Everything below reads this local ``args``, never the live decision.args.
++    args = freeze_args(dict(decision.args))
+     # Bind a held decision to the session that HELD it (red-team #5): a held emission carries an
+     # injected credential at approve time, so approving it under a DIFFERENT workspace subject would
+     # silently send THAT session's credential with THIS payload. Refuse the cross-subject approval
+@@ -179,6 +189,37 @@ def approve(session, decision: Decision) -> Decision:
+                         "code root: proposer-authored command re-denied at approval",
+                         decision.leash, directive=decision.directive, args=args,
+                         origin=decision.origin)
++    # MINOR-B (ADR 0003; net.post-FIX red-team): bind approval of a held run_command / write_file to
++    # the EXACT consequential args the human saw — the by-reference-mutation (TOCTOU) vector the
++    # emission seal closes for net_post, now closed uniformly for the other unbounded-reach tools. A
++    # MISSING seal fails CLOSED (a govern_action-produced hold ALWAYS carries one; its absence means
++    # the decision was not minted through the seam — refuse rather than run something unbound); a
++    # MISMATCH means the args were mutated after origination — DENY. Neither consumes the decision
++    # (a restored payload stays retryable). Placed AFTER the origin-gated re-denies so their specific
++    # reasons surface first; this is the general backstop for ANY other mutation (incl. user-origin,
++    # which the origin-gated re-denies above deliberately do not cover). The SNAPSHOT ``args`` is what
++    # is re-sealed AND run — approved == executed.
++    # Verify the args seal for a sealed tool, OR for ANY non-egress decision that still CARRIES a seal
++    # — the latter catches a Decision.tool rebind that keeps a leftover seal but points at a
++    # non-sealed tool (external panel / grok): the recomputed seal for the new tool is "" and cannot
++    # match, so it DENIES. Egress decisions carry the EMISSION seal (checked above), so they are
++    # excluded here.
++    if decision.tool in SEALED_TOOLS or (decision.seal and not getattr(tool, "egress", False)):
++        # A MISSING / non-str / non-ASCII seal fails CLOSED. A real seal is always a hexdigest (ASCII
++        # str); requiring `.isascii()` both stops a hostile wildcard-__eq__ object from spoofing a
++        # match (isinstance) AND keeps hmac.compare_digest from RAISING on a tampered non-ASCII /
++        # lone-surrogate seal (compare_digest rejects non-ASCII str) — a tampered seal is a clean DENY,
++        # never an exception out of approve() (which promises never to raise).
++        if not (isinstance(decision.seal, str) and decision.seal and decision.seal.isascii()):
++            return Decision(decision.action_id, decision.tool, DENIED,
++                            f"{decision.tool} decision carries no valid args seal — refusing (fail closed)",
++                            decision.leash, directive=decision.directive, args=args,
++                            origin=decision.origin)
++        if not hmac.compare_digest(held_action_seal(decision.tool, args), decision.seal):
++            return Decision(decision.action_id, decision.tool, DENIED,
++                            f"{decision.tool} payload changed after it was held (seal mismatch)",
++                            decision.leash, directive=decision.directive, args=args,
++                            origin=decision.origin)
+     decision.consumed = True     # claim it before running, so no concurrent/second path re-runs
+     # human_gated=True: this IS the human-approval path, so the emission keeps a bounded body preview
+     # regardless of how a signed cap rewrote the recorded leash (ADR 0003 Tier 2; red-team F3). The
+diff --git a/collaborator/netns.py b/collaborator/netns.py
+index faccd11..af70789 100644
+--- a/collaborator/netns.py
++++ b/collaborator/netns.py
+@@ -39,7 +39,15 @@ import shutil
+ import subprocess
+ import sys
+ 
+-COLLABORATOR_NETNS_VERSION = "0.2.0"
++COLLABORATOR_NETNS_VERSION = "0.3.0"
++
++# ADR 0003 revisit #1(a): the signed, DEFAULT-DENY opt-in that ACCEPTS raw (un-isolated) network
++# reach for run_command on a host where verified netns is unavailable. Absent it, an
++# act_then_report run_command floors to a human hand off-Linux ("isolation earns autonomy" — the
++# gate owns that floor). Granting it is the operator's explicit "I accept that this shell can reach
++# the network raw on this host". A separate namespace from the egress caps (net.get/net.post) — this
++# governs the SHELL's raw reach, not the mediated client's destinations.
++SHELL_RAW_NETWORK_CAP = "shell.raw_network"
+ 
+ # Sentinel a per-run guard prints (with exit 44) when the child is NOT in a fresh netns, so the
+ # caller can correct the flag to isolated=False rather than falsely claiming isolation.
+diff --git a/collaborator/tools.py b/collaborator/tools.py
+index bf8bc78..71642a9 100644
+--- a/collaborator/tools.py
++++ b/collaborator/tools.py
+@@ -27,6 +27,7 @@ says so (never a fabricated success).
+ 
+ from __future__ import annotations
+ 
++import hashlib
+ import os
+ import re
+ import shlex
+@@ -165,6 +166,83 @@ def flag_offense_shape(name: str, args: dict) -> str:
+     return ",".join(sorted(tokens & _OFFENSE_TOKENS))
+ 
+ 
++# The tools whose held approval is bound to an integrity seal (MINOR-B). SINGLE SOURCE OF TRUTH —
++# `held_action_seal` seals exactly these, and `loop.approve()` verifies exactly these. Deriving both
++# from one frozenset removes the two-hand-maintained-list drift that would otherwise be a silent
++# fail-open (a tool that gains a seal branch but is missing from the approve-time check would have a
++# seal MINTED but NEVER verified). Same lesson as codefence's `_code_slots()` single source (PR #35).
++SEALED_TOOLS = frozenset({"run_command", "write_file"})
++
++
++def held_action_seal(tool_name: str, args: dict) -> str:
++    """A stable digest binding a HELD run_command / write_file to the EXACT consequential args the
++    human saw at hold time, so ``approve()`` can REFUSE a payload mutated after origination — the
++    by-reference-mutation (TOCTOU) vector ``egress.emission_seal`` closes for net_post, now closed
++    UNIFORMLY for the other unbounded-reach tools (MINOR-B). run_command's exit-code check and
++    write_file's artifact verifier do NOT catch arg substitution (both re-derive from the SAME
++    mutated args), so this seal — over a FROZEN payload (see ``freeze_args``) — is the actual
++    approved==executed binding for these tools, not mere DiD. Returns "" for any tool not in
++    ``SEALED_TOOLS`` (read_file; the egress tools, which seal via ``emission_seal`` instead).
++
++    Framing mirrors ``emission_seal``: every field is LENGTH-PREFIXED (8-byte big-endian) so the
++    encoding is injective — no boundary shift can move bytes between fields and collide two distinct
++    actions to one seal. A leading TYPE TAG distinguishes shapes that EXECUTE differently (a string
++    command that ``_exec_command`` shlex-splits vs. a pre-split argv list) so they never seal alike;
++    ``surrogatepass`` keeps a lone-surrogate arg SEALABLE at hold time (validity is the executor's
++    job — the seal only needs consistency between hold and approve). Each field is coerced to str
++    EXACTLY as its executor will (``_exec_command`` / ``_exec_write``), so seal == what runs."""
++    if tool_name not in SEALED_TOOLS:
++        return ""
++    if tool_name == "run_command":
++        cmd = args.get("command")
++        if isinstance(cmd, (list, tuple)):
++            parts = [b"L"] + [str(c).encode("utf-8", "surrogatepass") for c in cmd]
++        elif isinstance(cmd, str):
++            parts = [b"S", cmd.encode("utf-8", "surrogatepass")]
++        else:
++            parts = [b"N"]  # None / other -> the executor refuses; seal a stable non-empty marker
++    else:  # write_file — the only other member of SEALED_TOOLS
++        parts = [b"W",
++                 str(args.get("path") or "").encode("utf-8", "surrogatepass"),
++                 str(args.get("content") or "").encode("utf-8", "surrogatepass")]
++    h = hashlib.sha256()
++    # Bind the TOOL IDENTITY into the seal as its first field (external panel / grok), so a
++    # Decision.tool rebind cannot replay one tool's sealed args as a different tool's action.
++    for part in [tool_name.encode("utf-8"), *parts]:
++        h.update(len(part).to_bytes(8, "big"))
++        h.update(part)
++    return h.hexdigest()
++
++
++def freeze_args(args: dict) -> dict:
++    """Return a shallow copy of ``args`` with its mutable CONSEQUENTIAL values made IMMUTABLE, so a
++    HELD action's payload cannot be swapped by reference between the moment the human sees/approves it
++    and the moment it runs — making ``approved == executed`` a STRUCTURAL property rather than a
++    digest re-check over a shared object (red-team: a shallow ``dict(args)`` still shares the
++    ``command`` LIST, and a concurrent / in-chain holder can mutate it in place after the seal check).
++    A ``run_command`` ``command`` list -> a str tuple (str() is evaluated ONCE here and frozen, so a
++    hostile ``__str__`` cannot return different bytes to the seal and the executor); a bytes-like
++    ``body`` -> ``bytes``. Everything else (str path/content/url, scalars) is already immutable. The
++    frozen forms seal and EXECUTE identically to the originals (``held_action_seal`` and
++    ``_exec_command`` both treat list/tuple alike; ``egress.post`` accepts bytes)."""
++    frozen = dict(args)
++    cmd = frozen.get("command")
++    if isinstance(cmd, (list, tuple)):
++        frozen["command"] = tuple(str(c) for c in cmd)
++    body = frozen.get("body")
++    if isinstance(body, (bytes, bytearray)):
++        frozen["body"] = bytes(body)
++    # write_file's path/content are usually str (immutable), but a JSON tool call can supply a list
++    # (e.g. "content": ["x"]) — a shared mutable — or a str SUBCLASS with a drifting __str__. Coerce
++    # UNCONDITIONALLY (str() on an exact str returns the same object, so it's free), EXACTLY as
++    # _exec_write will (str(x or "")), so the frozen value both seals and writes identically and no
++    # in-window mutation (including a subclass __str__ re-evaluated later) can reach the disk.
++    for key in ("path", "content"):
++        if key in frozen:
++            frozen[key] = str(frozen[key] or "")
++    return frozen
++
++
+ def get_tool(name: str) -> "Tool | None":
+     return _TOOLS.get(name)
+ 
+@@ -280,7 +358,7 @@ def _exec_read(workspace, args: dict) -> Execution:
+     return Execution(result=ToolResult(ok=True, output=target.read_text(encoding="utf-8", errors="replace")))
+ 
+ 
+-def _exec_command(workspace, args: dict) -> Execution:
++def _exec_command(workspace, args: dict, *, require_isolation: bool = False) -> Execution:
+     cmd = args.get("command")
+     if isinstance(cmd, str):
+         argv = shlex.split(cmd)
+@@ -294,6 +372,15 @@ def _exec_command(workspace, args: dict) -> Execution:
+     # a raw socket / curl / git can't egress — web_fetch (the mediated client) is the sole path
+     # off the machine. Fails closed to unisolated + a False flag where netns is unavailable.
+     run_argv, isolated = wrap_no_network(argv)
++    # ADR 0003 revisit #1a: when the caller REQUIRES isolation (an autonomous, un-opted-in shell) but
++    # this host cannot verifiably provide it, REFUSE to run — bind the run to the ACTUAL isolation
++    # result, not a govern-time belief (red-team F3). Prevention: the command never starts, so no raw
++    # egress can occur. A human-approved run or a signed raw-reach opt-in sets require_isolation False.
++    if require_isolation and not isolated:
++        return Execution(
++            result=ToolResult(ok=False,
++                              error="network isolation required but unavailable on this host — not run"),
++            network_isolated=False, code_protected=code_protection_available())
+     res = run_supervised(run_argv, cwd=workspace)
+     # If the per-run guard tripped (child was NOT in a fresh netns), the command did not run — no
+     # egress — and we correct the flag to False so it never falsely claims isolation (red-team).
+@@ -394,12 +481,16 @@ _EXECUTORS = {"write_file": _exec_write, "read_file": _exec_read,
+ 
+ 
+ def execute_tool(tool: Tool, workspace, args: dict, *, egress_preview: bool = False,
+-                 egress_auth: "str | None" = None) -> Execution:
++                 egress_auth: "str | None" = None, require_isolation: bool = False) -> Execution:
+     """Run a resolved tool. Raises WorkspaceError on an escaping path (the caller turns that into
+     a DENY); other failures come back as ``ok=False`` results. ``egress_preview``/``egress_auth``
+     are host-side values the governance seam threads for net_post ONLY (the audit-preview flag and
+     the host-injected credential); every other tool ignores them, so the model can never reach
+-    them through ``args``."""
++    them through ``args``. ``require_isolation`` is threaded to run_command ONLY: when True the shell
++    REFUSES to run unless verified netns isolation is achieved (ADR 0003 #1a — an autonomous,
++    un-opted-in shell can never egress raw)."""
+     if tool.name == "net_post":
+         return _exec_net_post(workspace, args, keep_preview=egress_preview, auth=egress_auth)
++    if tool.name == "run_command":
++        return _exec_command(workspace, args, require_isolation=require_isolation)
+     return _EXECUTORS[tool.name](workspace, args)
+diff --git a/tests/test_collaborator_run_command_parity.py b/tests/test_collaborator_run_command_parity.py
+new file mode 100644
+index 0000000..d4f5a7a
+--- /dev/null
++++ b/tests/test_collaborator_run_command_parity.py
+@@ -0,0 +1,456 @@
++"""ADR 0003 revisit #1a + MINOR-B — non-Linux run_command parity and the approved==executed seal.
++
++Two independent additions to the run_command govern slot, both pinned here:
++
++* B1 — the ISOLATION-EARNS-AUTONOMY floor. run_command's raw network reach is isolated (netns) only
++  on Linux with verified netns; where isolation is unavailable an act_then_report shell floors to a
++  human hand unless a signed, default-deny ``shell.raw_network`` opt-in accepts raw reach. This floor
++  is ORTHOGONAL to (and today BEHAVIOR-MASKED by) the F-6 Harm A code floor, which withholds ALL
++  run_command autonomy while ``code_protection_available()`` is False. So every B1 test PATCHES
++  ``code_protection_available``→True to stand the code floor down and put ONLY the network floor
++  under test — the pre-wired second axis, exercised in isolation.
++
++* MINOR-B — the by-reference-mutation (TOCTOU) seal, extended from net_post to held run_command /
++  write_file: approval is bound to the EXACT args the human saw; a payload mutated after origination
++  is DENIED, a decision with no seal fails CLOSED.
++"""
++
++import sys
++import tempfile
++import unittest
++from pathlib import Path
++from unittest.mock import patch
++
++from collaborator import netns
++from collaborator.governance import DENIED, HELD, RAN, govern_action
++from collaborator.loop import approve
++from collaborator.policycaps import mint, workspace_subject
++from collaborator.session import Session
++from collaborator.toolcall import ToolIntent
++from collaborator.tools import ACT_THEN_REPORT, PROPOSE_FIRST, SEALED_TOOLS, held_action_seal, toolset
++
++_CAPS = ("fs.read:project", "fs.write:project", "shell.exec")
++# code protection is deferred (False in this build); patch it True so the CODE floor stands down and
++# only the NETWORK floor (B1) governs the outcome under test.
++_CODE_UP = patch("collaborator.governance.code_protection_available", return_value=True)
++
++
++def _session(tmp, *, caps=_CAPS, **kw):
++    return Session(workspace=tmp, capabilities=caps, **kw)
++
++
++class IsolationEarnsAutonomyFloor(unittest.TestCase):
++    """B1 in ISOLATION (code floor patched down): only the network-isolation floor is under test."""
++
++    def test_atr_shell_floored_off_linux_without_optin(self):
++        # No verified netns AND no shell.raw_network opt-in -> an act_then_report run_command is
++        # WITHHELD to a human hand (HELD/propose_first), never auto-run with raw reach.
++        with tempfile.TemporaryDirectory() as tmp, _CODE_UP, \
++                patch("collaborator.governance.netns_available", return_value=False):
++            s = _session(tmp, leash_overrides={"run_command": ACT_THEN_REPORT})
++            d = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "structured"))
++            self.assertEqual(d.status, HELD)
++            self.assertEqual(d.leash, PROPOSE_FIRST)
++
++    def test_atr_shell_runs_with_SIGNED_raw_network_optin(self):
++        # The SIGNED, default-deny opt-in ACCEPTS raw reach on this host -> the floor stands down and
++        # the shell may auto-run (act_then_report). The isolation flag stays HONESTLY False (real
++        # netns is unavailable on this dev host — the executor never claims isolation it lacks).
++        with tempfile.TemporaryDirectory() as tmp, _CODE_UP, \
++                patch("collaborator.governance.netns_available", return_value=False):
++            key = b"caps-key"
++            signed = mint(("shell.exec", netns.SHELL_RAW_NETWORK_CAP),
++                          {"run_command": ACT_THEN_REPORT}, "admin", workspace_subject(tmp), key)
++            s = Session(workspace=tmp, policy_caps=signed, caps_key=key,
++                        leash_overrides={"run_command": ACT_THEN_REPORT})
++            d = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "structured"))
++            self.assertEqual(d.status, RAN)
++            self.assertEqual(d.leash, ACT_THEN_REPORT)
++            self.assertIs(d.network_isolated, False)   # honest — no raw-reach claim of isolation
++
++    def test_UNSIGNED_raw_network_optin_does_NOT_stand_the_floor_down(self):
++        # red-team F1: the raw-reach opt-in is the "run raw unattended" signal, so — like the emission
++        # auto-lift (F5) — it must rest on a SIGNED grant, never mutable session.capabilities. Listing
++        # shell.raw_network in an UNSIGNED session's caps must NOT lift autonomy: still HELD.
++        with tempfile.TemporaryDirectory() as tmp, _CODE_UP, \
++                patch("collaborator.governance.netns_available", return_value=False):
++            s = _session(tmp, caps=(*_CAPS, netns.SHELL_RAW_NETWORK_CAP),
++                         leash_overrides={"run_command": ACT_THEN_REPORT})
++            d = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "structured"))
++            self.assertEqual(d.status, HELD)
++            self.assertEqual(d.leash, PROPOSE_FIRST)
++
++    def test_atr_shell_runs_when_isolation_available(self):
++        # Verified netns available AND the executor genuinely isolates -> autonomy is NOT withheld and
++        # the shell auto-runs. On this non-Linux dev host real netns is absent, so wrap_no_network is
++        # patched to simulate a host that DOES isolate (the Linux IsolationProof tests exercise the
++        # real thing); with the isolation actually achieved, require_isolation is satisfied.
++        def _isolated(argv):
++            return [str(a) for a in argv], True
++        with tempfile.TemporaryDirectory() as tmp, _CODE_UP, \
++                patch("collaborator.governance.netns_available", return_value=True), \
++                patch("collaborator.tools.wrap_no_network", side_effect=_isolated):
++            s = _session(tmp, leash_overrides={"run_command": ACT_THEN_REPORT})
++            d = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "structured"))
++            self.assertEqual(d.status, RAN)
++            self.assertEqual(d.leash, ACT_THEN_REPORT)
++            self.assertIs(d.network_isolated, True)
++
++    def test_default_leash_shell_is_held_regardless(self):
++        # run_command's default leash is already propose_first, so a shell without a loosening
++        # override is HELD whether or not isolation is available — the floor only ever TIGHTENS.
++        with tempfile.TemporaryDirectory() as tmp, _CODE_UP, \
++                patch("collaborator.governance.netns_available", return_value=True):
++            s = _session(tmp)
++            d = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "structured"))
++            self.assertEqual(d.status, HELD)
++
++
++class RawNetworkPreview(unittest.TestCase):
++    """The HELD preview honestly surfaces raw network reach — LIVE off-Linux (not masked)."""
++
++    def test_held_preview_shows_raw_network_off_linux(self):
++        with tempfile.TemporaryDirectory() as tmp, \
++                patch("collaborator.governance.netns_available", return_value=False):
++            s = _session(tmp)  # default propose_first -> HELD
++            d = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "structured"))
++            self.assertEqual(d.status, HELD)
++            self.assertIs(d.preview.get("raw_network"), True)
++
++    def test_held_preview_omits_raw_network_when_isolation_available(self):
++        with tempfile.TemporaryDirectory() as tmp, \
++                patch("collaborator.governance.netns_available", return_value=True):
++            s = _session(tmp)
++            d = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "structured"))
++            self.assertEqual(d.status, HELD)
++            self.assertNotIn("raw_network", d.preview)
++
++
++class HeldActionSeal(unittest.TestCase):
++    """MINOR-B — the seal function itself: injective, tool-scoped, "" where nothing is consequential."""
++
++    def test_seal_is_empty_for_non_sealed_tools(self):
++        self.assertEqual(held_action_seal("read_file", {"path": "a"}), "")
++        self.assertEqual(held_action_seal("web_fetch", {"url": "https://x.example/"}), "")
++
++    def test_seal_changes_with_argv_and_content(self):
++        a = held_action_seal("run_command", {"command": ["echo", "hi"]})
++        b = held_action_seal("run_command", {"command": ["echo", "bye"]})
++        self.assertNotEqual(a, b)
++        self.assertTrue(a)
++        w = held_action_seal("write_file", {"path": "a.txt", "content": "x"})
++        w2 = held_action_seal("write_file", {"path": "a.txt", "content": "y"})
++        self.assertNotEqual(w, w2)
++
++    def test_str_and_list_command_seal_distinctly(self):
++        # a string command _exec_command shlex-splits vs. a pre-split argv EXECUTE the same here but
++        # are different consequential inputs — the type tag keeps them from colliding.
++        self.assertNotEqual(held_action_seal("run_command", {"command": "echo hi"}),
++                            held_action_seal("run_command", {"command": ["echo", "hi"]}))
++
++
++class MinorBApprovalSeal(unittest.TestCase):
++    """MINOR-B at the approval boundary — approved == executed for held run_command / write_file."""
++
++    def test_mutated_run_command_denied_at_approval(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            s = _session(tmp)  # run_command default propose_first -> HELD
++            held = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "structured"))
++            self.assertEqual(held.status, HELD)
++            self.assertTrue(held.seal)
++            held.args["command"] = ["echo", "bye"]        # by-reference mutation after the human saw it
++            d = approve(s, held)
++            self.assertEqual(d.status, DENIED)
++            self.assertIn("seal mismatch", d.reason)
++            self.assertFalse(held.consumed)               # retryable, not burned
++
++    def test_mutated_write_file_denied_at_approval(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            s = _session(tmp, leash_overrides={"write_file": PROPOSE_FIRST})
++            held = govern_action(s, ToolIntent(
++                "write_file", {"path": "note.txt", "content": "approved"}, "structured"))
++            self.assertEqual(held.status, HELD)
++            self.assertTrue(held.seal)
++            held.args["content"] = "swapped-in after approval"   # mutate content, path still resolves
++            d = approve(s, held)
++            self.assertEqual(d.status, DENIED)
++            self.assertIn("seal mismatch", d.reason)
++            self.assertFalse(held.consumed)
++            self.assertFalse((Path(tmp) / "note.txt").exists())  # nothing was written
++
++    def test_unmutated_run_command_approves_and_runs(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            s = _session(tmp)
++            held = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "structured"))
++            d = approve(s, held)                          # seal matches -> runs
++            self.assertEqual(d.status, RAN)
++
++    def test_unmutated_write_file_approves_and_runs(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            s = _session(tmp, leash_overrides={"write_file": PROPOSE_FIRST})
++            held = govern_action(s, ToolIntent(
++                "write_file", {"path": "note.txt", "content": "hello"}, "structured"))
++            d = approve(s, held)
++            self.assertEqual(d.status, RAN)
++            self.assertEqual((Path(tmp) / "note.txt").read_text(encoding="utf-8"), "hello")
++
++    def test_missing_seal_fails_closed(self):
++        # A held run_command whose seal was stripped (a decision not minted through the seam, or
++        # tampered) must not run something unbound — approve() DENIES rather than executing.
++        with tempfile.TemporaryDirectory() as tmp:
++            s = _session(tmp)
++            held = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "structured"))
++            held.seal = ""                                # strip the integrity binding
++            d = approve(s, held)
++            self.assertEqual(d.status, DENIED)
++            self.assertIn("fail closed", d.reason)
++            self.assertFalse(held.consumed)
++
++
++class RedTeamFixes(unittest.TestCase):
++    """Regressions for the internal-panel findings folded into this PR (reproduce-before-accept)."""
++
++    def test_held_command_is_frozen_immutable(self):
++        # F2: the held payload is FROZEN — the command is an immutable tuple, so an in-place aliasing
++        # mutation can't swap argv between the human's view/approval and the run.
++        with tempfile.TemporaryDirectory() as tmp:
++            s = _session(tmp)
++            held = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "structured"))
++            self.assertIsInstance(held.args["command"], tuple)
++            with self.assertRaises(TypeError):
++                held.args["command"][0] = "rm"          # frozen -> cannot mutate an element
++
++    def test_in_window_list_mutation_cannot_change_execution(self):
++        # F2 (rt-b1-floor repro): a holder that mutates the command in-place during the approve window
++        # (simulated via the real in-chain names_code_root call site) can no longer change what runs —
++        # the frozen tuple isn't a list, so the mutation never fires and the approved argv executes.
++        import collaborator.governance as G
++        real = G.names_code_root
++        def mutate_then_call(command):
++            if isinstance(command, list) and "hi" in command:
++                command[:] = ["echo", "PWNED"]
++            return real(command)
++        with tempfile.TemporaryDirectory() as tmp:
++            s = _session(tmp)
++            held = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "structured"))
++            with patch.object(G, "names_code_root", side_effect=mutate_then_call):
++                d = approve(s, held)
++            self.assertEqual(d.status, RAN)
++            self.assertIn("hi", (d.result.output if d.result else ""))
++            self.assertNotIn("PWNED", (d.result.output if d.result else ""))
++
++    def test_hostile_str_is_evaluated_once_at_freeze(self):
++        # rt-minorb-seal F1 deterministic repro: an element whose __str__ mutates a sibling on a later
++        # call cannot make seal-time and run-time disagree — freeze calls str() ONCE at hold and runs
++        # the frozen result.
++        with tempfile.TemporaryDirectory() as tmp:
++            s = _session(tmp)
++            cmd = [sys.executable, "-c", "print('CLEAN')", None]
++            class Sneak:
++                def __init__(self): self.n = 0
++                def __str__(self):
++                    self.n += 1
++                    if self.n >= 2:
++                        cmd[2] = "print('SWAPPED')"   # rewrite a sibling on any later str()
++                    return ""
++            cmd[3] = Sneak()
++            held = govern_action(s, ToolIntent("run_command", {"command": cmd}, "structured"))
++            d = approve(s, held)
++            self.assertEqual(d.status, RAN)
++            self.assertIn("CLEAN", (d.result.output if d.result else ""))
++            self.assertNotIn("SWAPPED", (d.result.output if d.result else ""))
++
++    def test_missing_binary_fails_closed_not_raises(self):
++        # F6b: a held run_command whose binary doesn't exist FAILS honestly (no exception escapes
++        # approve(), a Decision is returned, the action is not lost to a raise).
++        with tempfile.TemporaryDirectory() as tmp:
++            s = _session(tmp)
++            held = govern_action(s, ToolIntent(
++                "run_command", {"command": ["definitely-not-a-real-binary-zzz"]}, "structured"))
++            d = approve(s, held)                       # must not raise
++            self.assertEqual(d.status, "failed")
++            self.assertIn("command error", d.reason)
++
++    def test_unbalanced_quote_command_fails_closed_not_raises(self):
++        # F6b: a string command that shlex cannot split (ValueError) FAILS, never raises.
++        with tempfile.TemporaryDirectory() as tmp:
++            s = _session(tmp)
++            held = govern_action(s, ToolIntent("run_command", {"command": 'echo "unbalanced'}, "structured"))
++            d = approve(s, held)                       # must not raise
++            self.assertEqual(d.status, "failed")
++            self.assertIn("command error", d.reason)
++
++    def test_sealed_tools_is_the_single_source(self):
++        # rt-minorb-seal F3: held_action_seal seals EXACTLY the tools in SEALED_TOOLS — no drift
++        # between the seal-minting set and the approve-time verification set.
++        probe = {"command": ["x"], "path": "p", "content": "c", "url": "https://h.example/"}
++        sealed = frozenset(n for n in toolset() if held_action_seal(n, probe))
++        self.assertEqual(sealed, SEALED_TOOLS)
++
++    def test_wildcard_eq_seal_cannot_spoof_a_match(self):
++        # rt-minorb-seal F5: a hostile object whose __eq__ returns True for anything must NOT satisfy
++        # the seal check — compare_digest + the isinstance(str) guard fail it closed.
++        class AnyEq:
++            def __eq__(self, other): return True
++        with tempfile.TemporaryDirectory() as tmp:
++            s = _session(tmp)
++            held = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "structured"))
++            held.seal = AnyEq()
++            held.args["command"] = ["echo", "PWNED"]
++            d = approve(s, held)
++            self.assertEqual(d.status, DENIED)
++            self.assertFalse(held.consumed)
++
++    def test_exec_code_floor_belt_denies_autonomous_unprotected_shell(self):
++        # N2: the CODE floor is re-asserted at execution too — a direct autonomous (not human_gated)
++        # run_command reaching execute_and_verify while code protection is unavailable is DENIED,
++        # symmetric with the network floor and the floor doing all the work today.
++        from collaborator.governance import execute_and_verify
++        from collaborator.tools import get_tool
++        with tempfile.TemporaryDirectory() as tmp:
++            s = _session(tmp)
++            held = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "structured"))
++            d = execute_and_verify(s, get_tool("run_command"), held.directive, held.action_id,
++                                   dict(held.args), leash=ACT_THEN_REPORT, human_gated=False)
++            self.assertEqual(d.status, DENIED)
++            self.assertIn("code protection unavailable", d.reason)
++
++    def test_exec_network_floor_refuses_autonomous_unisolated_shell(self):
++        # F3 (real belief<->behaviour binding): with code protection available, a direct autonomous
++        # run_command with no verified netns and no signed opt-in is REFUSED BY THE EXECUTOR (it cannot
++        # isolate) -> FAILED, bound to the ACTUAL isolation result, not the govern-time belief.
++        from collaborator.governance import execute_and_verify
++        from collaborator.tools import get_tool
++        with tempfile.TemporaryDirectory() as tmp, _CODE_UP:
++            s = _session(tmp)   # unsigned -> no opt-in
++            held = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "structured"))
++            d = execute_and_verify(s, get_tool("run_command"), held.directive, held.action_id,
++                                   dict(held.args), leash=ACT_THEN_REPORT, human_gated=False)
++            self.assertEqual(d.status, "failed")
++            self.assertIn("isolation required", (d.result.error if d.result else ""))
++            self.assertIs(d.network_isolated, False)
++
++    def test_exec_belt_not_keyed_on_leash_string(self):
++        # N1: the execution belt keys on `not human_gated` (an autonomous execution), NOT the leash
++        # string — a propose_first leash with human_gated=False can't slip past the isolation refusal.
++        from collaborator.governance import execute_and_verify
++        from collaborator.tools import get_tool
++        with tempfile.TemporaryDirectory() as tmp, _CODE_UP:
++            s = _session(tmp)
++            held = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "structured"))
++            d = execute_and_verify(s, get_tool("run_command"), held.directive, held.action_id,
++                                   dict(held.args), leash=PROPOSE_FIRST, human_gated=False)
++            self.assertEqual(d.status, "failed")            # still refused, not run raw
++
++    def test_human_approved_shell_unaffected_by_exec_belt(self):
++        # A human-approved held shell is the human's call -> the execution belt does not refuse it.
++        with tempfile.TemporaryDirectory() as tmp, \
++                patch("collaborator.governance.netns_available", return_value=False):
++            s = _session(tmp)
++            held = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "structured"))
++            d = approve(s, held)
++            self.assertEqual(d.status, RAN)
++
++    def test_writefile_list_content_is_frozen_to_str(self):
++        # N3: a JSON tool call can supply a LIST content (a shared mutable). freeze_args coerces
++        # path/content to str EXACTLY as _exec_write will, so the seal binds what actually lands and an
++        # in-window mutation of the caller's list can't reach the disk.
++        with tempfile.TemporaryDirectory() as tmp:
++            s = _session(tmp, leash_overrides={"write_file": PROPOSE_FIRST})
++            content = ["approved"]
++            held = govern_action(s, ToolIntent(
++                "write_file", {"path": "note.txt", "content": content}, "structured"))
++            self.assertIsInstance(held.args["content"], str)      # frozen to str at hold
++            content[:] = ["PWNED"]                                 # mutate the caller's original list
++            d = approve(s, held)
++            self.assertEqual(d.status, RAN)
++            self.assertEqual((Path(tmp) / "note.txt").read_text(encoding="utf-8"), "['approved']")
++
++    def test_non_ascii_seal_denies_and_does_not_raise(self):
++        # F5b: a tampered NON-ASCII seal must DENY (fail closed), never raise out of approve() (a real
++        # seal is always an ASCII hexdigest; the .isascii() guard fails a non-ascii one closed).
++        with tempfile.TemporaryDirectory() as tmp:
++            s = _session(tmp)
++            held = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "structured"))
++            held.seal = "café-not-a-real-seal-\U0001f600"
++            d = approve(s, held)                                  # must not raise
++            self.assertEqual(d.status, DENIED)
++            self.assertFalse(held.consumed)
++
++    def test_surrogate_seal_denies_and_does_not_raise(self):
++        # F5b residual (rt-minorb-seal): a lone-surrogate tampered seal must DENY, never raise a
++        # UnicodeEncodeError — the .isascii() guard catches it before any encode.
++        with tempfile.TemporaryDirectory() as tmp:
++            s = _session(tmp)
++            held = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "structured"))
++            held.seal = "\ud800deadbeef"                          # lone surrogate
++            d = approve(s, held)                                  # must not raise
++            self.assertEqual(d.status, DENIED)
++            self.assertFalse(held.consumed)
++
++    def test_str_subclass_content_is_frozen_to_plain_str(self):
++        # rt-minorb-seal residual: a str SUBCLASS with a drifting __str__ in content must be coerced
++        # to a plain str at freeze (str() evaluated once), so seal and disk can never diverge.
++        class DriftStr(str):
++            _n = [0]
++            def __str__(self):
++                self._n[0] += 1
++                return "DRIFTED" if self._n[0] >= 3 else "approved"
++        with tempfile.TemporaryDirectory() as tmp:
++            s = _session(tmp, leash_overrides={"write_file": PROPOSE_FIRST})
++            held = govern_action(s, ToolIntent(
++                "write_file", {"path": "n.txt", "content": DriftStr("approved")}, "structured"))
++            self.assertIs(type(held.args["content"]), str)       # plain str, not the drifting subclass
++            d = approve(s, held)
++            self.assertEqual(d.status, RAN)
++            self.assertEqual(held.args["content"], (Path(tmp) / "n.txt").read_text(encoding="utf-8"))
++
++
++class ExternalPanelFixes(unittest.TestCase):
++    """Regressions for the 5-vendor certification panel's convergent finding — approve() must be a
++    SELF-CONTAINED approved==executed boundary, not reliant on govern_action having frozen/sealed."""
++
++    def test_approve_re_freezes_unfrozen_args(self):
++        # gemini (HIGH): a HELD decision whose args are a shared MUTABLE (not frozen by govern_action)
++        # must still be safe — approve() re-freezes, so an in-window mutation can't change execution.
++        import collaborator.governance as G
++        real = G.names_code_root
++        def mutate(cmd):
++            if isinstance(cmd, list) and "APPROVED" in cmd:
++                cmd[:] = ["echo", "PWNED"]
++            return real(cmd)
++        with tempfile.TemporaryDirectory() as tmp:
++            s = _session(tmp)
++            held = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "structured"))
++            held.args = {"command": ["echo", "APPROVED"]}        # simulate UNFROZEN args at approve
++            held.seal = held_action_seal("run_command", held.args)
++            with patch.object(G, "names_code_root", side_effect=mutate):
++                d = approve(s, held)
++            self.assertEqual(d.status, RAN)
++            self.assertIn("APPROVED", (d.result.output if d.result else ""))
++            self.assertNotIn("PWNED", (d.result.output if d.result else ""))
++
++    def test_tool_rebind_downgrade_is_denied(self):
++        # grok (MEDIUM): a Decision.tool rebound to a non-sealed tool while keeping a leftover seal is
++        # DENIED — a write_file hold cannot be downgraded to a read_file of the same path.
++        with tempfile.TemporaryDirectory() as tmp:
++            s = _session(tmp, leash_overrides={"write_file": PROPOSE_FIRST})
++            (Path(tmp) / "secret.txt").write_text("SECRET", encoding="utf-8")
++            held = govern_action(s, ToolIntent(
++                "write_file", {"path": "secret.txt", "content": "overwrite"}, "structured"))
++            held.tool = "read_file"                              # rebind to downgrade write -> read
++            d = approve(s, held)
++            self.assertEqual(d.status, DENIED)                   # leftover write_file seal can't match
++
++    def test_seal_binds_tool_identity(self):
++        # the seal includes the tool name, so identical args seal differently per tool — a rebind
++        # between two SEALED tools cannot replay one's sealed args as the other's action.
++        common = {"command": ["x"], "path": "x", "content": "x"}
++        a = held_action_seal("run_command", common)
++        b = held_action_seal("write_file", common)
++        self.assertTrue(a and b)
++        self.assertNotEqual(a, b)
++
++
++if __name__ == "__main__":
++    sys.exit(unittest.main())
+diff --git a/tests/test_collaborator_staging.py b/tests/test_collaborator_staging.py
+index 8613c6e..0851d40 100644
+--- a/tests/test_collaborator_staging.py
++++ b/tests/test_collaborator_staging.py
+@@ -320,10 +320,14 @@ class ProposerShellAndApproveGates(unittest.TestCase):
+             d_user = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "structured"))
+             self.assertEqual(d_user.leash, PROPOSE_FIRST)
+             self.assertEqual(d_user.status, HELD)
+-            # The PROPOSER floor is additionally proposer-SPECIFIC: with code protection available (so
+-            # the autonomy floor stands down), a user-directed command keeps ACT_THEN_REPORT while a
+-            # proposer-originated one is STILL floored to propose_first.
+-            with patch("collaborator.governance.code_protection_available", return_value=True):
++            # The PROPOSER floor is additionally proposer-SPECIFIC: with BOTH autonomy floors stood
++            # down — code protection available (Harm A) AND network isolation available (ADR 0003
++            # revisit #1a; netns is unavailable on this dev host, so patch it) — a user-directed
++            # command keeps ACT_THEN_REPORT while a proposer-originated one is STILL floored to
++            # propose_first. (The two floors are orthogonal; isolating the proposer floor requires
++            # neutralising both.)
++            with patch("collaborator.governance.code_protection_available", return_value=True), \
++                 patch("collaborator.governance.netns_available", return_value=True):
+                 d2 = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "structured"))
+                 self.assertEqual(d2.leash, ACT_THEN_REPORT)
+                 d3 = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "proposed"))
