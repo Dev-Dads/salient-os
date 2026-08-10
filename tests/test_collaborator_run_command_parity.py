@@ -274,8 +274,11 @@ class RedTeamFixes(unittest.TestCase):
 
     def test_missing_binary_fails_closed_not_raises(self):
         # F6b: a held run_command whose binary doesn't exist FAILS honestly (no exception escapes
-        # approve(), a Decision is returned, the action is not lost to a raise).
-        with tempfile.TemporaryDirectory() as tmp:
+        # approve(), a Decision is returned, the action is not lost to a raise). Run UNWRAPPED so the
+        # missing binary raises FileNotFoundError from subprocess (the F6b catch path) rather than
+        # becoming a shell "command not found" exit 127 inside the netns wrapper on Linux.
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch("collaborator.tools.wrap_no_network", side_effect=_unisolated):
             s = _session(tmp)
             held = govern_action(s, ToolIntent(
                 "run_command", {"command": ["definitely-not-a-real-binary-zzz"]}, "structured"))
