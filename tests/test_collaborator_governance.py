@@ -90,7 +90,12 @@ class HonestFailure(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             s = _session(tmp, caps=("fs.read:project", "fs.write:project", "shell.exec"),
                          leash_overrides={"run_command": "act_then_report"})
-            d = govern_action(s, ToolIntent("run_command", {"command": [sys.executable, "-c", "import sys;sys.exit(3)"]}, "structured"))
+            held = govern_action(s, ToolIntent("run_command", {"command": [sys.executable, "-c", "import sys;sys.exit(3)"]}, "structured"))
+            # F-6 Harm A: run_command autonomy is withheld until code protection is verified, so an
+            # act_then_report shell is HELD (not auto-run). The human hand approves; the honest exit
+            # code still drives the result — which is the point of THIS test.
+            self.assertEqual(held.status, HELD)
+            d = approve(s, held)
             self.assertEqual(d.status, FAILED)  # real exit code drives the honest result
             self.assertFalse(d.cleared)
 

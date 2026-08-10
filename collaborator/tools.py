@@ -1,10 +1,22 @@
 """The Collaborator's small, honest, workspace-fenced toolset.
 
-Every tool is confined to a declared workspace root. The Collaborator's own wiring
-(its config, policy key, audit trail) lives OUTSIDE that root, so a governed tool
-can never rewrite the rules it runs under (panel gap #1). Paths are resolved and
-containment-checked BEFORE execution (defence in depth — the verifier's observers
-also fail closed on an escaping path, but we refuse to even run one).
+``write_file``/``read_file`` are confined to a declared workspace root: paths are resolved and
+containment-checked BEFORE execution (defence in depth — the verifier's observers also fail closed
+on an escaping path, but we refuse to even run one). The Collaborator's own wiring (its config,
+policy key, audit trail, and CODE) lives OUTSIDE that root — enforced for the workspace by
+``codefence.disjoint_from_code`` — so a FENCED tool can never rewrite the rules it runs under.
+
+``run_command`` is the honest exception: it has NO filesystem fence (a shell may write anywhere,
+which is exactly what system maintenance NEEDS). So a governed shell COULD, unfenced, overwrite the
+Collaborator's own code and neuter F1 — the rulebook-rewrite path (red-team F-6 "Harm A"). Two
+cross-platform layers bound that today: a PROPOSER may never self-originate a ``run_command`` naming
+the code root (hard-denied in the seam), and ``run_command`` AUTONOMY is WITHHELD until its
+write-reach to the code is structurally prevented (``codefence.code_protection_available`` — False
+in this build), so an unfenced shell can never AUTO-run; it always gets a human hand, who sees a
+``⚠ code NOT protected`` flag. The STRUCTURAL guarantee for a human-APPROVED ``run_command`` (an
+OS-level read-only bind of the code, or a separate maintenance trust domain) is a deferred
+follow-up — until it lands, the "can never rewrite the rules" claim holds for ``write_file``, not
+for an approved ``run_command``. See ``collaborator/codefence.py``.
 
 Mutating tools run under the verifier's supervisor (``run_supervised``) so the
 world can be observed independently of what the tool reports — the basis for the
@@ -28,6 +40,7 @@ from salienceos.verifier.observers import SupervisedResult, run_supervised
 from salienceos.verifier.signing import sha256_bytes
 
 from collaborator import egress
+from collaborator.codefence import code_protection_available
 from collaborator.netns import isolation_unverified, wrap_no_network
 
 COLLABORATOR_TOOLS_VERSION = "0.1.0"
@@ -88,6 +101,9 @@ class Execution:
     egress: "egress.EgressRecord | None" = None  # ADR 0003: channel-integrity audit of a net.get
     network_isolated: "bool | None" = None  # ADR 0003 revisit #1: run_command ran in a netns
                                             # (None = not a network-isolable tool)
+    code_protected: "bool | None" = None  # F-6 Harm A: run_command ran with its write-reach to the
+                                          # Collaborator's OWN code structurally prevented (None =
+                                          # not a code-reaching tool; False until OS protection ships)
 
 
 _TOOLS: dict[str, Tool] = {
@@ -291,6 +307,9 @@ def _exec_command(workspace, args: dict) -> Execution:
         supervised=res, exit_code=res.returncode,
         write_set=(),  # nothing declared; observe_action's write-set diff catches undeclared writes
         artifact_hashes={}, network_isolated=isolated,
+        # F-6 Harm A: honest — False until the OS-level read-only-bind protection lands. While False
+        # the seam withholds run_command autonomy, so an unfenced shell never AUTO-runs.
+        code_protected=code_protection_available(),
     )
 
 

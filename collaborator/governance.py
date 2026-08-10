@@ -35,6 +35,7 @@ from salienceos.verifier import issue_envelope, issue_receipt
 from salienceos.verifier.observers import observe_action, snapshot_tree
 
 from collaborator import egress
+from collaborator.codefence import code_protection_available, names_code_root
 from collaborator.tools import (
     ACT_THEN_REPORT,
     NOTIFY_ONLY,
@@ -121,6 +122,12 @@ class Decision:
     # ADR 0003 revisit #1: whether a run_command ran network-isolated (netns). None for tools
     # that are not network-isolable; True/False honestly reflects whether isolation applied.
     network_isolated: "bool | None" = None
+    # F-6 Harm A: whether a run_command ran with its write-reach to the Collaborator's OWN code
+    # structurally prevented (None = not a code-reaching tool; False until OS-level protection ships).
+    code_protected: "bool | None" = None
+    # F-6 Harm A audit-only tag: the run_command's command literally named a protected code root —
+    # a POROUS recognizer, never a deny; the boundary is structural (see codefence.names_code_root).
+    code_touch: str = ""
     # ADR 0003 Tier 2 (panel: approved != sent): a seal over a HELD EMISSION's consequential
     # payload (canonical dest + request target + content-type + body), captured at hold time. An
     # emission has no verifier, so approval re-checks this seal and REFUSES if the held args were
@@ -140,6 +147,10 @@ class Decision:
             tail += f"  ⚑ offense-shape audit: {self.offense_flag}"
         if self.network_isolated is not None:  # ADR 0003 revisit #1 — honest per-run flag
             tail += "  🔒 net-isolated" if self.network_isolated else "  ⚠ net NOT isolated (raw reach)"
+        if self.code_protected is not None:  # F-6 Harm A — honest per-run flag
+            tail += "  🔒 code-protected" if self.code_protected else "  ⚠ code NOT protected (unfenced shell)"
+        if self.code_touch:  # F-6 Harm A — audit-only tag (never a deny)
+            tail += f"  ⚑ code-touch audit: {self.code_touch}"
         if self.status == RAN:
             out = (self.result.output if self.result else "") or "(no output)"
             # An egress action is channel-LOGGED, not world-verified (the mediated client both makes
@@ -328,6 +339,20 @@ def govern_action(session, intent: ToolIntent, importance: "float | None" = None
                                 "placement here requires explicit approval"),
                         leash=leash, directive=directive, args=intent.args)
 
+    # --- code-root hard-deny for PROPOSER-originated run_command (F-6 Harm A) -
+    # A proposer must NEVER self-originate a shell command targeting the Collaborator's own code
+    # (governance/verifier/…) — the rulebook-rewrite path. Hard-denied outright (like the
+    # controlled-location deny above), not merely floored, because there is no legitimate
+    # proposer-authored reason to rewrite the rules it runs under. Keyed on the model-unforgeable
+    # intent.source == "proposed". POROUS (names_code_root is a literal recognizer, NOT the
+    # boundary) — defence-in-depth over the deferred OS-level structural protection.
+    if (intent.name == "run_command" and getattr(intent, "source", "") == "proposed"
+            and names_code_root(intent.args.get("command"))):
+        return Decision(action_id=action_id, tool=tool.name, status=DENIED,
+                        reason=("the proposer may not self-originate a command targeting the "
+                                "Collaborator's own code"),
+                        leash=leash, directive=directive, args=intent.args)
+
     # --- EMISSION FLOOR / auto-lift (ADR 0003 Tier 2) ------------------------
     # A side-effecting egress (net_post) is "acting on the world" — the less-reversible,
     # un-verifiable channel — so it is HUMAN-GATED by default. It may run autonomously
@@ -362,6 +387,18 @@ def govern_action(session, intent: ToolIntent, importance: "float | None" = None
                 and leash == ACT_THEN_REPORT)
         if not auto:
             leash = apply_cap(leash, PROPOSE_FIRST)
+
+    # --- run_command AUTONOMY-WITHHELD FLOOR (F-6 Harm A) --------------------
+    # run_command has NO filesystem fence: an autonomous shell could overwrite the Collaborator's
+    # own code and neuter F1. Until that write-reach is STRUCTURALLY prevented (an OS-level
+    # read-only bind of the code root — deferred), WITHHOLD autonomy — an act_then_report
+    # run_command floors to propose_first so it can never AUTO-run, only run under a human hand. An
+    # INDEPENDENT, monotonic floor: composes with the emission floor and PR B's (future) network
+    # floor by ANDing (stricter always wins, no shared mutable state); an explicit host tighten
+    # (notify_only) survives, being stricter than the floor.
+    if (intent.name == "run_command" and leash == ACT_THEN_REPORT
+            and not code_protection_available()):
+        leash = apply_cap(leash, PROPOSE_FIRST)
 
     # --- LEASH (second axis) — ALLOWLIST dispatch (red-team F0) ---------------
     # Run ONLY on the explicit act_then_report; notify_only notifies; EVERYTHING ELSE (propose_first
@@ -401,6 +438,14 @@ def govern_action(session, intent: ToolIntent, importance: "float | None" = None
                "verification_depth": directive.verification_depth}
     if getattr(tool, "egress", False):
         preview["canonical_dest"] = egress.canonical_host(str(intent.args.get("url") or ""))
+    if intent.name == "run_command":
+        # Surface the honest code-protection posture + any literal self-code reference to the human
+        # who holds the hand on this shell (F-6 Harm A). code_protection_available() is False in this
+        # build, so this reads "not protected" — the honest state until OS-level protection lands.
+        preview["code_protected"] = code_protection_available()
+        _named = names_code_root(intent.args.get("command"))
+        if _named:
+            preview["names_code_root"] = _named
     reason = ("propose-first leash: awaiting approval" if leash == PROPOSE_FIRST
               else f"unrecognised leash {leash!r} -> held (fail-closed)")
     return Decision(action_id=action_id, tool=tool.name, status=HELD, reason=reason, leash=leash,
@@ -546,17 +591,19 @@ def execute_and_verify(session, tool: Tool, directive, action_id: str, args: dic
     # can't be narrated as success.
     if tool.verify_mode == "exit":
         offense_flag = flag_offense_shape(tool.name, args)  # audit-only tag, never a deny
+        code_touch = names_code_root(args.get("command"))   # F-6 audit-only tag (porous), never a deny
         try:
             execution = execute_tool(tool, session.workspace, args)
         except WorkspaceError as exc:
             return Decision(action_id, tool.name, DENIED, str(exc), leash, directive=directive,
-                            args=args, offense_flag=offense_flag)
+                            args=args, offense_flag=offense_flag, code_touch=code_touch)
         cleared = bool(execution.result.ok)
         return Decision(action_id, tool.name, RAN if cleared else FAILED,
                         "supervised exit 0" if cleared else f"exit {execution.exit_code}",
                         leash, cleared=cleared, result=execution.result, directive=directive,
                         args=args, offense_flag=offense_flag,
-                        network_isolated=execution.network_isolated)
+                        network_isolated=execution.network_isolated,
+                        code_protected=execution.code_protected, code_touch=code_touch)
 
     # verify_mode == "artifact": build envelope BEFORE running, snapshot, execute
     # receipt from the REAL result, observe world independently, govern.
