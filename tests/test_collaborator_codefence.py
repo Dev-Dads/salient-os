@@ -72,15 +72,31 @@ class DisjointnessGuard(unittest.TestCase):
         with self.assertRaises(ValueError):
             Session(workspace=str(_ROOT))
 
-    def test_empty_protected_roots_fails_closed(self):
-        # PR #33 certification panel (4/5): a governance guard must never silently no-op. If we
-        # can't locate our own code roots, refuse EVERY workspace rather than fail open.
-        with patch.object(codefence, "PROTECTED_ROOTS", ()):
+    def test_incomplete_resolved_packages_fail_closed(self):
+        # PR #34 + completeness panel (5/5): completeness is by SLOT (which package resolved), not by
+        # directory basename. If EITHER expected package fails to resolve, refuse EVERY workspace —
+        # empty, collaborator-only, AND salienceos-only all fail closed.
+        for resolved in (frozenset(), frozenset({"collaborator"}), frozenset({"salienceos"})):
+            with self.subTest(resolved=sorted(resolved)):
+                with patch.object(codefence, "_RESOLVED_PACKAGES", resolved):
+                    with tempfile.TemporaryDirectory() as tmp:
+                        with self.assertRaises(codefence.WorkspaceOverlapsCodeError):
+                            codefence.disjoint_from_code(tmp)
+                        with self.assertRaises(ValueError):
+                            Session(workspace=tmp)
+
+    def test_completeness_is_slot_based_not_basename(self):
+        # completeness panel (5/5): a legitimate layout where a package dir basename differs from the
+        # import name (case-insensitive checkout naming it SalienceOS, a symlink, an editable/vendor
+        # install) must NOT false-fail — completeness tracks which MODULE resolved, not the directory
+        # basename. Odd-named roots + complete slots => construction still succeeds.
+        tmproot = Path(tempfile.gettempdir())
+        odd_roots = (tmproot / "SalienceOS-v2", tmproot / "collab-impl")  # basenames != import names
+        with patch.object(codefence, "PROTECTED_ROOTS", odd_roots), \
+             patch.object(codefence, "_RESOLVED_PACKAGES", frozenset(codefence._EXPECTED_PACKAGES)):
             with tempfile.TemporaryDirectory() as tmp:
-                with self.assertRaises(codefence.WorkspaceOverlapsCodeError):
-                    codefence.disjoint_from_code(tmp)
-                with self.assertRaises(ValueError):
-                    Session(workspace=tmp)
+                codefence.disjoint_from_code(tmp)  # must NOT raise despite odd basenames
+                Session(workspace=tmp)             # constructs fine
 
 
 class NamesCodeRootRecognizer(unittest.TestCase):

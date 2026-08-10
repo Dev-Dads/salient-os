@@ -37,27 +37,49 @@ import salienceos
 COLLABORATOR_CODEFENCE_VERSION = "0.1.0"
 
 
-def _resolved_roots() -> "tuple[Path, ...]":
-    """The Collaborator's own code roots — ``collaborator/`` (this package) and ``salienceos/``
-    (the interpreter/verifier core the seam calls into). The F1 guarantee spans BOTH, so both are
-    protected. Resolved once at import; a module whose path can't be resolved is skipped. If that
-    leaves NO roots at all, ``disjoint_from_code`` fails CLOSED (refuses every workspace) rather than
-    silently protecting nothing — a governance guard must never no-op (the unanimous top-fix from the
-    5-vendor PR #33 certification panel)."""
-    roots: list[Path] = []
-    for mod_file in (__file__, getattr(salienceos, "__file__", None)):
-        if not mod_file:
+def _code_slots() -> "tuple[tuple[str, object], ...]":
+    """THE single source of truth for the F1 protected perimeter: ``(slot name, that package's
+    __file__)``. The Collaborator's own code lives in EXACTLY these packages; ``collaborator/`` comes
+    from THIS module's ``__file__`` (always present — codefence.py lives in it), ``salienceos/`` from
+    the imported core's ``__file__``. Add a package HERE and BOTH ``PROTECTED_ROOTS`` and the
+    completeness check pick it up — there is no second hand-maintained list to keep in lockstep (a
+    completeness-panel maintainability finding: two drifting sources would fail closed on the next
+    perimeter change)."""
+    return (("collaborator", __file__), ("salienceos", getattr(salienceos, "__file__", None)))
+
+
+# The expected perimeter, DERIVED from the single slot source above (never a duplicate literal).
+_EXPECTED_PACKAGES = tuple(name for name, _ in _code_slots())
+
+
+def _resolved_roots() -> "tuple[tuple[str, Path], ...]":
+    """``(<slot name>, <resolved package dir>)`` for each perimeter package (``_code_slots``) that
+    RESOLVED. A slot whose ``__file__`` is missing / unresolvable / not-a-dir is DROPPED —
+    ``disjoint_from_code`` then fails CLOSED because a required slot is absent (empty OR partial
+    resolve). Completeness is thus by SLOT (which module resolved), NOT by directory basename, so a
+    legitimately odd-named package dir cannot false-fail. Resolved once at import (before any
+    run_command could move things)."""
+    out: list[tuple[str, Path]] = []
+    for name, mod_file in _code_slots():
+        if not mod_file:  # e.g. a namespace package with no __file__ — slot absent => fail closed
             continue
         try:
             p = Path(mod_file).resolve().parent
         except (OSError, ValueError, RuntimeError):
             continue
-        if p.is_dir() and p not in roots:
-            roots.append(p)
-    return tuple(roots)
+        if p.is_dir():
+            out.append((name, p))
+    # No path-dedup: distinct packages have distinct dirs, and the degenerate "both in one dir" case
+    # simply protects that dir under BOTH slots (correct — it contains both). Deriving PROTECTED_ROOTS
+    # and _RESOLVED_PACKAGES from this single list keeps them impossible to desync (completeness-panel).
+    return tuple(out)
 
 
-PROTECTED_ROOTS: "tuple[Path, ...]" = _resolved_roots()
+_RESOLVED: "tuple[tuple[str, Path], ...]" = _resolved_roots()
+# The resolved code-root directories (consumed by disjoint_from_code + names_code_root).
+PROTECTED_ROOTS: "tuple[Path, ...]" = tuple(p for _, p in _RESOLVED)
+# Which EXPECTED packages actually resolved — the completeness signal (by slot, not basename).
+_RESOLVED_PACKAGES: "frozenset[str]" = frozenset(name for name, _ in _RESOLVED)
 
 
 class WorkspaceOverlapsCodeError(ValueError):
@@ -72,15 +94,17 @@ def disjoint_from_code(workspace) -> None:
     any protected code root. Enforces the invariant ``tools.py`` already ASSUMES ("the Collaborator's
     wiring lives OUTSIDE the workspace root"), so the fenced ``write_file``/``read_file`` can never
     reach the code. Checked at Session construction — fail LOUD, like the leash/proactivity checks."""
-    if not PROTECTED_ROOTS:
-        # Fail CLOSED: we could not locate our own code roots, so refuse to construct a session
-        # rather than let this guard silently become a NO-OP (a governance guard must never fail
-        # OPEN — the unanimous top-fix from the 5-vendor PR #33 certification panel). Only reachable
-        # in a pathological import env (no resolvable __file__ on EITHER package); collaborator/
-        # normally always resolves, so this never fires in normal operation.
+    missing = [pkg for pkg in _EXPECTED_PACKAGES if pkg not in _RESOLVED_PACKAGES]
+    if missing:
+        # Fail CLOSED: a required code-root package did not resolve, so refuse EVERY workspace rather
+        # than leave it silently unfenced (empty OR partial resolve — the unanimous PR #34 finding; a
+        # governance guard must never fail OPEN). Completeness is by SLOT (which module resolved), not
+        # directory basename, so a legitimately odd-named package dir does NOT false-fail (the
+        # completeness-panel finding). Only reachable in a pathological import env (a package with no
+        # resolvable __file__); both packages resolve normally, so this never fires in normal operation.
         raise WorkspaceOverlapsCodeError(
-            "cannot locate the Collaborator's own code roots — refusing to construct a session "
-            "(structural code protection would otherwise be a silent no-op)")
+            f"could not locate all of the Collaborator's own code roots (missing: {missing}) — "
+            "refusing to construct a session (partial or absent code protection would be a silent no-op)")
     try:
         ws = Path(workspace).resolve()
     except (OSError, ValueError, RuntimeError) as exc:
