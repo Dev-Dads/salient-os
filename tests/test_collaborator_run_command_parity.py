@@ -35,6 +35,19 @@ _CAPS = ("fs.read:project", "fs.write:project", "shell.exec")
 _CODE_UP = patch("collaborator.governance.code_protection_available", return_value=True)
 
 
+# The EXECUTOR's real isolation depends on the host (Linux+userns isolates; this Windows dev host and
+# many CI sandboxes do not). Tests that reach the executor autonomously and assert an
+# isolation-dependent outcome patch wrap_no_network to force a DETERMINISTIC result — otherwise the
+# same test passes on Windows (no netns) and fails on an Ubuntu runner (netns available) or vice
+# versa. The Linux @skipUnless IsolationProof tests exercise the real thing.
+def _unisolated(argv):
+    return [str(a) for a in argv], False
+
+
+def _isolated(argv):
+    return [str(a) for a in argv], True
+
+
 def _session(tmp, *, caps=_CAPS, **kw):
     return Session(workspace=tmp, capabilities=caps, **kw)
 
@@ -57,16 +70,17 @@ class IsolationEarnsAutonomyFloor(unittest.TestCase):
         # the shell may auto-run (act_then_report). The isolation flag stays HONESTLY False (real
         # netns is unavailable on this dev host — the executor never claims isolation it lacks).
         with tempfile.TemporaryDirectory() as tmp, _CODE_UP, \
-                patch("collaborator.governance.netns_available", return_value=False):
+                patch("collaborator.governance.netns_available", return_value=False), \
+                patch("collaborator.tools.wrap_no_network", side_effect=_unisolated):
             key = b"caps-key"
             signed = mint(("shell.exec", netns.SHELL_RAW_NETWORK_CAP),
                           {"run_command": ACT_THEN_REPORT}, "admin", workspace_subject(tmp), key)
             s = Session(workspace=tmp, policy_caps=signed, caps_key=key,
                         leash_overrides={"run_command": ACT_THEN_REPORT})
             d = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "structured"))
-            self.assertEqual(d.status, RAN)
+            self.assertEqual(d.status, RAN)                 # opt-in lets an UNISOLATED shell auto-run
             self.assertEqual(d.leash, ACT_THEN_REPORT)
-            self.assertIs(d.network_isolated, False)   # honest — no raw-reach claim of isolation
+            self.assertIs(d.network_isolated, False)        # honest — ran raw, under the signed opt-in
 
     def test_UNSIGNED_raw_network_optin_does_NOT_stand_the_floor_down(self):
         # red-team F1: the raw-reach opt-in is the "run raw unattended" signal, so — like the emission
@@ -85,8 +99,6 @@ class IsolationEarnsAutonomyFloor(unittest.TestCase):
         # the shell auto-runs. On this non-Linux dev host real netns is absent, so wrap_no_network is
         # patched to simulate a host that DOES isolate (the Linux IsolationProof tests exercise the
         # real thing); with the isolation actually achieved, require_isolation is satisfied.
-        def _isolated(argv):
-            return [str(a) for a in argv], True
         with tempfile.TemporaryDirectory() as tmp, _CODE_UP, \
                 patch("collaborator.governance.netns_available", return_value=True), \
                 patch("collaborator.tools.wrap_no_network", side_effect=_isolated):
@@ -321,7 +333,8 @@ class RedTeamFixes(unittest.TestCase):
         # isolate) -> FAILED, bound to the ACTUAL isolation result, not the govern-time belief.
         from collaborator.governance import execute_and_verify
         from collaborator.tools import get_tool
-        with tempfile.TemporaryDirectory() as tmp, _CODE_UP:
+        with tempfile.TemporaryDirectory() as tmp, _CODE_UP, \
+                patch("collaborator.tools.wrap_no_network", side_effect=_unisolated):
             s = _session(tmp)   # unsigned -> no opt-in
             held = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "structured"))
             d = execute_and_verify(s, get_tool("run_command"), held.directive, held.action_id,
@@ -335,7 +348,8 @@ class RedTeamFixes(unittest.TestCase):
         # string — a propose_first leash with human_gated=False can't slip past the isolation refusal.
         from collaborator.governance import execute_and_verify
         from collaborator.tools import get_tool
-        with tempfile.TemporaryDirectory() as tmp, _CODE_UP:
+        with tempfile.TemporaryDirectory() as tmp, _CODE_UP, \
+                patch("collaborator.tools.wrap_no_network", side_effect=_unisolated):
             s = _session(tmp)
             held = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "structured"))
             d = execute_and_verify(s, get_tool("run_command"), held.directive, held.action_id,
