@@ -1,5 +1,5 @@
 diff --git a/collaborator/governance.py b/collaborator/governance.py
-index 7a97216..bcc648b 100644
+index 7a97216..fa3ba30 100644
 --- a/collaborator/governance.py
 +++ b/collaborator/governance.py
 @@ -36,6 +36,7 @@ from salienceos.verifier.observers import observe_action, snapshot_tree
@@ -30,7 +30,7 @@ index 7a97216..bcc648b 100644
          if self.status == RAN:
              out = (self.result.output if self.result else "") or "(no output)"
              # An egress action is channel-LOGGED, not world-verified (the mediated client both makes
-@@ -356,6 +363,23 @@ def govern_action(session, intent: ToolIntent, importance: "float | None" = None
+@@ -356,6 +363,28 @@ def govern_action(session, intent: ToolIntent, importance: "float | None" = None
                                  "Collaborator's own code"),
                          leash=leash, directive=directive, args=intent.args)
  
@@ -40,10 +40,15 @@ index 7a97216..bcc648b 100644
 +    # (e.g. `chmod 600 ~/.ssh/id_rsa` hardening) — but that is the HUMAN's to DIRECT, not the model's
 +    # to self-originate: a one-click-approvable command that reads the operator's private keys is the
 +    # confused-deputy surface this refuses (an adversarial / memory-poisoned proposer). DENY outright
-+    # (operator-confirmed), keyed on the model-unforgeable intent.source == "proposed"; a USER/HOST-
-+    # directed command is deliberately UNAFFECTED (maintenance preserved). Placed after the code-root
-+    # deny so a command naming BOTH surfaces the higher-severity code reason first. POROUS DiD — there
-+    # is NO structural boundary here and none planned (see sensitivepaths.names_sensitive_path).
++    # (operator-confirmed), keyed on the model-unforgeable intent.source == "proposed". SCOPE (owned,
++    # not hidden): ONLY the fully-autonomous PROPOSER channel is hard-denied. A USER/HOST-directed
++    # command AND the model's in-turn channel (source in {structured, content_*}) are deliberately
++    # UNAFFECTED here — byte-identical to the code-root deny's scope above. On the turn channel a
++    # secret-touching command is not denied but HELD with the ⚠ (names_sensitive_path) in the preview,
++    # and the run_command AUTONOMY-WITHHELD FLOOR below guarantees it can never AUTO-run — so the human
++    # hand + the ⚠ are the mitigation there (maintenance preserved; the deceived-human approve is the
++    # acknowledged residual). Placed after the code-root deny so a command naming BOTH surfaces the
++    # higher-severity code reason first. POROUS DiD — NO structural boundary here and none planned.
 +    if (intent.name == "run_command" and getattr(intent, "source", "") == "proposed"
 +            and names_sensitive_path(intent.args.get("command"))):
 +        return Decision(action_id=action_id, tool=tool.name, status=DENIED,
@@ -54,7 +59,7 @@ index 7a97216..bcc648b 100644
      # --- EMISSION FLOOR / auto-lift (ADR 0003 Tier 2) ------------------------
      # A side-effecting egress (net_post) is "acting on the world" — the less-reversible,
      # un-verifiable channel — so it is HUMAN-GATED by default. It may run autonomously
-@@ -479,6 +503,11 @@ def govern_action(session, intent: ToolIntent, importance: "float | None" = None
+@@ -479,6 +508,11 @@ def govern_action(session, intent: ToolIntent, importance: "float | None" = None
          _named = names_code_root(args.get("command"))
          if _named:
              preview["names_code_root"] = _named
@@ -66,7 +71,7 @@ index 7a97216..bcc648b 100644
          # ADR 0003 revisit #1a: whether this shell will run with RAW network reach (no netns
          # isolation on this host) — the honest posture the approving human sees. LIVE off-Linux
          # (netns_available() is False), independent of whether the raw-reach opt-in was granted:
-@@ -649,18 +678,21 @@ def execute_and_verify(session, tool: Tool, directive, action_id: str, args: dic
+@@ -649,18 +683,21 @@ def execute_and_verify(session, tool: Tool, directive, action_id: str, args: dic
      if tool.verify_mode == "exit":
          offense_flag = flag_offense_shape(tool.name, args)  # audit-only tag, never a deny
          code_touch = names_code_root(args.get("command"))   # F-6 audit-only tag (porous), never a deny
@@ -90,7 +95,7 @@ index 7a97216..bcc648b 100644
          cleared = bool(execution.result.ok)
          if cleared:
              reason = "supervised exit 0"
-@@ -674,7 +706,8 @@ def execute_and_verify(session, tool: Tool, directive, action_id: str, args: dic
+@@ -674,7 +711,8 @@ def execute_and_verify(session, tool: Tool, directive, action_id: str, args: dic
                          leash, cleared=cleared, result=execution.result, directive=directive,
                          args=args, offense_flag=offense_flag,
                          network_isolated=execution.network_isolated,
@@ -130,10 +135,10 @@ index ee459b5..d16ceb1 100644
      # emission seal closes for net_post, now closed uniformly for the other unbounded-reach tools. A
 diff --git a/collaborator/sensitivepaths.py b/collaborator/sensitivepaths.py
 new file mode 100644
-index 0000000..4570079
+index 0000000..26363cf
 --- /dev/null
 +++ b/collaborator/sensitivepaths.py
-@@ -0,0 +1,82 @@
+@@ -0,0 +1,89 @@
 +"""Best-effort recognition of a ``run_command`` naming the OPERATOR's sensitive host paths
 +(SSH keys, cloud/OS credentials) — a DIFFERENT concern from ``codefence`` (which protects the
 +Collaborator's OWN code). Cross-platform, stdlib-only, NO new dependency.
@@ -174,10 +179,17 @@ index 0000000..4570079
 +#     .env is workspace-local project config, not a HOST secret. Excluded — recall loss is acceptable.
 +#   * ".npmrc" — touched constantly by npm / CI / Dockerfiles → noise.
 +#   * bare "credentials.json" / "login data" (unanchored) — too generic.
-+# Accepted porous false-positive: dumb substring means "id_rsa" also hits "grid_rsa" — rare, and on the
-+# DENY path it only affects a model-authored proposer command (recoverable via human-direction). Kept
-+# faithful to ``names_code_root`` (dumb substring, no token anchoring) and documented rather than
-+# complicated. The trailing "borderline tier" is safe to drop first if an FP-audit complains.
++# BROAD-RECALL EXCEPTION (the one place we favour recall over precision, deliberately): ".ssh/" matches
++# the WHOLE key directory, so a proposed command touching a NON-secret sibling (".ssh/config",
++# ".ssh/known_hosts", "chmod 700 ~/.ssh/") is also denied. That is intended: a custom-named private key
++# (~/.ssh/id_company, ~/.ssh/deploy_key) would slip a filename-only list, so the crown-jewel directory
++# is treated as deny-and-redirect for a PROPOSER (proposer-only, fully recoverable by human direction).
++# The module's "precision over recall" default holds everywhere else; ".ssh/" is the marked exception.
++# Accepted porous false-positive: dumb substring means "id_rsa" also hits "grid_rsa" (e.g. cloning a
++# repo literally named that) — rare, and on the DENY path it only affects a model-authored proposer
++# command (recoverable via human-direction). Kept faithful to ``names_code_root`` (dumb substring, no
++# token anchoring) and documented rather than complicated. The trailing "borderline tier" (.pypirc,
++# .docker/config.json) is safe to drop first if an FP-audit complains.
 +_SENSITIVE_MARKERS: "tuple[str, ...]" = (
 +    # SSH — the whole dir is sensitive, plus the distinctive private-key filenames
 +    ".ssh/", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "authorized_keys",

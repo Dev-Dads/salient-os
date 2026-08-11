@@ -87,6 +87,22 @@ class NamesSensitivePathRecognizer(unittest.TestCase):
         self.assertIn(".aws/credentials", got)
         self.assertIn(",", got)  # multiple markers, comma-joined
 
+    def test_total_function_never_raises_on_hostile_str(self):
+        # external panel: govern_action/approve promise never to raise. A throwing __str__ on a command
+        # element must fail CLOSED to "" (no match), not propagate. Not model-reachable (json.loads
+        # yields scalars) but the recognizer is a TOTAL function so the contract holds for any caller.
+        class Boom:
+            def __str__(self):
+                raise RuntimeError("boom")
+
+        self.assertEqual(sensitivepaths.names_sensitive_path(Boom()), "")
+        self.assertEqual(sensitivepaths.names_sensitive_path(["cat", Boom()]), "")
+
+    def test_uppercase_lookalike_matches_accepted_crossplatform_fp(self):
+        # the case-folding trade-off (opus SENS-003): an uppercased sibling matches too. Accepted +
+        # documented — audit-grade, proposer-deny only, recoverable by human direction.
+        self.assertTrue(sensitivepaths.names_sensitive_path(["cat", "/home/u/ID_RSA"]))
+
 
 class GovernSensitivePathSlot(unittest.TestCase):
     def test_proposer_command_naming_secret_is_hard_denied(self):

@@ -74,11 +74,23 @@ def names_sensitive_path(command) -> str:
     substring test) with ONE deliberate divergence: it also LOWERCASES the haystack. ``names_code_root``
     matches EXACT resolved absolute paths so it needs no folding; these markers are conventional short
     lowercase names, and Windows/macOS filesystems are case-insensitive — folding buys cross-platform
-    recall (``C:\\Users\\me\\.SSH\\id_rsa``) at negligible false-positive cost for THIS specific list."""
-    if isinstance(command, (list, tuple)):
-        text = " ".join(str(c) for c in command)
-    else:
-        text = str(command or "")
+    recall (``C:\\Users\\me\\.SSH\\id_rsa``) at negligible false-positive cost for THIS specific list.
+    (Accepted consequence on case-SENSITIVE Linux: an uppercased lookalike like ``/home/u/ID_RSA`` —
+    a different file there — also matches; rare, audit-grade, and proposer-deny only, so recoverable.)
+
+    TOTAL FUNCTION — never raises (external panel: govern_action/approve promise never to raise). A
+    hostile/throwing ``__str__`` on a command element fails CLOSED to "no match" (""). Not model-
+    reachable (a command comes from ``json.loads`` -> JSON scalars only), and the sibling
+    ``codefence.names_code_root`` (which runs FIRST at every shared call site) plus ``freeze_args``
+    have the identical pre-existing str-coercion — so this guard is module-level hygiene, not a change
+    to any reachable govern_action behaviour."""
+    try:
+        if isinstance(command, (list, tuple)):
+            text = " ".join(str(c) for c in command)
+        else:
+            text = str(command or "")
+    except Exception:  # noqa: BLE001 — a throwing __str__ must fail closed to "" (no tag, no deny),
+        return ""       # never propagate out of govern_action/approve (a non-boundary recognizer)
     if not text:
         return ""
     hay = text.replace("\\", "/").lower()
