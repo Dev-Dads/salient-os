@@ -38,10 +38,17 @@ COLLABORATOR_SENSITIVEPATHS_VERSION = "0.1.0"
 #     .env is workspace-local project config, not a HOST secret. Excluded — recall loss is acceptable.
 #   * ".npmrc" — touched constantly by npm / CI / Dockerfiles → noise.
 #   * bare "credentials.json" / "login data" (unanchored) — too generic.
-# Accepted porous false-positive: dumb substring means "id_rsa" also hits "grid_rsa" — rare, and on the
-# DENY path it only affects a model-authored proposer command (recoverable via human-direction). Kept
-# faithful to ``names_code_root`` (dumb substring, no token anchoring) and documented rather than
-# complicated. The trailing "borderline tier" is safe to drop first if an FP-audit complains.
+# BROAD-RECALL EXCEPTION (the one place we favour recall over precision, deliberately): ".ssh/" matches
+# the WHOLE key directory, so a proposed command touching a NON-secret sibling (".ssh/config",
+# ".ssh/known_hosts", "chmod 700 ~/.ssh/") is also denied. That is intended: a custom-named private key
+# (~/.ssh/id_company, ~/.ssh/deploy_key) would slip a filename-only list, so the crown-jewel directory
+# is treated as deny-and-redirect for a PROPOSER (proposer-only, fully recoverable by human direction).
+# The module's "precision over recall" default holds everywhere else; ".ssh/" is the marked exception.
+# Accepted porous false-positive: dumb substring means "id_rsa" also hits "grid_rsa" (e.g. cloning a
+# repo literally named that) — rare, and on the DENY path it only affects a model-authored proposer
+# command (recoverable via human-direction). Kept faithful to ``names_code_root`` (dumb substring, no
+# token anchoring) and documented rather than complicated. The trailing "borderline tier" (.pypirc,
+# .docker/config.json) is safe to drop first if an FP-audit complains.
 _SENSITIVE_MARKERS: "tuple[str, ...]" = (
     # SSH — the whole dir is sensitive, plus the distinctive private-key filenames
     ".ssh/", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "authorized_keys",

@@ -369,10 +369,15 @@ def govern_action(session, intent: ToolIntent, importance: "float | None" = None
     # (e.g. `chmod 600 ~/.ssh/id_rsa` hardening) — but that is the HUMAN's to DIRECT, not the model's
     # to self-originate: a one-click-approvable command that reads the operator's private keys is the
     # confused-deputy surface this refuses (an adversarial / memory-poisoned proposer). DENY outright
-    # (operator-confirmed), keyed on the model-unforgeable intent.source == "proposed"; a USER/HOST-
-    # directed command is deliberately UNAFFECTED (maintenance preserved). Placed after the code-root
-    # deny so a command naming BOTH surfaces the higher-severity code reason first. POROUS DiD — there
-    # is NO structural boundary here and none planned (see sensitivepaths.names_sensitive_path).
+    # (operator-confirmed), keyed on the model-unforgeable intent.source == "proposed". SCOPE (owned,
+    # not hidden): ONLY the fully-autonomous PROPOSER channel is hard-denied. A USER/HOST-directed
+    # command AND the model's in-turn channel (source in {structured, content_*}) are deliberately
+    # UNAFFECTED here — byte-identical to the code-root deny's scope above. On the turn channel a
+    # secret-touching command is not denied but HELD with the ⚠ (names_sensitive_path) in the preview,
+    # and the run_command AUTONOMY-WITHHELD FLOOR below guarantees it can never AUTO-run — so the human
+    # hand + the ⚠ are the mitigation there (maintenance preserved; the deceived-human approve is the
+    # acknowledged residual). Placed after the code-root deny so a command naming BOTH surfaces the
+    # higher-severity code reason first. POROUS DiD — NO structural boundary here and none planned.
     if (intent.name == "run_command" and getattr(intent, "source", "") == "proposed"
             and names_sensitive_path(intent.args.get("command"))):
         return Decision(action_id=action_id, tool=tool.name, status=DENIED,
