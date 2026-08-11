@@ -1,0 +1,976 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 2f93f7b..709148b 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -32,10 +32,18 @@ jobs:
+       - name: Show Python
+         run: python --version
+ 
+-      # Let the ADR 0003 revisit-#1 netns isolation PROOF actually run: Ubuntu 24.04 can block
+-      # unprivileged user namespaces via AppArmor. Best-effort (|| true) — a no-op where already
+-      # permitted; without it the isolation test would just skip, not fail.
+-      - name: Enable unprivileged user namespaces (netns isolation tests)
++      # Install bubblewrap so the "protection earns autonomy" contained-execution LIVE proof
++      # (tests/test_collaborator_contained.py::ContainmentProofLinux) actually runs instead of silently
++      # skipping — bwrap is NOT preinstalled on ubuntu-latest, and where it is absent
++      # containment_available() is False (the honest fallback), so the proof would skip and certify
++      # nothing. This is a system binary, not a Python dependency (the verifier stays stdlib-only).
++      - name: Install bubblewrap (contained run_command proof)
++        run: sudo apt-get update && sudo apt-get install -y bubblewrap
++
++      # Let the ADR 0003 revisit-#1 netns isolation PROOF and the bwrap containment proof actually run:
++      # Ubuntu 24.04 can block unprivileged user namespaces via AppArmor. Best-effort (|| true) — a no-op
++      # where already permitted; without it the isolation/containment tests would just skip, not fail.
++      - name: Enable unprivileged user namespaces (netns + bwrap containment tests)
+         run: |
+           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+           sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
+diff --git a/collaborator/codefence.py b/collaborator/codefence.py
+index 4233f30..6ced885 100644
+--- a/collaborator/codefence.py
++++ b/collaborator/codefence.py
+@@ -117,6 +117,26 @@ def disjoint_from_code(workspace) -> None:
+                 "shell must never be able to reach the rules it runs under)")
+ 
+ 
++def protected_roots_with_witness() -> "tuple[tuple[Path, Path], ...]":
++    """``(root_dir, witness_file)`` per resolved code slot. The witness is the module ``__file__`` the root
++    was resolved from — guaranteed to exist INSIDE the root (a slot with no resolvable ``__file__`` was
++    already dropped by ``_resolved_roots``). Consumed by ``contained.py``'s in-child guard, which must tell
++    "ro-bound + unwritable" (protected) from "absent" (the wrapper silently didn't apply): absence must
++    never count as proof, so it checks a witness that is present iff the ro-bind actually took. Derived from
++    the SAME ``_code_slots`` single source of truth as ``PROTECTED_ROOTS`` — the two cannot desync."""
++    out: list[tuple[Path, Path]] = []
++    for _name, mod_file in _code_slots():
++        if not mod_file:
++            continue
++        try:
++            witness = Path(mod_file).resolve()
++        except (OSError, ValueError, RuntimeError):
++            continue
++        if witness.is_file() and witness.parent.is_dir():
++            out.append((witness.parent, witness))
++    return tuple(out)
++
++
+ def names_code_root(command) -> str:
+     """POROUS, best-effort tag of a ``run_command`` whose ``command`` literally names a protected
+     code root. Returns the matched root path(s) joined by ``,`` (empty string = no literal match).
+@@ -144,15 +164,15 @@ def names_code_root(command) -> str:
+ 
+ 
+ def code_protection_available() -> bool:
+-    """Govern-time predictor: does ``run_command`` run with its write-reach to the Collaborator's
+-    own code STRUCTURALLY prevented?
+-
+-    **False in this build.** OS-level prevention (a read-only bind-mount of ``PROTECTED_ROOTS`` in a
+-    nested user namespace, or bubblewrap ``--ro-bind``) is a deferred follow-up (the single-level
+-    bind is defeatable by the mapped-root child — CVE-2014-5206 / ``MNT_LOCK_READONLY``; see the
+-    F-6 plan). While this is False the seam withholds ``run_command`` autonomy so an unprotected
+-    shell can never auto-run — it always gets a human hand. When the follow-up lands this becomes a
+-    real, cached host probe (mirroring ``netns.netns_available()``), and ``run_command`` earns
+-    autonomy on hosts where the read-only bind is verified. Kept as a function (not a constant) so
+-    that landing is a one-body change and every call site is already wired."""
+-    return False
++    """Govern-time predictor: can ``run_command`` ACTUALLY run with its write-reach to the Collaborator's
++    own code (``PROTECTED_ROOTS``) STRUCTURALLY prevented on THIS host?
++
++    A REAL, VERIFIED, cached host probe (mirrors ``netns.netns_available()``): delegates to
++    ``contained.containment_available``, which runs a bwrap-contained probe child whose in-child guard
++    PROVES each protected root is present, unwritable, and mounted read-only (not merely "bwrap exists").
++    True only where that verifies. Off-Linux / no bwrap / user namespaces blocked ⇒ **False** — the seam
++    then withholds ``run_command`` autonomy so an unprotected shell can never auto-run (exactly the
++    behaviour before this landed). NEVER a silent claim of protection. Lazy import keeps ``codefence`` the
++    single source of *what* is protected (stdlib-only), while ``contained`` owns *how* (Linux/bwrap)."""
++    from collaborator import contained
++    return contained.containment_available(protected_roots_with_witness())
+diff --git a/collaborator/contained.py b/collaborator/contained.py
+new file mode 100644
+index 0000000..bc11c52
+--- /dev/null
++++ b/collaborator/contained.py
+@@ -0,0 +1,228 @@
++"""Contained execution for an AUTONOMOUS `run_command` — "protection earns autonomy" (F-6 / ADR 0003).
++
++`run_command` has no filesystem fence. Harm A (a shell rewriting the Collaborator's OWN code) is closed
++today only by WITHHOLDING autonomy: `codefence.code_protection_available()` is False, so every shell is
++floored to a human hand. This module makes that predicate REAL — an autonomous shell may run only inside a
++bubblewrap sandbox where the code roots (`codefence.PROTECTED_ROOTS`) are READ-ONLY, `$HOME`/secrets are
++absent, and the network is isolated — so it can EARN autonomy by accepting containment. The human path is
++untouched: a human-approved `run_command` keeps FULL filesystem reach (system maintenance must not break),
++so containment applies ONLY to the autonomy-earning path (`require_code_protection=True`).
++
++WHY bubblewrap (not `unshare --mount` by hand): a single-level read-only bind is defeatable by the
++mapped-root child (CVE-2014-5206 / `MNT_LOCK_READONLY`). bwrap's ro-bind holds via TWO independent layers:
++(1) it drops ALL capabilities before exec (`--cap-drop ALL`) and `--disable-userns` blocks regaining them,
++so the payload has no `CAP_SYS_ADMIN` to `mount -o remount,rw` at all; (2) as a backstop, the kernel LOCKS
++`MS_RDONLY` when a mount propagates to a less-privileged namespace (`mount_namespaces(7)`), so even a nested
++namespace cannot remount-rw or unmount-to-reveal. bwrap does NOT itself call `MNT_LOCK_READONLY` (no
++userspace API) — the guarantee is assembled from cap-drop + kernel semantics, which is EXACTLY why we do
++not trust it: the in-child guard PROVES, per run, that each root is present, unwritable, and mounted ro.
++
++CRITICAL — do NOT nest this under `netns` (`unshare --map-root-user`): that makes the child uid 0, and
++bwrap's `drop_all_caps()` early-returns for real-uid 0, so the sandbox would INHERIT `CAP_SYS_ADMIN` and
++the ro-bind would be a lie (bubblewrap#287). bwrap runs on its OWN path, as the real unprivileged uid, and
++does BOTH mount + network containment itself; the certified `netns.py` path stays for the human/opted-in
++shell only.
++
++Linux-only, stdlib-only, NO new Python dependency (bwrap is a system binary resolved like `unshare`).
++Where bwrap is absent / user namespaces are blocked / non-Linux, containment is UNAVAILABLE and the seam
++withholds autonomy (honest flag, exactly today's behaviour) — never a fake fence.
++"""
++
++from __future__ import annotations
++
++import os
++import shutil
++import subprocess
++import sys
++import tempfile
++
++from collaborator import codefence, netns
++
++COLLABORATOR_CONTAINED_VERSION = "0.1.0"
++
++# ADR 0003 / F-6: the signed, DEFAULT-DENY opt-in that lets an AUTONOMOUS run_command EARN autonomy by
++# running CONTAINED. Verified containment is necessary but NOT sufficient — the operator must ALSO sign
++# this grant (mirrors shell.raw_network / net.post.auto:<host>). Absent it, a capable host still withholds
++# run_command autonomy (a human hand). The single largest autonomy expansion in the system is thus
++# operator-ratcheted, never lifted by the mere presence of bwrap on a host.
++SHELL_CONTAINED_AUTONOMY_CAP = "shell.contained_autonomy"
++
++# Sentinel + exit code the in-child guard prints when a protected root is NOT verifiably read-only, so the
++# caller corrects code_protected -> False rather than falsely claiming protection. The NET half reuses
++# netns's own sentinel/exit-44 so netns.isolation_unverified() keeps working unchanged.
++_CODEFENCE_UNVERIFIED_SENTINEL = "SALIENT_CODEFENCE_UNVERIFIED"
++_CODEFENCE_UNVERIFIED_EXIT = 45
++
++
++def _resolve(candidates, name: str) -> str:
++    """Absolute path to a system binary, resolved at import (before any run_command could plant a shadow),
++    identical in spirit to netns._resolve — a bare name would be PATH-resolved at RUN time."""
++    for p in candidates:
++        if os.path.isfile(p):
++            return p
++    return shutil.which(name) or candidates[0]
++
++
++_BWRAP_BIN = _resolve(["/usr/bin/bwrap", "/bin/bwrap", "/usr/local/bin/bwrap"], "bwrap")
++_SH_BIN = _resolve(["/bin/sh", "/usr/bin/sh", "/system/bin/sh"], "sh")
++
++# Decide the read-only system view ONCE at import from what actually EXISTS on this host — a hard
++# `--ro-bind` of a missing dir aborts bwrap, and aarch64 (Sparky) has no /lib64. Deny-by-default: only
++# these system dirs, the code roots (ro), and the workspace (rw) are ever in the view — never $HOME,
++# /root, /run (docker.sock), /sys, or the host `/`.
++_RO_SYSTEM = tuple(p for p in ("/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/etc")
++                   if os.path.isdir(p))
++# Belt over the whole-/etc ro-bind: shadow /dev/null over the highest-value secret files so even a read
++# returns empty. (Under DAC these are root-only anyway, and we cap-drop; this is defence in depth.)
++_MASK = tuple(p for p in ("/etc/shadow", "/etc/gshadow", "/etc/sudoers", "/etc/ssh")
++              if os.path.exists(p))
++
++_available = None  # cached host-property probe (None = not yet probed)
++
++
++def _roots_with_witness():
++    """(root_dir, witness_file) pairs for the contained guard, from codefence's single source of truth.
++    The witness is the module __file__ each root was resolved from — guaranteed to exist INSIDE the root —
++    so the guard can tell "ro-bound + unwritable" (protected) from "absent" (the wrapper silently didn't
++    apply): absence must never count as proof of protection."""
++    return codefence.protected_roots_with_witness()
++
++
++def _guarded_script(parent_ino: "int | None", pairs, *, check_net: bool) -> str:
++    """The inner `sh` script: VERIFY (fail CLOSED) then `exec "$@"`. NET half (only when check_net) reuses
++    netns's inode check + sentinel/exit-44. CODE half proves, for each protected root R with witness F:
++    (1) F is PRESENT (else absence masquerades as protection), (2) opening F for APPEND FAILS (a real
++    write-block — writes nothing), (3) /proc/self/mountinfo shows R mounted `ro` (structural). Any failure
++    -> sentinel + exit 45."""
++    net = ""
++    if check_net and parent_ino is not None:
++        net = (f'ino=$(stat -Lc %i /proc/self/ns/net 2>/dev/null || echo x);'
++               f'if [ "$ino" = "{parent_ino}" ]; then echo {netns._UNVERIFIED_SENTINEL} >&2; exit 44; fi;')
++    specs = " ".join(f'"{r.as_posix()}|{w.as_posix()}"' for r, w in pairs)
++    code = (
++        f'for spec in {specs}; do '
++        f'r=${{spec%%|*}}; f=${{spec#*|}}; '
++        # (1) present
++        f'[ -r "$f" ] || {{ echo {_CODEFENCE_UNVERIFIED_SENTINEL} >&2; exit {_CODEFENCE_UNVERIFIED_EXIT}; }}; '
++        # (2) append must FAIL (writes nothing); if it SUCCEEDS the root is writable -> unverified
++        f'if ( : >> "$f" ) 2>/dev/null; then echo {_CODEFENCE_UNVERIFIED_SENTINEL} >&2; '
++        f'exit {_CODEFENCE_UNVERIFIED_EXIT}; fi; '
++        # (3) structural: the mount for r carries the ro option
++        f'opts=$(awk -v m="$r" \'$5==m {{print $6}}\' /proc/self/mountinfo | tail -n1); '
++        f'case ",$opts," in *,ro,*) ;; *) echo {_CODEFENCE_UNVERIFIED_SENTINEL} >&2; '
++        f'exit {_CODEFENCE_UNVERIFIED_EXIT} ;; esac; '
++        f'done;'
++    )
++    return net + code + ' exec "$@"'
++
++
++def _bwrap_argv(workspace, pairs, *, unshare_net: bool, parent_ino: "int | None", inner):
++    """Assemble the full bwrap argv (order-sensitive: bwrap applies ops left-to-right)."""
++    argv = [
++        _BWRAP_BIN,
++        # namespaces — EXPLICIT --unshare-user (NOT --unshare-all, whose -try variant fails OPEN)
++        "--unshare-user", "--unshare-ipc", "--unshare-pid", "--unshare-uts", "--unshare-cgroup-try",
++    ]
++    if unshare_net:
++        argv.append("--unshare-net")
++    argv += [
++        "--disable-userns", "--assert-userns-disabled",   # child cannot create a fresh userns to regain caps
++        "--cap-drop", "ALL",                              # forces cap-drop even if a future caller sets uid 0
++        "--die-with-parent", "--new-session",
++        "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
++    ]
++    for p in _RO_SYSTEM:
++        argv += ["--ro-bind", p, p]
++    for p in _MASK:                                       # /dev/null over secrets, AFTER the /etc bind
++        argv += ["--ro-bind", "/dev/null", p]
++    for root, _witness in pairs:                          # THE GUARANTEE — code roots read-only, identity-bound
++        rp = str(root)
++        argv += ["--ro-bind", rp, rp]
++    ws = str(workspace)
++    home = os.path.join(ws, ".sandbox-home")              # rw, persistent (warm caches), INSIDE the fence
++    argv += [
++        "--bind", ws, ws,
++        "--chdir", ws,
++        "--clearenv",
++        "--setenv", "PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
++        "--setenv", "HOME", home,
++        "--setenv", "TMPDIR", "/tmp",
++        "--setenv", "LANG", "C.UTF-8",
++        # git identity so a contained `git commit` works without a host ~/.gitconfig (no bind-back)
++        "--setenv", "GIT_AUTHOR_NAME", "collaborator", "--setenv", "GIT_AUTHOR_EMAIL", "collaborator@localhost",
++        "--setenv", "GIT_COMMITTER_NAME", "collaborator", "--setenv", "GIT_COMMITTER_EMAIL", "collaborator@localhost",
++        # bwrap opts end; the guard runs as `sh -c <guard> sh <original argv…>` — the trailing _SH_BIN is
++        # $0 (a name), the caller appends the original argv as $1..$n, and the guard's `exec "$@"` runs it.
++        "--", _SH_BIN, "-c", inner, _SH_BIN,
++    ]
++    return argv
++
++
++def wrap_contained(argv, workspace, *, roots_with_witness=None, unshare_net: bool = True):
++    """Return ``(run_argv, isolated, protected)``. On Linux with bwrap present, ``run_argv`` runs the
++    command inside a contained view (code roots ro, no $HOME/secrets, tmpfs /tmp, cleared env, and — when
++    ``unshare_net`` — a fresh routeless netns), with an in-child guard that fails CLOSED if the code root
++    is not verifiably read-only (exit 45) or the netns is not fresh (exit 44). ``isolated``/``protected``
++    are the pre-run BELIEFS (verified/downgraded by the caller via ``*_unverified``). Where containment is
++    unavailable (non-Linux, no bwrap, no roots) returns ``(argv, False, False)`` — the caller then refuses
++    to run an autonomous shell, so nothing executes uncontained."""
++    argv = [str(a) for a in (argv or [])]
++    pairs = _roots_with_witness() if roots_with_witness is None else tuple(roots_with_witness)
++    if not argv or sys.platform != "linux" or not os.path.isfile(_BWRAP_BIN) or not pairs:
++        return argv, False, False
++    parent_ino = netns._netns_ino() if unshare_net else None
++    inner = _guarded_script(parent_ino, pairs, check_net=unshare_net)
++    run_argv = _bwrap_argv(workspace, pairs, unshare_net=unshare_net, parent_ino=parent_ino, inner=inner)
++    run_argv += argv  # the guard's `exec "$@"` receives the original argv as $1..$n after argv0=sh
++    return run_argv, unshare_net, True
++
++
++def protection_unverified(returncode: int, stderr) -> bool:
++    """True iff a contained run failed CLOSED because a code root was not verifiably read-only (the per-run
++    guard tripped, exit 45). The caller then reports code_protected=False honestly — protection was
++    attempted but not verified, and the command did NOT run, so no unprotected shell executed."""
++    text = stderr if isinstance(stderr, str) else (stderr or b"").decode("utf-8", "replace")
++    return returncode == _CODEFENCE_UNVERIFIED_EXIT and _CODEFENCE_UNVERIFIED_SENTINEL in text
++
++
++def setup_failed(returncode: int, stderr) -> bool:
++    """True iff bwrap itself failed during SETUP (the payload never ran). Safety is intact (nothing ran),
++    but the negative-sentinel convention can't distinguish it, so the caller DOWNGRADES protected->False
++    (fail-safe only; never used to upgrade) — mirrors the netns deferred-hardening note in ADR 0003."""
++    text = stderr if isinstance(stderr, str) else (stderr or b"").decode("utf-8", "replace")
++    return returncode != 0 and text.startswith("bwrap:")
++
++
++def containment_available(roots_with_witness=None) -> bool:
++    """True iff an autonomous run_command can ACTUALLY run with PROTECTED_ROOTS read-only on THIS host —
++    VERIFIED, not merely "bwrap exists": a probe child runs the SAME argv template and its in-child guard
++    proves each root is present, unwritable, and ro-mounted, and the netns is fresh. Cached — a property
++    of the host, not of any call. Mirrors netns.netns_available()."""
++    global _available
++    if _available is not None:
++        return _available
++    pairs = _roots_with_witness() if roots_with_witness is None else tuple(roots_with_witness)
++    if sys.platform != "linux" or not os.path.isfile(_BWRAP_BIN) or not pairs:
++        _available = False
++        return _available
++    tmp = tempfile.mkdtemp(prefix="salient-contain-probe-")
++    try:
++        run_argv, isolated, protected = wrap_contained([_SH_BIN, "-c", "exit 0"], tmp,
++                                                        roots_with_witness=pairs, unshare_net=True)
++        if not protected:
++            _available = False
++            return _available
++        r = subprocess.run(run_argv, capture_output=True, timeout=20, check=False)
++        # rc==0 only if the guard verified BOTH halves (fresh netns AND every root ro) and the payload ran.
++        _available = (r.returncode == 0 and isolated)
++    except (OSError, subprocess.SubprocessError):
++        _available = False
++    finally:
++        shutil.rmtree(tmp, ignore_errors=True)
++    return _available
++
++
++def _reset_probe_cache_for_tests():
++    """Test hook: forget the cached probe so a test can re-evaluate under a patched platform/bwrap."""
++    global _available
++    _available = None
+diff --git a/collaborator/governance.py b/collaborator/governance.py
+index fa3ba30..8214d5a 100644
+--- a/collaborator/governance.py
++++ b/collaborator/governance.py
+@@ -37,6 +37,7 @@ from salienceos.verifier.observers import observe_action, snapshot_tree
+ from collaborator import egress
+ from collaborator.codefence import code_protection_available, names_code_root
+ from collaborator.sensitivepaths import names_sensitive_path
++from collaborator.contained import SHELL_CONTAINED_AUTONOMY_CAP
+ from collaborator.netns import SHELL_RAW_NETWORK_CAP, netns_available
+ from collaborator.tools import (
+     ACT_THEN_REPORT,
+@@ -420,16 +421,22 @@ def govern_action(session, intent: ToolIntent, importance: "float | None" = None
+         if not auto:
+             leash = apply_cap(leash, PROPOSE_FIRST)
+ 
+-    # --- run_command AUTONOMY-WITHHELD FLOOR (F-6 Harm A) --------------------
+-    # run_command has NO filesystem fence: an autonomous shell could overwrite the Collaborator's
+-    # own code and neuter F1. Until that write-reach is STRUCTURALLY prevented (an OS-level
+-    # read-only bind of the code root — deferred), WITHHOLD autonomy — an act_then_report
+-    # run_command floors to propose_first so it can never AUTO-run, only run under a human hand. An
+-    # INDEPENDENT, monotonic floor: composes with the emission floor and the isolation-earns-autonomy
+-    # network floor below by ANDing (stricter always wins, no shared mutable state); an explicit host
+-    # tighten (notify_only) survives, being stricter than the floor.
++    # --- run_command AUTONOMY-WITHHELD FLOOR — "protection earns autonomy" (F-6 / ADR 0003) --
++    # run_command has NO filesystem fence: an autonomous shell could overwrite the Collaborator's own
++    # code and neuter F1. An act_then_report run_command may AUTO-run ONLY when BOTH hold: (a) its
++    # write-reach to the code is STRUCTURALLY prevented AND VERIFIABLE on this host (bwrap containment
++    # of PROTECTED_ROOTS — code_protection_available() is now a real probe), AND (b) the operator has
++    # SIGNED for it (shell.contained_autonomy — enforced + a signed grant, never mutable
++    # session.capabilities; the same F5 rule shell.raw_network/net.post.auto follow). Verified
++    # containment is necessary but NOT sufficient — the signed cap keeps the single largest autonomy
++    # expansion operator-ratcheted, never lifted by the mere presence of bwrap on a host. Absent EITHER,
++    # WITHHOLD autonomy: floor to propose_first (a human hand). An INDEPENDENT, monotonic floor,
++    # ANDed with the emission + isolation-earns-autonomy floors (stricter always wins, no shared mutable
++    # state); an explicit host tighten (notify_only) survives, being stricter than the floor.
+     if (intent.name == "run_command" and leash == ACT_THEN_REPORT
+-            and not code_protection_available()):
++            and not (code_protection_available()
++                     and enforced(session)
++                     and directive.grants_capability(SHELL_CONTAINED_AUTONOMY_CAP))):
+         leash = apply_cap(leash, PROPOSE_FIRST)
+ 
+     # --- run_command ISOLATION-EARNS-AUTONOMY FLOOR (ADR 0003 revisit #1a) ----
+@@ -501,10 +508,15 @@ def govern_action(session, intent: ToolIntent, importance: "float | None" = None
+     if getattr(tool, "egress", False):
+         preview["canonical_dest"] = egress.canonical_host(str(args.get("url") or ""))
+     if intent.name == "run_command":
+-        # Surface the honest code-protection posture + any literal self-code reference to the human
+-        # who holds the hand on this shell (F-6 Harm A). code_protection_available() is False in this
+-        # build, so this reads "not protected" — the honest state until OS-level protection lands.
+-        preview["code_protected"] = code_protection_available()
++        # Surface the honest posture to the human holding the hand (F-6). A HELD run_command, once
++        # APPROVED, runs on the HUMAN path (human_gated) which is UNCONTAINED BY DESIGN — full filesystem
++        # reach for maintenance — REGARDLESS of whether this host CAN contain (that only earns AUTONOMY, a
++        # different, un-held path). So the run the human is approving is NOT code-protected: say so, never
++        # imply a fence the approved run won't have (else code_protection_available() going True on a
++        # capable host would print 🔒 over a full-reach run).
++        preview["code_protected"] = False
++        preview["reach"] = ("full filesystem — a human-approved run_command is deliberately uncontained "
++                            "(maintenance); containment applies only to the autonomy-earning path")
+         _named = names_code_root(args.get("command"))
+         if _named:
+             preview["names_code_root"] = _named
+@@ -617,16 +629,25 @@ def execute_and_verify(session, tool: Tool, directive, action_id: str, args: dic
+     # string, so a propose_first-with-human_gated=False caller can't slip one notch over (N1). A
+     # human-approved run is the human's call, unaffected.
+     require_isolation = False
++    require_code_protection = False
+     if tool.name == "run_command" and not human_gated:
+-        # CODE floor: never AUTO-run a shell whose write-reach to its own code is unprevented —
+-        # symmetric with the network floor below, and the floor doing all the work today (N2).
+-        if not code_protection_available():
++        # CODE floor re-asserted at the MOMENT OF USE (defence in depth, N2): an autonomous shell may run
++        # only CONTAINED and only where the operator SIGNED for it — verified code protection on this host
++        # AND a signed shell.contained_autonomy grant. Bound here (not just govern-time) so no direct
++        # internal caller / future refactor reaches an unprotected or un-opted-in autonomous run.
++        if not (code_protection_available()
++                and enforced(session)
++                and directive.grants_capability(SHELL_CONTAINED_AUTONOMY_CAP)):
+             return Decision(action_id, tool.name, DENIED,
+-                            "autonomous shell withheld at execution: code protection unavailable",
++                            "autonomous shell withheld at execution: contained-autonomy unavailable "
++                            "(needs verified code protection + a signed shell.contained_autonomy grant)",
+                             leash, directive=directive, args=args)
+-        # NETWORK floor: require ACTUAL isolation unless signed-opted-in. Threaded to the executor,
+-        # which REFUSES to run when it cannot isolate — so the guarantee is bound to the executor's
+-        # real isolation result (execution.network_isolated), not the govern-time belief (F3).
++        # The BINDING flag (ADR 0003:336-338): the executor wraps in bwrap and REFUSES to run if it cannot
++        # verifiably contain — the guarantee is bound to the executor's REAL result (execution.code_protected),
++        # NOT re-read here, so the belief-vs-behaviour split cannot reopen on the code axis.
++        require_code_protection = True
++        # NETWORK floor: on the contained path bwrap isolates the network too (unshare_net=require_isolation).
++        # Require ACTUAL isolation unless signed-opted-in; bound to the executor's real result (F3).
+         require_isolation = not (enforced(session) and directive.grants_capability(SHELL_RAW_NETWORK_CAP))
+     # Read-only: gate already passed; execute and report (nothing is mutated).
+     if tool.verify_mode == "none":
+@@ -685,7 +706,8 @@ def execute_and_verify(session, tool: Tool, directive, action_id: str, args: dic
+         code_touch = names_code_root(args.get("command"))   # F-6 audit-only tag (porous), never a deny
+         secret_touch = names_sensitive_path(args.get("command"))  # PR 1a audit-only (porous), never a deny
+         try:
+-            execution = execute_tool(tool, session.workspace, args, require_isolation=require_isolation)
++            execution = execute_tool(tool, session.workspace, args, require_isolation=require_isolation,
++                                     require_code_protection=require_code_protection)
+         except WorkspaceError as exc:
+             return Decision(action_id, tool.name, DENIED, str(exc), leash, directive=directive,
+                             args=args, offense_flag=offense_flag, code_touch=code_touch,
+diff --git a/collaborator/tools.py b/collaborator/tools.py
+index 1f6b30c..4100d2d 100644
+--- a/collaborator/tools.py
++++ b/collaborator/tools.py
+@@ -41,7 +41,7 @@ from salienceos.verifier.observers import SupervisedResult, run_supervised
+ from salienceos.verifier.signing import sha256_bytes
+ 
+ from collaborator import egress
+-from collaborator.codefence import code_protection_available
++from collaborator.contained import protection_unverified, setup_failed, wrap_contained
+ from collaborator.netns import isolation_unverified, wrap_no_network
+ 
+ COLLABORATOR_TOOLS_VERSION = "0.1.0"
+@@ -358,7 +358,8 @@ def _exec_read(workspace, args: dict) -> Execution:
+     return Execution(result=ToolResult(ok=True, output=target.read_text(encoding="utf-8", errors="replace")))
+ 
+ 
+-def _exec_command(workspace, args: dict, *, require_isolation: bool = False) -> Execution:
++def _exec_command(workspace, args: dict, *, require_isolation: bool = False,
++                  require_code_protection: bool = False) -> Execution:
+     cmd = args.get("command")
+     if isinstance(cmd, str):
+         argv = shlex.split(cmd)
+@@ -368,24 +369,47 @@ def _exec_command(workspace, args: dict, *, require_isolation: bool = False) ->
+         return Execution(result=ToolResult(ok=False, error="command must be a string or list"))
+     if not argv:
+         return Execution(result=ToolResult(ok=False, error="empty command"))
+-    # ADR 0003 revisit #1: run the shell inside a fresh network namespace with no route out, so
+-    # a raw socket / curl / git can't egress — web_fetch (the mediated client) is the sole path
+-    # off the machine. Fails closed to unisolated + a False flag where netns is unavailable.
+-    run_argv, isolated = wrap_no_network(argv)
+-    # ADR 0003 revisit #1a: when the caller REQUIRES isolation (an autonomous, un-opted-in shell) but
+-    # this host cannot verifiably provide it, REFUSE to run — bind the run to the ACTUAL isolation
+-    # result, not a govern-time belief (red-team F3). Prevention: the command never starts, so no raw
+-    # egress can occur. A human-approved run or a signed raw-reach opt-in sets require_isolation False.
++    if require_code_protection:
++        # AUTONOMY path (ADR 0003 revisit #1 / F-6 "protection earns autonomy"): an autonomous shell runs
++        # ONLY CONTAINED — the code roots read-only, no $HOME/secrets in view, cleared env, and (unless a
++        # signed raw-reach opt-in set require_isolation=False) a fresh routeless netns. bwrap does BOTH
++        # mount + net containment on its OWN path (never nested under netns's --map-root-user, which would
++        # inherit CAP_SYS_ADMIN and defeat the ro-bind). REFUSE to run if this host can't verifiably
++        # contain — bind the guarantee to the ACTUAL containment, not a govern belief (red-team F3).
++        try:
++            os.makedirs(os.path.join(str(workspace), ".sandbox-home"), exist_ok=True)  # rw HOME in-fence
++        except OSError:
++            pass
++        run_argv, isolated, protected = wrap_contained(argv, workspace, unshare_net=require_isolation)
++        if not protected:
++            return Execution(
++                result=ToolResult(ok=False,
++                                  error="code protection required but unavailable on this host — not run"),
++                network_isolated=False, code_protected=False)
++    else:
++        # HUMAN-approved / opted-in path: uncontained BY DESIGN (maintenance keeps full filesystem reach).
++        # Network still isolated via netns (ADR 0003 revisit #1) so the mediated client stays the sole
++        # egress path; fails closed to unisolated + a False flag where netns is unavailable.
++        run_argv, isolated = wrap_no_network(argv)
++        protected = False
++    # ADR 0003 revisit #1a: when the caller REQUIRES isolation but this host can't verifiably provide it,
++    # REFUSE to run (the command never starts, no raw egress). A human-approved run or a signed raw-reach
++    # opt-in sets require_isolation=False. On the contained path bwrap provides isolation, verified by the
++    # per-run guard below rather than this belief pre-check.
+     if require_isolation and not isolated:
+         return Execution(
+             result=ToolResult(ok=False,
+                               error="network isolation required but unavailable on this host — not run"),
+-            network_isolated=False, code_protected=code_protection_available())
++            network_isolated=False, code_protected=protected)
+     res = run_supervised(run_argv, cwd=workspace)
+-    # If the per-run guard tripped (child was NOT in a fresh netns), the command did not run — no
+-    # egress — and we correct the flag to False so it never falsely claims isolation (red-team).
++    # A per-run guard trip means the command did NOT run — correct the honest flags so we never falsely
++    # claim isolation (netns exit 44) or protection (codefence exit 45 / a bwrap setup failure).
+     if isolated and isolation_unverified(res.returncode, res.stderr):
+         isolated = False
++    if protected and (protection_unverified(res.returncode, res.stderr)
++                      or isolation_unverified(res.returncode, res.stderr)
++                      or setup_failed(res.returncode, res.stderr)):
++        protected = False
+     ok = res.returncode == 0
+     out = (res.stdout or b"").decode("utf-8", "replace")
+     err = (res.stderr or b"").decode("utf-8", "replace")
+@@ -396,9 +420,10 @@ def _exec_command(workspace, args: dict, *, require_isolation: bool = False) ->
+         # artifact branch, so observe_action/snapshot_tree never run — there is NO write-set observation
+         # for a shell (honest: a post-exec workspace tripwire was deferred by the Harm A panel, not built)
+         artifact_hashes={}, network_isolated=isolated,
+-        # F-6 Harm A: honest — False until the OS-level read-only-bind protection lands. While False
+-        # the seam withholds run_command autonomy, so an unfenced shell never AUTO-runs.
+-        code_protected=code_protection_available(),
++        # The REAL, per-run VERIFIED containment result (NOT a govern-time belief): True only on the
++        # autonomy path where the in-child guard proved the code roots read-only; False on the
++        # human-approved path, which is uncontained by design.
++        code_protected=protected,
+     )
+ 
+ 
+@@ -483,16 +508,19 @@ _EXECUTORS = {"write_file": _exec_write, "read_file": _exec_read,
+ 
+ 
+ def execute_tool(tool: Tool, workspace, args: dict, *, egress_preview: bool = False,
+-                 egress_auth: "str | None" = None, require_isolation: bool = False) -> Execution:
++                 egress_auth: "str | None" = None, require_isolation: bool = False,
++                 require_code_protection: bool = False) -> Execution:
+     """Run a resolved tool. Raises WorkspaceError on an escaping path (the caller turns that into
+     a DENY); other failures come back as ``ok=False`` results. ``egress_preview``/``egress_auth``
+     are host-side values the governance seam threads for net_post ONLY (the audit-preview flag and
+     the host-injected credential); every other tool ignores them, so the model can never reach
+-    them through ``args``. ``require_isolation`` is threaded to run_command ONLY: when True the shell
+-    REFUSES to run unless verified netns isolation is achieved (ADR 0003 #1a — an autonomous,
+-    un-opted-in shell can never egress raw)."""
++    them through ``args``. ``require_isolation``/``require_code_protection`` are threaded to run_command
++    ONLY: when True the shell REFUSES to run unless verified netns isolation (ADR 0003 #1a) resp. verified
++    bwrap containment of the code roots (ADR 0003 revisit #1 / F-6) is achieved — so an autonomous shell
++    can never egress raw nor run with its own code writable (bound to the executor's REAL result)."""
+     if tool.name == "net_post":
+         return _exec_net_post(workspace, args, keep_preview=egress_preview, auth=egress_auth)
+     if tool.name == "run_command":
+-        return _exec_command(workspace, args, require_isolation=require_isolation)
++        return _exec_command(workspace, args, require_isolation=require_isolation,
++                             require_code_protection=require_code_protection)
+     return _EXECUTORS[tool.name](workspace, args)
+diff --git a/tests/test_collaborator_codefence.py b/tests/test_collaborator_codefence.py
+index d2d3266..4c11a96 100644
+--- a/tests/test_collaborator_codefence.py
++++ b/tests/test_collaborator_codefence.py
+@@ -44,9 +44,14 @@ class CodeRootModel(unittest.TestCase):
+             self.assertTrue(p.is_dir())
+             self.assertTrue(p.is_absolute())
+ 
+-    def test_protection_is_unavailable_in_this_build(self):
+-        # OS-level prevention is deferred; while False the seam withholds run_command autonomy.
+-        self.assertFalse(codefence.code_protection_available())
++    def test_code_protection_delegates_to_containment_probe(self):
++        # code_protection_available() is now a REAL, cached host probe: it delegates to
++        # contained.containment_available (True only where bwrap verifiably contains the code roots).
++        # Off-Linux / no bwrap it is False = the withheld-autonomy behaviour. Patch both directions.
++        with patch("collaborator.contained.containment_available", return_value=False):
++            self.assertFalse(codefence.code_protection_available())
++        with patch("collaborator.contained.containment_available", return_value=True):
++            self.assertTrue(codefence.code_protection_available())
+ 
+ 
+ class DisjointnessGuard(unittest.TestCase):
+diff --git a/tests/test_collaborator_contained.py b/tests/test_collaborator_contained.py
+new file mode 100644
+index 0000000..4aea7c6
+--- /dev/null
++++ b/tests/test_collaborator_contained.py
+@@ -0,0 +1,167 @@
++"""PR 1b — bwrap contained execution ("protection earns autonomy").
++
++Cross-platform, hermetic tests of the wrapper's CONSTRUCTION + honest fallback (the argv template, the
++in-child guard, the sentinels, the off-Linux/no-bwrap no-op), plus a Linux ``@skipUnless`` LIVE proof
++that a real contained child genuinely has the code roots read-only and no $HOME/secrets in view. The
++construction tests exercise the pure builders directly so they run everywhere (real bwrap is Linux-only
++and absent on this dev host / some CI); the live proof is where the guarantee is actually checked.
++"""
++
++import subprocess
++import sys
++import tempfile
++import unittest
++from pathlib import Path
++
++from collaborator import codefence, contained
++
++
++class HonestFallback(unittest.TestCase):
++    """Where containment is unavailable (non-Linux, no bwrap), the wrapper NO-OPs and reports honestly —
++    the seam then withholds autonomy (today's behaviour), never a fake fence."""
++
++    def test_off_linux_wrap_is_a_noop_not_a_fake_fence(self):
++        if sys.platform == "linux":
++            self.skipTest("this asserts the NON-Linux fallback")
++        argv, isolated, protected = contained.wrap_contained(["echo", "hi"], "/tmp/x")
++        self.assertEqual(argv, ["echo", "hi"])   # unchanged
++        self.assertFalse(isolated)
++        self.assertFalse(protected)              # -> the executor REFUSES an autonomous run (never fakes)
++
++    def test_off_linux_probe_is_false(self):
++        if sys.platform == "linux":
++            self.skipTest("this asserts the NON-Linux fallback")
++        contained._reset_probe_cache_for_tests()
++        self.assertFalse(contained.containment_available())
++        self.assertFalse(codefence.code_protection_available())   # delegates to the probe
++
++    def test_empty_roots_cannot_claim_protection(self):
++        # No code roots to protect -> containment is meaningless -> not protected (fail closed), on any OS.
++        argv, isolated, protected = contained.wrap_contained(["echo", "hi"], "/tmp/x", roots_with_witness=())
++        self.assertFalse(protected)
++
++
++class Sentinels(unittest.TestCase):
++    def test_protection_unverified_only_on_exit_45_with_sentinel(self):
++        self.assertTrue(contained.protection_unverified(45, "x SALIENT_CODEFENCE_UNVERIFIED y"))
++        self.assertFalse(contained.protection_unverified(0, "SALIENT_CODEFENCE_UNVERIFIED"))   # wrong rc
++        self.assertFalse(contained.protection_unverified(45, "clean"))                          # no sentinel
++        self.assertFalse(contained.protection_unverified(44, "SALIENT_CODEFENCE_UNVERIFIED"))   # netns exit
++
++    def test_setup_failed_only_on_bwrap_prefixed_stderr(self):
++        self.assertTrue(contained.setup_failed(1, "bwrap: No permissions to create new namespace"))
++        self.assertFalse(contained.setup_failed(0, "bwrap: whatever"))   # rc 0 -> the payload ran fine
++        self.assertFalse(contained.setup_failed(1, "some other error"))  # not a bwrap setup failure
++
++    def test_signed_cap_constant(self):
++        self.assertEqual(contained.SHELL_CONTAINED_AUTONOMY_CAP, "shell.contained_autonomy")
++
++
++class GuardScript(unittest.TestCase):
++    """The in-child verification script — the crux of verified-not-trusted."""
++
++    _PAIRS = ((Path("/x/collaborator"), Path("/x/collaborator/codefence.py")),
++              (Path("/x/salienceos"), Path("/x/salienceos/__init__.py")))
++
++    def test_code_half_checks_present_unwritable_and_ro_mount(self):
++        g = contained._guarded_script(None, self._PAIRS, check_net=False)
++        self.assertIn("SALIENT_CODEFENCE_UNVERIFIED", g)
++        self.assertIn("exit 45", g)
++        self.assertIn(">>", g)                       # the append-must-fail write probe
++        self.assertIn("mountinfo", g)                # the structural ro check
++        self.assertIn("collaborator/codefence.py", g)
++        self.assertIn('exec "$@"', g)
++        # no net half when check_net is False
++        self.assertNotIn("SALIENT_NETNS_UNVERIFIED", g)
++        self.assertNotIn("exit 44", g)
++
++    def test_net_half_present_when_check_net(self):
++        g = contained._guarded_script(12345, self._PAIRS, check_net=True)
++        self.assertIn("12345", g)                    # the parent netns inode baked in
++        self.assertIn("SALIENT_NETNS_UNVERIFIED", g)
++        self.assertIn("exit 44", g)
++
++
++class ArgvTemplate(unittest.TestCase):
++    """The bwrap argv is deny-by-default, hardened, and never leaks $HOME/secrets."""
++
++    _PAIRS = ((Path("/x/collaborator"), Path("/x/collaborator/codefence.py")),)
++
++    def _argv(self, *, unshare_net):
++        return contained._bwrap_argv("/ws", self._PAIRS, unshare_net=unshare_net,
++                                     parent_ino=1, inner="GUARD")
++
++    def test_hardening_flags_present(self):
++        a = " ".join(self._argv(unshare_net=True))
++        for flag in ("--unshare-user", "--disable-userns", "--assert-userns-disabled",
++                     "--cap-drop", "ALL", "--die-with-parent", "--new-session", "--clearenv"):
++            self.assertIn(flag, a)
++        self.assertNotIn("--unshare-all", a)         # its -try variant fails OPEN — never used
++
++    def test_code_root_ro_and_workspace_rw(self):
++        a = self._argv(unshare_net=True)
++        # the protected root is ro-bound at its identity path; the workspace is rw-bound. _bwrap_argv
++        # binds str(root) — derive the expected token the same way so the test is host-agnostic (str(Path)
++        # renders backslashes on Windows dev hosts, forward slashes on the Linux path that actually runs it).
++        root = str(self._PAIRS[0][0])
++        self.assertIn("--ro-bind", a)
++        j = a.index(root)                    # the code root appears as an identity ro-bind: --ro-bind R R
++        self.assertEqual(a[j - 1], "--ro-bind")
++        self.assertEqual(a[j + 1], root)
++        i = a.index("--bind")
++        self.assertEqual(a[i + 1], "/ws")
++        self.assertEqual(a[i + 2], "/ws")
++
++    def test_deny_by_default_never_binds_home_or_root_or_run(self):
++        a = " ".join(self._argv(unshare_net=True))
++        # $HOME is SET to a workspace-local dir but the host home / root / docker-socket dir are NEVER bound
++        self.assertNotIn("--bind /root", a)
++        self.assertNotIn("--ro-bind /root", a)
++        self.assertNotIn("/var/run", a)
++        self.assertNotIn("--bind / ", a)             # never bind the host root
++        self.assertIn(".sandbox-home", a)            # HOME points inside the fenced workspace
++
++    def test_unshare_net_toggles_with_flag(self):
++        self.assertIn("--unshare-net", self._argv(unshare_net=True))
++        self.assertNotIn("--unshare-net", self._argv(unshare_net=False))
++
++
++class Witness(unittest.TestCase):
++    def test_witness_pairs_are_real_files_inside_their_roots(self):
++        pairs = codefence.protected_roots_with_witness()
++        self.assertTrue(pairs)                        # both packages resolve on a normal checkout
++        for root, witness in pairs:
++            self.assertTrue(witness.is_file())
++            self.assertEqual(witness.parent, root)
++            self.assertIn(root, codefence.PROTECTED_ROOTS)
++
++
++@unittest.skipUnless(contained.containment_available(), "bwrap containment unavailable on this host")
++class ContainmentProofLinux(unittest.TestCase):
++    """LIVE: a real contained child genuinely has the code roots read-only and no secrets in view."""
++
++    def test_code_root_is_read_only_inside_the_sandbox(self):
++        root = codefence.PROTECTED_ROOTS[0]
++        target = (root / "__contained_probe__.tmp").as_posix()
++        with tempfile.TemporaryDirectory() as ws:
++            argv, _iso, protected = contained.wrap_contained(
++                [contained._SH_BIN, "-c", f'echo x > "{target}" 2>/dev/null; echo rc=$?'], ws)
++            self.assertTrue(protected)
++            r = subprocess.run(argv, capture_output=True, timeout=30, text=True)
++            self.assertEqual(r.returncode, 0)                       # guard passed + payload ran
++            self.assertNotIn("rc=0", r.stdout)                      # the write to the code root FAILED (ro)
++            self.assertFalse((root / "__contained_probe__.tmp").exists())  # nothing written on the host
++
++    def test_no_home_or_shadow_in_view(self):
++        with tempfile.TemporaryDirectory() as ws:
++            argv, _iso, protected = contained.wrap_contained(
++                [contained._SH_BIN, "-c",
++                 'cat /etc/shadow 2>/dev/null; ls /root 2>/dev/null; echo DONE'], ws)
++            self.assertTrue(protected)
++            r = subprocess.run(argv, capture_output=True, timeout=30, text=True)
++            self.assertIn("DONE", r.stdout)
++            self.assertNotIn("root:", r.stdout)                     # /etc/shadow masked with /dev/null (empty)
++
++
++if __name__ == "__main__":
++    sys.exit(unittest.main())
+diff --git a/tests/test_collaborator_run_command_parity.py b/tests/test_collaborator_run_command_parity.py
+index d17cbb8..dda0188 100644
+--- a/tests/test_collaborator_run_command_parity.py
++++ b/tests/test_collaborator_run_command_parity.py
+@@ -22,6 +22,7 @@ from pathlib import Path
+ from unittest.mock import patch
+ 
+ from collaborator import netns
++from collaborator.contained import SHELL_CONTAINED_AUTONOMY_CAP
+ from collaborator.governance import DENIED, HELD, RAN, govern_action
+ from collaborator.loop import approve
+ from collaborator.policycaps import mint, workspace_subject
+@@ -30,11 +31,32 @@ from collaborator.toolcall import ToolIntent
+ from collaborator.tools import ACT_THEN_REPORT, PROPOSE_FIRST, SEALED_TOOLS, held_action_seal, toolset
+ 
+ _CAPS = ("fs.read:project", "fs.write:project", "shell.exec")
+-# code protection is deferred (False in this build); patch it True so the CODE floor stands down and
+-# only the NETWORK floor (B1) governs the outcome under test.
++# "protection earns autonomy": an autonomous run_command earns autonomy only with BOTH verified code
++# protection AND a signed shell.contained_autonomy grant, and then runs CONTAINED (bwrap). Patch the
++# probe True to stand the CODE-PROTECTION half down; the signed cap is granted via _signed_autonomy.
+ _CODE_UP = patch("collaborator.governance.code_protection_available", return_value=True)
+ 
+ 
++def _contained(argv, workspace, *, roots_with_witness=None, unshare_net=True):
++    # Simulate a host that DOES contain (real bwrap is Linux-only + absent on this dev host / some CI).
++    # isolated follows unshare_net; protected True. The Linux @skipUnless proof exercises the real thing.
++    return [str(a) for a in argv], unshare_net, True
++
++
++def _uncontained(argv, workspace, *, roots_with_witness=None, unshare_net=True):
++    return [str(a) for a in argv], False, False   # a host that CANNOT contain (bwrap absent / probe fails)
++
++
++def _signed_autonomy(tmp, *, extra=()):
++    """A SIGNED session carrying shell.contained_autonomy (+ extras like shell.raw_network) — the signed
++    half of the earned-autonomy gate (mutable session.capabilities can NEVER earn it, F5)."""
++    key = b"caps-key"
++    signed = mint(("shell.exec", SHELL_CONTAINED_AUTONOMY_CAP, *extra),
++                  {"run_command": ACT_THEN_REPORT}, "admin", workspace_subject(tmp), key)
++    return Session(workspace=tmp, policy_caps=signed, caps_key=key,
++                   leash_overrides={"run_command": ACT_THEN_REPORT})
++
++
+ # The EXECUTOR's real isolation depends on the host (Linux+userns isolates; this Windows dev host and
+ # many CI sandboxes do not). Tests that reach the executor autonomously and assert an
+ # isolation-dependent outcome patch wrap_no_network to force a DETERMINISTIC result — otherwise the
+@@ -44,10 +66,6 @@ def _unisolated(argv):
+     return [str(a) for a in argv], False
+ 
+ 
+-def _isolated(argv):
+-    return [str(a) for a in argv], True
+-
+-
+ def _session(tmp, *, caps=_CAPS, **kw):
+     return Session(workspace=tmp, capabilities=caps, **kw)
+ 
+@@ -66,21 +84,19 @@ class IsolationEarnsAutonomyFloor(unittest.TestCase):
+             self.assertEqual(d.leash, PROPOSE_FIRST)
+ 
+     def test_atr_shell_runs_with_SIGNED_raw_network_optin(self):
+-        # The SIGNED, default-deny opt-in ACCEPTS raw reach on this host -> the floor stands down and
+-        # the shell may auto-run (act_then_report). The isolation flag stays HONESTLY False (real
+-        # netns is unavailable on this dev host — the executor never claims isolation it lacks).
++        # Earned autonomy (verified protection + signed shell.contained_autonomy) PLUS a signed
++        # shell.raw_network opt-in -> the shell auto-runs CONTAINED but with the network SHARED
++        # (--share-net): network_isolated stays HONESTLY False (ran raw, under the signed opt-in),
++        # while the code roots are still read-only (code_protected True).
+         with tempfile.TemporaryDirectory() as tmp, _CODE_UP, \
+                 patch("collaborator.governance.netns_available", return_value=False), \
+-                patch("collaborator.tools.wrap_no_network", side_effect=_unisolated):
+-            key = b"caps-key"
+-            signed = mint(("shell.exec", netns.SHELL_RAW_NETWORK_CAP),
+-                          {"run_command": ACT_THEN_REPORT}, "admin", workspace_subject(tmp), key)
+-            s = Session(workspace=tmp, policy_caps=signed, caps_key=key,
+-                        leash_overrides={"run_command": ACT_THEN_REPORT})
++                patch("collaborator.tools.wrap_contained", side_effect=_contained):
++            s = _signed_autonomy(tmp, extra=(netns.SHELL_RAW_NETWORK_CAP,))
+             d = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "structured"))
+-            self.assertEqual(d.status, RAN)                 # opt-in lets an UNISOLATED shell auto-run
++            self.assertEqual(d.status, RAN)
+             self.assertEqual(d.leash, ACT_THEN_REPORT)
+-            self.assertIs(d.network_isolated, False)        # honest — ran raw, under the signed opt-in
++            self.assertIs(d.network_isolated, False)        # raw-network opt-in -> --share-net -> not isolated
++            self.assertIs(d.code_protected, True)           # earned path IS contained (code roots ro)
+ 
+     def test_UNSIGNED_raw_network_optin_does_NOT_stand_the_floor_down(self):
+         # red-team F1: the raw-reach opt-in is the "run raw unattended" signal, so — like the emission
+@@ -94,19 +110,19 @@ class IsolationEarnsAutonomyFloor(unittest.TestCase):
+             self.assertEqual(d.status, HELD)
+             self.assertEqual(d.leash, PROPOSE_FIRST)
+ 
+-    def test_atr_shell_runs_when_isolation_available(self):
+-        # Verified netns available AND the executor genuinely isolates -> autonomy is NOT withheld and
+-        # the shell auto-runs. On this non-Linux dev host real netns is absent, so wrap_no_network is
+-        # patched to simulate a host that DOES isolate (the Linux IsolationProof tests exercise the
+-        # real thing); with the isolation actually achieved, require_isolation is satisfied.
++    def test_atr_shell_earns_autonomy_contained(self):
++        # Earned autonomy: verified protection + a signed shell.contained_autonomy grant + a host that
++        # contains -> the shell auto-runs CONTAINED, network isolated (bwrap --unshare-net) and code
++        # roots read-only. netns_available patched True so the orthogonal network floor also stands down.
+         with tempfile.TemporaryDirectory() as tmp, _CODE_UP, \
+                 patch("collaborator.governance.netns_available", return_value=True), \
+-                patch("collaborator.tools.wrap_no_network", side_effect=_isolated):
+-            s = _session(tmp, leash_overrides={"run_command": ACT_THEN_REPORT})
++                patch("collaborator.tools.wrap_contained", side_effect=_contained):
++            s = _signed_autonomy(tmp)
+             d = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "structured"))
+             self.assertEqual(d.status, RAN)
+             self.assertEqual(d.leash, ACT_THEN_REPORT)
+-            self.assertIs(d.network_isolated, True)
++            self.assertIs(d.network_isolated, True)         # no raw opt-in -> --unshare-net -> isolated
++            self.assertIs(d.code_protected, True)           # code roots ro inside the sandbox
+ 
+     def test_default_leash_shell_is_held_regardless(self):
+         # run_command's default leash is already propose_first, so a shell without a loosening
+@@ -318,46 +334,45 @@ class RedTeamFixes(unittest.TestCase):
+ 
+     def test_exec_code_floor_belt_denies_autonomous_unprotected_shell(self):
+         # N2: the CODE floor is re-asserted at execution too — a direct autonomous (not human_gated)
+-        # run_command reaching execute_and_verify while code protection is unavailable is DENIED,
+-        # symmetric with the network floor and the floor doing all the work today.
++        # run_command reaching execute_and_verify without the earned-autonomy gate (verified protection +
++        # a signed shell.contained_autonomy grant; this unsigned session has neither) is DENIED before it
++        # can reach the executor, symmetric with the network floor.
+         from collaborator.governance import execute_and_verify
+         from collaborator.tools import get_tool
+         with tempfile.TemporaryDirectory() as tmp:
+-            s = _session(tmp)
++            s = _session(tmp)   # unsigned -> no signed contained_autonomy grant
+             held = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "structured"))
+             d = execute_and_verify(s, get_tool("run_command"), held.directive, held.action_id,
+                                    dict(held.args), leash=ACT_THEN_REPORT, human_gated=False)
+             self.assertEqual(d.status, DENIED)
+-            self.assertIn("code protection unavailable", d.reason)
+-
+-    def test_exec_network_floor_refuses_autonomous_unisolated_shell(self):
+-        # F3 (real belief<->behaviour binding): with code protection available, a direct autonomous
+-        # run_command with no verified netns and no signed opt-in is REFUSED BY THE EXECUTOR (it cannot
+-        # isolate) -> FAILED, bound to the ACTUAL isolation result, not the govern-time belief.
+-        from collaborator.governance import execute_and_verify
+-        from collaborator.tools import get_tool
++            self.assertIn("contained-autonomy unavailable", d.reason)
++
++    def test_exec_refuses_autonomous_shell_when_host_cannot_contain(self):
++        # F3 on the CODE axis (real belief<->behaviour binding): govern BELIEVES protection is available
++        # (patched) and the operator SIGNED contained_autonomy, so the gate stands down and the shell
++        # auto-runs — but the EXECUTOR cannot actually contain (wrap_contained returns not-protected), so
++        # it REFUSES to run. The guarantee is bound to the executor's REAL containment result, never a
++        # govern belief; code_protected is honestly False and nothing ran.
+         with tempfile.TemporaryDirectory() as tmp, _CODE_UP, \
+-                patch("collaborator.tools.wrap_no_network", side_effect=_unisolated):
+-            s = _session(tmp)   # unsigned -> no opt-in
+-            held = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "structured"))
+-            d = execute_and_verify(s, get_tool("run_command"), held.directive, held.action_id,
+-                                   dict(held.args), leash=ACT_THEN_REPORT, human_gated=False)
++                patch("collaborator.governance.netns_available", return_value=True), \
++                patch("collaborator.tools.wrap_contained", side_effect=_uncontained):
++            s = _signed_autonomy(tmp)   # earns the gate; the executor still can't contain on this host
++            d = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "structured"))
+             self.assertEqual(d.status, "failed")
+-            self.assertIn("isolation required", (d.result.error if d.result else ""))
+-            self.assertIs(d.network_isolated, False)
++            self.assertIn("code protection required but unavailable", (d.result.error if d.result else ""))
++            self.assertIs(d.code_protected, False)
+ 
+     def test_exec_belt_not_keyed_on_leash_string(self):
+         # N1: the execution belt keys on `not human_gated` (an autonomous execution), NOT the leash
+-        # string — a propose_first leash with human_gated=False can't slip past the isolation refusal.
++        # string — a propose_first leash with human_gated=False can't slip past the earned-autonomy gate.
+         from collaborator.governance import execute_and_verify
+         from collaborator.tools import get_tool
+-        with tempfile.TemporaryDirectory() as tmp, _CODE_UP, \
+-                patch("collaborator.tools.wrap_no_network", side_effect=_unisolated):
+-            s = _session(tmp)
++        with tempfile.TemporaryDirectory() as tmp:
++            s = _session(tmp)   # unsigned -> no earned-autonomy grant
+             held = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "structured"))
+             d = execute_and_verify(s, get_tool("run_command"), held.directive, held.action_id,
+                                    dict(held.args), leash=PROPOSE_FIRST, human_gated=False)
+-            self.assertEqual(d.status, "failed")            # still refused, not run raw
++            self.assertEqual(d.status, DENIED)              # keyed on not-human_gated -> gated, not run
+ 
+     def test_human_approved_shell_unaffected_by_exec_belt(self):
+         # A human-approved held shell is the human's call -> the execution belt does not refuse it.
+diff --git a/tests/test_collaborator_staging.py b/tests/test_collaborator_staging.py
+index 0851d40..02d2353 100644
+--- a/tests/test_collaborator_staging.py
++++ b/tests/test_collaborator_staging.py
+@@ -19,9 +19,11 @@ import unittest
+ from pathlib import Path
+ from unittest.mock import patch
+ 
++from collaborator.contained import SHELL_CONTAINED_AUTONOMY_CAP
+ from collaborator.governance import DENIED, HELD, RAN, govern_action
+ from collaborator.loop import approve
+ from collaborator.model_client import ScriptedClient
++from collaborator.policycaps import mint, workspace_subject
+ from collaborator.propose import PROPOSED, approve_proposal, propose, veto_proposal
+ from collaborator.proposalpool import ProposalPool
+ from collaborator.session import Session
+@@ -320,17 +322,22 @@ class ProposerShellAndApproveGates(unittest.TestCase):
+             d_user = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "structured"))
+             self.assertEqual(d_user.leash, PROPOSE_FIRST)
+             self.assertEqual(d_user.status, HELD)
+-            # The PROPOSER floor is additionally proposer-SPECIFIC: with BOTH autonomy floors stood
+-            # down — code protection available (Harm A) AND network isolation available (ADR 0003
+-            # revisit #1a; netns is unavailable on this dev host, so patch it) — a user-directed
+-            # command keeps ACT_THEN_REPORT while a proposer-originated one is STILL floored to
+-            # propose_first. (The two floors are orthogonal; isolating the proposer floor requires
+-            # neutralising both.)
++            # The PROPOSER floor is additionally proposer-SPECIFIC: with the autonomy floors stood down —
++            # verified code protection AND a SIGNED shell.contained_autonomy grant (Harm A / "protection
++            # earns autonomy") AND network isolation available (ADR 0003 revisit #1a; netns is unavailable
++            # on this dev host, so patch it) — a user-directed command keeps ACT_THEN_REPORT while a
++            # proposer-originated one is STILL floored to propose_first. (The floors are orthogonal;
++            # isolating the proposer floor requires neutralising them, incl. the signed autonomy cap.)
++            key = b"caps-key"
++            signed = mint(("shell.exec", SHELL_CONTAINED_AUTONOMY_CAP),
++                          {"run_command": ACT_THEN_REPORT}, "admin", workspace_subject(tmp), key)
++            s_signed = Session(workspace=tmp, policy_caps=signed, caps_key=key,
++                               leash_overrides={"run_command": ACT_THEN_REPORT})
+             with patch("collaborator.governance.code_protection_available", return_value=True), \
+                  patch("collaborator.governance.netns_available", return_value=True):
+-                d2 = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "structured"))
++                d2 = govern_action(s_signed, ToolIntent("run_command", {"command": ["echo", "hi"]}, "structured"))
+                 self.assertEqual(d2.leash, ACT_THEN_REPORT)
+-                d3 = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "proposed"))
++                d3 = govern_action(s_signed, ToolIntent("run_command", {"command": ["echo", "hi"]}, "proposed"))
+                 self.assertEqual(d3.leash, PROPOSE_FIRST)
+ 
+     def test_approve_re_denies_a_mutated_controlled_path(self):

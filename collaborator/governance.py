@@ -37,6 +37,7 @@ from salienceos.verifier.observers import observe_action, snapshot_tree
 from collaborator import egress
 from collaborator.codefence import code_protection_available, names_code_root
 from collaborator.sensitivepaths import names_sensitive_path
+from collaborator.contained import SHELL_CONTAINED_AUTONOMY_CAP
 from collaborator.netns import SHELL_RAW_NETWORK_CAP, netns_available
 from collaborator.tools import (
     ACT_THEN_REPORT,
@@ -420,16 +421,22 @@ def govern_action(session, intent: ToolIntent, importance: "float | None" = None
         if not auto:
             leash = apply_cap(leash, PROPOSE_FIRST)
 
-    # --- run_command AUTONOMY-WITHHELD FLOOR (F-6 Harm A) --------------------
-    # run_command has NO filesystem fence: an autonomous shell could overwrite the Collaborator's
-    # own code and neuter F1. Until that write-reach is STRUCTURALLY prevented (an OS-level
-    # read-only bind of the code root — deferred), WITHHOLD autonomy — an act_then_report
-    # run_command floors to propose_first so it can never AUTO-run, only run under a human hand. An
-    # INDEPENDENT, monotonic floor: composes with the emission floor and the isolation-earns-autonomy
-    # network floor below by ANDing (stricter always wins, no shared mutable state); an explicit host
-    # tighten (notify_only) survives, being stricter than the floor.
+    # --- run_command AUTONOMY-WITHHELD FLOOR — "protection earns autonomy" (F-6 / ADR 0003) --
+    # run_command has NO filesystem fence: an autonomous shell could overwrite the Collaborator's own
+    # code and neuter F1. An act_then_report run_command may AUTO-run ONLY when BOTH hold: (a) its
+    # write-reach to the code is STRUCTURALLY prevented AND VERIFIABLE on this host (bwrap containment
+    # of PROTECTED_ROOTS — code_protection_available() is now a real probe), AND (b) the operator has
+    # SIGNED for it (shell.contained_autonomy — enforced + a signed grant, never mutable
+    # session.capabilities; the same F5 rule shell.raw_network/net.post.auto follow). Verified
+    # containment is necessary but NOT sufficient — the signed cap keeps the single largest autonomy
+    # expansion operator-ratcheted, never lifted by the mere presence of bwrap on a host. Absent EITHER,
+    # WITHHOLD autonomy: floor to propose_first (a human hand). An INDEPENDENT, monotonic floor,
+    # ANDed with the emission + isolation-earns-autonomy floors (stricter always wins, no shared mutable
+    # state); an explicit host tighten (notify_only) survives, being stricter than the floor.
     if (intent.name == "run_command" and leash == ACT_THEN_REPORT
-            and not code_protection_available()):
+            and not (code_protection_available()
+                     and enforced(session)
+                     and directive.grants_capability(SHELL_CONTAINED_AUTONOMY_CAP))):
         leash = apply_cap(leash, PROPOSE_FIRST)
 
     # --- run_command ISOLATION-EARNS-AUTONOMY FLOOR (ADR 0003 revisit #1a) ----
@@ -501,10 +508,15 @@ def govern_action(session, intent: ToolIntent, importance: "float | None" = None
     if getattr(tool, "egress", False):
         preview["canonical_dest"] = egress.canonical_host(str(args.get("url") or ""))
     if intent.name == "run_command":
-        # Surface the honest code-protection posture + any literal self-code reference to the human
-        # who holds the hand on this shell (F-6 Harm A). code_protection_available() is False in this
-        # build, so this reads "not protected" — the honest state until OS-level protection lands.
-        preview["code_protected"] = code_protection_available()
+        # Surface the honest posture to the human holding the hand (F-6). A HELD run_command, once
+        # APPROVED, runs on the HUMAN path (human_gated) which is UNCONTAINED BY DESIGN — full filesystem
+        # reach for maintenance — REGARDLESS of whether this host CAN contain (that only earns AUTONOMY, a
+        # different, un-held path). So the run the human is approving is NOT code-protected: say so, never
+        # imply a fence the approved run won't have (else code_protection_available() going True on a
+        # capable host would print 🔒 over a full-reach run).
+        preview["code_protected"] = False
+        preview["reach"] = ("full filesystem — a human-approved run_command is deliberately uncontained "
+                            "(maintenance); containment applies only to the autonomy-earning path")
         _named = names_code_root(args.get("command"))
         if _named:
             preview["names_code_root"] = _named
@@ -617,16 +629,25 @@ def execute_and_verify(session, tool: Tool, directive, action_id: str, args: dic
     # string, so a propose_first-with-human_gated=False caller can't slip one notch over (N1). A
     # human-approved run is the human's call, unaffected.
     require_isolation = False
+    require_code_protection = False
     if tool.name == "run_command" and not human_gated:
-        # CODE floor: never AUTO-run a shell whose write-reach to its own code is unprevented —
-        # symmetric with the network floor below, and the floor doing all the work today (N2).
-        if not code_protection_available():
+        # CODE floor re-asserted at the MOMENT OF USE (defence in depth, N2): an autonomous shell may run
+        # only CONTAINED and only where the operator SIGNED for it — verified code protection on this host
+        # AND a signed shell.contained_autonomy grant. Bound here (not just govern-time) so no direct
+        # internal caller / future refactor reaches an unprotected or un-opted-in autonomous run.
+        if not (code_protection_available()
+                and enforced(session)
+                and directive.grants_capability(SHELL_CONTAINED_AUTONOMY_CAP)):
             return Decision(action_id, tool.name, DENIED,
-                            "autonomous shell withheld at execution: code protection unavailable",
+                            "autonomous shell withheld at execution: contained-autonomy unavailable "
+                            "(needs verified code protection + a signed shell.contained_autonomy grant)",
                             leash, directive=directive, args=args)
-        # NETWORK floor: require ACTUAL isolation unless signed-opted-in. Threaded to the executor,
-        # which REFUSES to run when it cannot isolate — so the guarantee is bound to the executor's
-        # real isolation result (execution.network_isolated), not the govern-time belief (F3).
+        # The BINDING flag (ADR 0003:336-338): the executor wraps in bwrap and REFUSES to run if it cannot
+        # verifiably contain — the guarantee is bound to the executor's REAL result (execution.code_protected),
+        # NOT re-read here, so the belief-vs-behaviour split cannot reopen on the code axis.
+        require_code_protection = True
+        # NETWORK floor: on the contained path bwrap isolates the network too (unshare_net=require_isolation).
+        # Require ACTUAL isolation unless signed-opted-in; bound to the executor's real result (F3).
         require_isolation = not (enforced(session) and directive.grants_capability(SHELL_RAW_NETWORK_CAP))
     # Read-only: gate already passed; execute and report (nothing is mutated).
     if tool.verify_mode == "none":
@@ -685,7 +706,8 @@ def execute_and_verify(session, tool: Tool, directive, action_id: str, args: dic
         code_touch = names_code_root(args.get("command"))   # F-6 audit-only tag (porous), never a deny
         secret_touch = names_sensitive_path(args.get("command"))  # PR 1a audit-only (porous), never a deny
         try:
-            execution = execute_tool(tool, session.workspace, args, require_isolation=require_isolation)
+            execution = execute_tool(tool, session.workspace, args, require_isolation=require_isolation,
+                                     require_code_protection=require_code_protection)
         except WorkspaceError as exc:
             return Decision(action_id, tool.name, DENIED, str(exc), leash, directive=directive,
                             args=args, offense_flag=offense_flag, code_touch=code_touch,

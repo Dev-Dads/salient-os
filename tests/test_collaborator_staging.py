@@ -19,9 +19,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from collaborator.contained import SHELL_CONTAINED_AUTONOMY_CAP
 from collaborator.governance import DENIED, HELD, RAN, govern_action
 from collaborator.loop import approve
 from collaborator.model_client import ScriptedClient
+from collaborator.policycaps import mint, workspace_subject
 from collaborator.propose import PROPOSED, approve_proposal, propose, veto_proposal
 from collaborator.proposalpool import ProposalPool
 from collaborator.session import Session
@@ -320,17 +322,22 @@ class ProposerShellAndApproveGates(unittest.TestCase):
             d_user = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "structured"))
             self.assertEqual(d_user.leash, PROPOSE_FIRST)
             self.assertEqual(d_user.status, HELD)
-            # The PROPOSER floor is additionally proposer-SPECIFIC: with BOTH autonomy floors stood
-            # down — code protection available (Harm A) AND network isolation available (ADR 0003
-            # revisit #1a; netns is unavailable on this dev host, so patch it) — a user-directed
-            # command keeps ACT_THEN_REPORT while a proposer-originated one is STILL floored to
-            # propose_first. (The two floors are orthogonal; isolating the proposer floor requires
-            # neutralising both.)
+            # The PROPOSER floor is additionally proposer-SPECIFIC: with the autonomy floors stood down —
+            # verified code protection AND a SIGNED shell.contained_autonomy grant (Harm A / "protection
+            # earns autonomy") AND network isolation available (ADR 0003 revisit #1a; netns is unavailable
+            # on this dev host, so patch it) — a user-directed command keeps ACT_THEN_REPORT while a
+            # proposer-originated one is STILL floored to propose_first. (The floors are orthogonal;
+            # isolating the proposer floor requires neutralising them, incl. the signed autonomy cap.)
+            key = b"caps-key"
+            signed = mint(("shell.exec", SHELL_CONTAINED_AUTONOMY_CAP),
+                          {"run_command": ACT_THEN_REPORT}, "admin", workspace_subject(tmp), key)
+            s_signed = Session(workspace=tmp, policy_caps=signed, caps_key=key,
+                               leash_overrides={"run_command": ACT_THEN_REPORT})
             with patch("collaborator.governance.code_protection_available", return_value=True), \
                  patch("collaborator.governance.netns_available", return_value=True):
-                d2 = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "structured"))
+                d2 = govern_action(s_signed, ToolIntent("run_command", {"command": ["echo", "hi"]}, "structured"))
                 self.assertEqual(d2.leash, ACT_THEN_REPORT)
-                d3 = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "proposed"))
+                d3 = govern_action(s_signed, ToolIntent("run_command", {"command": ["echo", "hi"]}, "proposed"))
                 self.assertEqual(d3.leash, PROPOSE_FIRST)
 
     def test_approve_re_denies_a_mutated_controlled_path(self):
