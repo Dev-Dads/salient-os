@@ -8,6 +8,7 @@ fail-closed directive (no capabilities at all), not a trusted one.
 """
 
 import enum
+import unicodedata
 from dataclasses import dataclass, field
 
 from salienceos.verifier.signing import sign, signature_valid
@@ -16,6 +17,31 @@ from salienceos.verifier.signing import sign, signature_valid
 # ceiling; the default (no memory signal) is the least-durable — a total durable
 # record is itself a liability (Finding G).
 RETENTION_ORDER = ("ephemeral", "working", "episodic", "semantic")
+
+# ADR 0004 (ADR 0003 revisit #4) — the PROHIBITED, structurally UN-GRANTABLE capability namespace.
+# A capability naming a third party the operator cannot prove authority over ("offense") is
+# un-expressable BY CONSTRUCTION: `issue_policy` strips it from a signed envelope and
+# `Directive.grants_capability` refuses it unconditionally, so no in-band grant — not the model's,
+# not the operator's HMAC PolicyCaps, not a hand-built or mis-wired directive — can authorize the
+# prohibited class. The prohibition is enforced in CORE (P-01's sibling), not by the Collaborator
+# declining to mint one. A legitimate Tier-3 unlock, if ever built, comes through a SEPARATE trust
+# root (an external-key scope artifact provisioned by a domain the operator runtime cannot author),
+# NEVER through this capability path. See docs/adr/0004.
+RESERVED_UNGRANTABLE_PREFIXES = ("offense:",)
+
+
+def is_ungrantable_capability(capability) -> bool:
+    """True if `capability` names the structurally prohibited class (a reserved prefix). Total —
+    a non-string is not a capability string, so it is not (this) prohibited namespace (False).
+
+    Normalized before matching so a CONFUSABLE cannot slip a variant past the reservation:
+    NFKC compatibility-folds full-width / compatibility forms (``ｏｆｆｅｎｓｅ：`` -> ``offense:``,
+    external-panel gemini), then casefold handles case (``OFFENSE:``). The reserved prefixes are
+    already ASCII-lowercase, so a legitimate ASCII capability is unaffected."""
+    if not isinstance(capability, str):
+        return False
+    normalized = unicodedata.normalize("NFKC", capability).casefold()
+    return normalized.startswith(RESERVED_UNGRANTABLE_PREFIXES)
 
 
 class VerificationDepth(enum.IntEnum):
@@ -78,10 +104,17 @@ def issue_policy(
     allow_immediate_reconfigure: bool,
     policy_key: bytes,
 ) -> PolicyCaps:
+    # Total / fail-closed: a malformed granted_capabilities (None, or a bare str/bytes that would
+    # otherwise iterate into single characters) yields NO capabilities — the hardest fail-closed —
+    # rather than raising at this boundary (external-panel gemini FRAG-01; pre-existing, hardened here).
+    _caps = () if (granted_capabilities is None
+                   or isinstance(granted_capabilities, (str, bytes))) else granted_capabilities
     caps = PolicyCaps(
         policy_id=policy_id,
         subject=subject,
-        granted_capabilities=tuple(granted_capabilities),
+        # ADR 0004: a prohibited-namespace capability never rides in a signed envelope. Stripped here
+        # (defense in depth + clean audit); grants_capability refuses it unconditionally regardless.
+        granted_capabilities=tuple(c for c in _caps if not is_ungrantable_capability(c)),
         min_budget=min_budget,
         max_budget=max_budget,
         min_verification=min_verification,

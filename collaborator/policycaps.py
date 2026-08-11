@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from collaborator.tools import ACT_THEN_REPORT, NOTIFY_ONLY, PROPOSE_FIRST
+from salienceos.interpreter.policy import is_ungrantable_capability
 
 COLLABORATOR_POLICYCAPS_VERSION = "0.1.0"
 
@@ -76,8 +77,18 @@ def mint(capabilities, leash_caps, issuer: str, subject: str, key: bytes) -> Sig
     for _name, level in items:
         if level not in _LEASH_RANK:
             raise ValueError(f"leash_cap must be one of {tuple(_LEASH_RANK)}, got {level!r}")
+    # ADR 0004 (ADR 0003 revisit #4): the operator cannot even CONSTRUCT a grant naming the
+    # structurally prohibited class — the reserved `offense:` namespace. Fail LOUD at mint (like the
+    # leash validation above), the belt closest to where the operator writes authority. Core also
+    # strips it at issue_policy and refuses it in grants_capability, so a grant that somehow carried
+    # it would still never authorize — but there is no legitimate reason to mint one.
+    caps_list = tuple(str(c) for c in capabilities)
+    for c in caps_list:
+        if is_ungrantable_capability(c):
+            raise ValueError(f"capability {c!r} names the structurally un-grantable prohibited "
+                             "namespace (ADR 0004) and cannot be minted into a grant")
     caps = PolicyCaps(
-        capabilities=tuple(str(c) for c in capabilities),
+        capabilities=caps_list,
         leash_caps=tuple(items),
         issuer=str(issuer), subject=str(subject),
     )
@@ -144,10 +155,16 @@ def granted_capabilities(session) -> tuple:
     authoritative — the mutable ``session.capabilities`` cannot widen them, and a grant that
     is absent-when-required or invalid -> () (fail closed). Not enforced (constructed with
     no grant) -> legacy ``session.capabilities``."""
+    # ADR 0004: the prohibited namespace never rides into the seam, even from a grant hand-built
+    # OUTSIDE mint() (mint's reject is only one construction path — external-panel grok/gpt). Filter
+    # both the legacy and the signed read paths; core's issue_policy strip + grants_capability refusal
+    # are the load-bearing belts regardless, so an offense: cap is authorized by NONE of the three.
     if not _enforced(session):
-        return tuple(getattr(session, "capabilities", ()))
+        return tuple(c for c in getattr(session, "capabilities", ()) if not is_ungrantable_capability(c))
     grant = _valid_grant(session)
-    return tuple(grant.caps.capabilities) if grant is not None else ()
+    if grant is None:
+        return ()
+    return tuple(c for c in grant.caps.capabilities if not is_ungrantable_capability(c))
 
 
 def leash_cap(session, tool_name: str):

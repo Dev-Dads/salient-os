@@ -18,6 +18,8 @@ ALLOWED_TOP_LEVEL_IMPORTS = {
     "os",
     "pathlib",
     "subprocess",
+    "unicodedata",  # NFKC-normalize a capability string before the un-grantable-namespace check
+                    # (confusable defense for the prohibited offense: reservation, ADR 0004)
     # the package itself
     "salienceos",
 }

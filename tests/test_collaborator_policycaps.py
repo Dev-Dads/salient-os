@@ -17,6 +17,7 @@ from collaborator.policycaps import (
     granted_capabilities,
     leash_cap,
     mint,
+    sign,
     verify,
     workspace_subject,
 )
@@ -62,6 +63,33 @@ class SignVerify(unittest.TestCase):
 
     def test_verify_is_total(self):
         self.assertFalse(verify("not-a-signed-caps", CAPS_KEY, "/ws"))  # never raises
+
+    def test_mint_rejects_the_prohibited_offense_namespace(self):
+        # ADR 0004 (ADR 0003 revisit #4): the operator cannot even construct a grant that names the
+        # structurally un-grantable prohibited class — fail LOUD at mint (the belt closest to where
+        # the operator writes authority). A legit capability alongside is irrelevant; the whole mint
+        # is refused.
+        with self.assertRaises(ValueError):
+            mint(("offense:evil.com",), {}, "admin", "/ws", CAPS_KEY)
+        with self.assertRaises(ValueError):
+            mint(("fs.write:project", "offense:evil.com"), {"write_file": "act_then_report"},
+                 "admin", "/ws", CAPS_KEY)
+        # a normal grant is unaffected
+        self.assertTrue(verify(mint(("fs.write:project",), {}, "admin", "/ws", CAPS_KEY), CAPS_KEY, "/ws"))
+
+    def test_granted_capabilities_strips_offense_from_a_hand_built_foreign_grant(self):
+        # mint() is only ONE construction path (external-panel grok/gpt): a VALID signed grant built
+        # directly (bypassing mint) could carry an offense: cap. The read path strips it too, so the
+        # prohibited namespace never rides into the seam — a legit cap alongside is unaffected.
+        with tempfile.TemporaryDirectory() as tmp:
+            subj = workspace_subject(tmp)
+            caps = PolicyCaps(("offense:evil.com", "fs.read:project"), (), "admin", subj)
+            foreign = SignedPolicyCaps(caps, sign(caps, CAPS_KEY))   # a genuinely-valid signature
+            self.assertTrue(verify(foreign, CAPS_KEY, subj))         # it DOES verify (built with the key)...
+            s = Session(workspace=tmp, policy_caps=foreign, caps_key=CAPS_KEY)
+            got = granted_capabilities(s)
+            self.assertNotIn("offense:evil.com", got)                # ...yet offense: never rides
+            self.assertIn("fs.read:project", got)
 
 
 class NoWiden(unittest.TestCase):

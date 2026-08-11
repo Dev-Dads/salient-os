@@ -1,0 +1,279 @@
+diff --git a/collaborator/policycaps.py b/collaborator/policycaps.py
+index 5bbf0af..25a5dac 100644
+--- a/collaborator/policycaps.py
++++ b/collaborator/policycaps.py
+@@ -21,6 +21,7 @@ from dataclasses import dataclass
+ from pathlib import Path
+ 
+ from collaborator.tools import ACT_THEN_REPORT, NOTIFY_ONLY, PROPOSE_FIRST
++from salienceos.interpreter.policy import is_ungrantable_capability
+ 
+ COLLABORATOR_POLICYCAPS_VERSION = "0.1.0"
+ 
+@@ -76,8 +77,18 @@ def mint(capabilities, leash_caps, issuer: str, subject: str, key: bytes) -> Sig
+     for _name, level in items:
+         if level not in _LEASH_RANK:
+             raise ValueError(f"leash_cap must be one of {tuple(_LEASH_RANK)}, got {level!r}")
++    # ADR 0004 (ADR 0003 revisit #4): the operator cannot even CONSTRUCT a grant naming the
++    # structurally prohibited class — the reserved `offense:` namespace. Fail LOUD at mint (like the
++    # leash validation above), the belt closest to where the operator writes authority. Core also
++    # strips it at issue_policy and refuses it in grants_capability, so a grant that somehow carried
++    # it would still never authorize — but there is no legitimate reason to mint one.
++    caps_list = tuple(str(c) for c in capabilities)
++    for c in caps_list:
++        if is_ungrantable_capability(c):
++            raise ValueError(f"capability {c!r} names the structurally un-grantable prohibited "
++                             "namespace (ADR 0004) and cannot be minted into a grant")
+     caps = PolicyCaps(
+-        capabilities=tuple(str(c) for c in capabilities),
++        capabilities=caps_list,
+         leash_caps=tuple(items),
+         issuer=str(issuer), subject=str(subject),
+     )
+@@ -144,10 +155,16 @@ def granted_capabilities(session) -> tuple:
+     authoritative — the mutable ``session.capabilities`` cannot widen them, and a grant that
+     is absent-when-required or invalid -> () (fail closed). Not enforced (constructed with
+     no grant) -> legacy ``session.capabilities``."""
++    # ADR 0004: the prohibited namespace never rides into the seam, even from a grant hand-built
++    # OUTSIDE mint() (mint's reject is only one construction path — external-panel grok/gpt). Filter
++    # both the legacy and the signed read paths; core's issue_policy strip + grants_capability refusal
++    # are the load-bearing belts regardless, so an offense: cap is authorized by NONE of the three.
+     if not _enforced(session):
+-        return tuple(getattr(session, "capabilities", ()))
++        return tuple(c for c in getattr(session, "capabilities", ()) if not is_ungrantable_capability(c))
+     grant = _valid_grant(session)
+-    return tuple(grant.caps.capabilities) if grant is not None else ()
++    if grant is None:
++        return ()
++    return tuple(c for c in grant.caps.capabilities if not is_ungrantable_capability(c))
+ 
+ 
+ def leash_cap(session, tool_name: str):
+diff --git a/salienceos/interpreter/directive.py b/salienceos/interpreter/directive.py
+index 079e189..ea47413 100644
+--- a/salienceos/interpreter/directive.py
++++ b/salienceos/interpreter/directive.py
+@@ -9,7 +9,7 @@ accessor, so a consumer cannot infer authority from the scalar knobs.
+ import enum
+ from dataclasses import dataclass, field
+ 
+-from salienceos.interpreter.policy import AdaptationEligibility
++from salienceos.interpreter.policy import AdaptationEligibility, is_ungrantable_capability
+ 
+ 
+ class Reconfigure(enum.Enum):
+@@ -54,4 +54,10 @@ class Directive:
+     reasons: tuple = field(default=())
+ 
+     def grants_capability(self, capability: str) -> bool:
++        # ADR 0004 (ADR 0003 revisit #4): the prohibited class is un-grantable BY CONSTRUCTION.
++        # Refuse the reserved namespace UNCONDITIONALLY — before the membership check — so no
++        # directive can authorize it regardless of what allowed_capabilities contains (even a
++        # hand-built or mis-wired one). P-01's sibling: policy cannot authorize the prohibited class.
++        if is_ungrantable_capability(capability):
++            return False
+         return capability in self.allowed_capabilities
+diff --git a/salienceos/interpreter/policy.py b/salienceos/interpreter/policy.py
+index 5c7417c..76c570d 100644
+--- a/salienceos/interpreter/policy.py
++++ b/salienceos/interpreter/policy.py
+@@ -8,6 +8,7 @@ fail-closed directive (no capabilities at all), not a trusted one.
+ """
+ 
+ import enum
++import unicodedata
+ from dataclasses import dataclass, field
+ 
+ from salienceos.verifier.signing import sign, signature_valid
+@@ -17,6 +18,31 @@ from salienceos.verifier.signing import sign, signature_valid
+ # record is itself a liability (Finding G).
+ RETENTION_ORDER = ("ephemeral", "working", "episodic", "semantic")
+ 
++# ADR 0004 (ADR 0003 revisit #4) — the PROHIBITED, structurally UN-GRANTABLE capability namespace.
++# A capability naming a third party the operator cannot prove authority over ("offense") is
++# un-expressable BY CONSTRUCTION: `issue_policy` strips it from a signed envelope and
++# `Directive.grants_capability` refuses it unconditionally, so no in-band grant — not the model's,
++# not the operator's HMAC PolicyCaps, not a hand-built or mis-wired directive — can authorize the
++# prohibited class. The prohibition is enforced in CORE (P-01's sibling), not by the Collaborator
++# declining to mint one. A legitimate Tier-3 unlock, if ever built, comes through a SEPARATE trust
++# root (an external-key scope artifact provisioned by a domain the operator runtime cannot author),
++# NEVER through this capability path. See docs/adr/0004.
++RESERVED_UNGRANTABLE_PREFIXES = ("offense:",)
++
++
++def is_ungrantable_capability(capability) -> bool:
++    """True if `capability` names the structurally prohibited class (a reserved prefix). Total —
++    a non-string is not a capability string, so it is not (this) prohibited namespace (False).
++
++    Normalized before matching so a CONFUSABLE cannot slip a variant past the reservation:
++    NFKC compatibility-folds full-width / compatibility forms (``ｏｆｆｅｎｓｅ：`` -> ``offense:``,
++    external-panel gemini), then casefold handles case (``OFFENSE:``). The reserved prefixes are
++    already ASCII-lowercase, so a legitimate ASCII capability is unaffected."""
++    if not isinstance(capability, str):
++        return False
++    normalized = unicodedata.normalize("NFKC", capability).casefold()
++    return normalized.startswith(RESERVED_UNGRANTABLE_PREFIXES)
++
+ 
+ class VerificationDepth(enum.IntEnum):
+     NONE = 0
+@@ -78,10 +104,17 @@ def issue_policy(
+     allow_immediate_reconfigure: bool,
+     policy_key: bytes,
+ ) -> PolicyCaps:
++    # Total / fail-closed: a malformed granted_capabilities (None, or a bare str/bytes that would
++    # otherwise iterate into single characters) yields NO capabilities — the hardest fail-closed —
++    # rather than raising at this boundary (external-panel gemini FRAG-01; pre-existing, hardened here).
++    _caps = () if (granted_capabilities is None
++                   or isinstance(granted_capabilities, (str, bytes))) else granted_capabilities
+     caps = PolicyCaps(
+         policy_id=policy_id,
+         subject=subject,
+-        granted_capabilities=tuple(granted_capabilities),
++        # ADR 0004: a prohibited-namespace capability never rides in a signed envelope. Stripped here
++        # (defense in depth + clean audit); grants_capability refuses it unconditionally regardless.
++        granted_capabilities=tuple(c for c in _caps if not is_ungrantable_capability(c)),
+         min_budget=min_budget,
+         max_budget=max_budget,
+         min_verification=min_verification,
+diff --git a/tests/test_collaborator_policycaps.py b/tests/test_collaborator_policycaps.py
+index aeeb93f..c840daa 100644
+--- a/tests/test_collaborator_policycaps.py
++++ b/tests/test_collaborator_policycaps.py
+@@ -17,6 +17,7 @@ from collaborator.policycaps import (
+     granted_capabilities,
+     leash_cap,
+     mint,
++    sign,
+     verify,
+     workspace_subject,
+ )
+@@ -63,6 +64,33 @@ class SignVerify(unittest.TestCase):
+     def test_verify_is_total(self):
+         self.assertFalse(verify("not-a-signed-caps", CAPS_KEY, "/ws"))  # never raises
+ 
++    def test_mint_rejects_the_prohibited_offense_namespace(self):
++        # ADR 0004 (ADR 0003 revisit #4): the operator cannot even construct a grant that names the
++        # structurally un-grantable prohibited class — fail LOUD at mint (the belt closest to where
++        # the operator writes authority). A legit capability alongside is irrelevant; the whole mint
++        # is refused.
++        with self.assertRaises(ValueError):
++            mint(("offense:evil.com",), {}, "admin", "/ws", CAPS_KEY)
++        with self.assertRaises(ValueError):
++            mint(("fs.write:project", "offense:evil.com"), {"write_file": "act_then_report"},
++                 "admin", "/ws", CAPS_KEY)
++        # a normal grant is unaffected
++        self.assertTrue(verify(mint(("fs.write:project",), {}, "admin", "/ws", CAPS_KEY), CAPS_KEY, "/ws"))
++
++    def test_granted_capabilities_strips_offense_from_a_hand_built_foreign_grant(self):
++        # mint() is only ONE construction path (external-panel grok/gpt): a VALID signed grant built
++        # directly (bypassing mint) could carry an offense: cap. The read path strips it too, so the
++        # prohibited namespace never rides into the seam — a legit cap alongside is unaffected.
++        with tempfile.TemporaryDirectory() as tmp:
++            subj = workspace_subject(tmp)
++            caps = PolicyCaps(("offense:evil.com", "fs.read:project"), (), "admin", subj)
++            foreign = SignedPolicyCaps(caps, sign(caps, CAPS_KEY))   # a genuinely-valid signature
++            self.assertTrue(verify(foreign, CAPS_KEY, subj))         # it DOES verify (built with the key)...
++            s = Session(workspace=tmp, policy_caps=foreign, caps_key=CAPS_KEY)
++            got = granted_capabilities(s)
++            self.assertNotIn("offense:evil.com", got)                # ...yet offense: never rides
++            self.assertIn("fs.read:project", got)
++
+ 
+ class NoWiden(unittest.TestCase):
+     def test_mutable_capabilities_cannot_widen(self):
+diff --git a/tests/test_discipline.py b/tests/test_discipline.py
+index 7e1bae8..585642d 100644
+--- a/tests/test_discipline.py
++++ b/tests/test_discipline.py
+@@ -18,6 +18,8 @@ ALLOWED_TOP_LEVEL_IMPORTS = {
+     "os",
+     "pathlib",
+     "subprocess",
++    "unicodedata",  # NFKC-normalize a capability string before the un-grantable-namespace check
++                    # (confusable defense for the prohibited offense: reservation, ADR 0004)
+     # the package itself
+     "salienceos",
+ }
+diff --git a/tests/test_no_laundering.py b/tests/test_no_laundering.py
+index 4fad92b..5faa373 100644
+--- a/tests/test_no_laundering.py
++++ b/tests/test_no_laundering.py
+@@ -14,6 +14,15 @@ from salienceos.interpreter import (
+     interpret,
+     issue_policy,
+ )
++from salienceos.interpreter.directive import (
++    AdaptationRationale,
++    Directive,
++    Reconfigure,
++)
++from salienceos.interpreter.policy import (
++    RESERVED_UNGRANTABLE_PREFIXES,
++    is_ungrantable_capability,
++)
+ 
+ KEY = b"policy-test-key"
+ 
+@@ -58,6 +67,61 @@ class CapabilitiesComeOnlyFromPolicy(unittest.TestCase):
+             self.assertNotIn(forbidden, fields)
+ 
+ 
++class ProhibitedNamespaceIsUngrantable(unittest.TestCase):
++    """ADR 0004 (ADR 0003 revisit #4): the prohibited class (`offense:`) is un-grantable BY
++    CONSTRUCTION in core — P-01's sibling. No signed policy carries it and no directive grants it,
++    so an authorized-offense capability cannot be minted in band; Tier 3 stays locked by core."""
++
++    def test_recognizer_matrix(self):
++        for cap in ("offense:example.com", "offense:", "offense:1.2.3.4",
++                    "OFFENSE:example.com", "Offense:x",     # case-insensitive
++                    "ｏｆｆｅｎｓｅ：x"):  # full-width ｏｆｆｅｎｓｅ： (NFKC, gemini)
++            self.assertTrue(is_ungrantable_capability(cap), cap)
++        for cap in ("net.get:example.com", "fs.read:project", "shell.exec", "offense",
++                    "offensive", "offense_shape", "", "not.offense:x"):
++            self.assertFalse(is_ungrantable_capability(cap), cap)
++        for junk in (None, 123, ("offense:x",), b"offense:x"):   # a non-str is not this namespace
++            self.assertFalse(is_ungrantable_capability(junk), repr(junk))
++
++    def test_issue_policy_strips_the_prohibited_namespace(self):
++        # A signed envelope never carries an offense: cap — it is stripped before signing; the legit
++        # capability alongside it survives and still grants.
++        d = interpret(policy(caps=("fs.read:project", "offense:evil.com")),
++                      [sig(Facet.ATTENTION, 1.0)], KEY)
++        self.assertNotIn("offense:evil.com", d.allowed_capabilities)
++        self.assertEqual(d.allowed_capabilities, ("fs.read:project",))
++        self.assertFalse(d.grants_capability("offense:evil.com"))
++        self.assertTrue(d.grants_capability("fs.read:project"))
++
++    def test_grants_capability_refuses_offense_even_if_present_in_allowed(self):
++        # THE load-bearing structural guarantee: even a HAND-BUILT / mis-wired directive that somehow
++        # lists an offense: capability cannot grant it — grants_capability refuses the namespace
++        # unconditionally, before the membership check. Nothing downstream of a directive can authorize
++        # the prohibited class.
++        d = Directive(
++            subject="s", policy_id="p", compute_budget=10, verification_depth=3,
++            retention_class="semantic", routing_hint="", adaptation_eligibility=AdaptationEligibility.NONE,
++            adaptation_rationale=AdaptationRationale.NOT_REQUESTED,
++            allowed_capabilities=("offense:evil.com", "fs.read:project"),
++            reconfigure=Reconfigure.BETWEEN_TURN, interpreter_version="test",
++        )
++        self.assertIn("offense:evil.com", d.allowed_capabilities)   # it IS present in the tuple...
++        self.assertFalse(d.grants_capability("offense:evil.com"))   # ...yet it is NOT granted (structural)
++        self.assertTrue(d.grants_capability("fs.read:project"))     # the legit one is unaffected
++
++    def test_reserved_prefix_tuple_is_the_single_source(self):
++        # Pin the namespace so a future edit that empties it (fail-open) is caught.
++        self.assertIn("offense:", RESERVED_UNGRANTABLE_PREFIXES)
++
++    def test_issue_policy_is_total_on_malformed_capabilities(self):
++        # gemini FRAG-01: a malformed granted_capabilities must fail closed (no capabilities), never
++        # raise at this boundary. None and a bare str (which would iterate into characters) both -> ().
++        from salienceos.interpreter import issue_policy
++        for bad in (None, "fs.read:project"):
++            p = issue_policy("p", "s", bad, 10, 1000, 0, 3, "semantic", False, 2, 0.4, False, KEY)
++            self.assertEqual(p.granted_capabilities, ())
++
++
+ class AdaptationNeedsPolicySwitch(unittest.TestCase):
+     def test_no_adaptation_without_policy_allow(self):
+         # allow_adapt=False; even the perfect adaptation case cannot become eligible.

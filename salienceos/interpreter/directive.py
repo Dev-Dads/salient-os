@@ -9,7 +9,7 @@ accessor, so a consumer cannot infer authority from the scalar knobs.
 import enum
 from dataclasses import dataclass, field
 
-from salienceos.interpreter.policy import AdaptationEligibility
+from salienceos.interpreter.policy import AdaptationEligibility, is_ungrantable_capability
 
 
 class Reconfigure(enum.Enum):
@@ -54,4 +54,10 @@ class Directive:
     reasons: tuple = field(default=())
 
     def grants_capability(self, capability: str) -> bool:
+        # ADR 0004 (ADR 0003 revisit #4): the prohibited class is un-grantable BY CONSTRUCTION.
+        # Refuse the reserved namespace UNCONDITIONALLY — before the membership check — so no
+        # directive can authorize it regardless of what allowed_capabilities contains (even a
+        # hand-built or mis-wired one). P-01's sibling: policy cannot authorize the prohibited class.
+        if is_ungrantable_capability(capability):
+            return False
         return capability in self.allowed_capabilities

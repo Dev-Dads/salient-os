@@ -14,6 +14,15 @@ from salienceos.interpreter import (
     interpret,
     issue_policy,
 )
+from salienceos.interpreter.directive import (
+    AdaptationRationale,
+    Directive,
+    Reconfigure,
+)
+from salienceos.interpreter.policy import (
+    RESERVED_UNGRANTABLE_PREFIXES,
+    is_ungrantable_capability,
+)
 
 KEY = b"policy-test-key"
 
@@ -56,6 +65,61 @@ class CapabilitiesComeOnlyFromPolicy(unittest.TestCase):
         fields = set(SalienceSignal.__dataclass_fields__)
         for forbidden in ("capability", "capabilities", "scope", "grant", "authority", "allow"):
             self.assertNotIn(forbidden, fields)
+
+
+class ProhibitedNamespaceIsUngrantable(unittest.TestCase):
+    """ADR 0004 (ADR 0003 revisit #4): the prohibited class (`offense:`) is un-grantable BY
+    CONSTRUCTION in core — P-01's sibling. No signed policy carries it and no directive grants it,
+    so an authorized-offense capability cannot be minted in band; Tier 3 stays locked by core."""
+
+    def test_recognizer_matrix(self):
+        for cap in ("offense:example.com", "offense:", "offense:1.2.3.4",
+                    "OFFENSE:example.com", "Offense:x",     # case-insensitive
+                    "ｏｆｆｅｎｓｅ：x"):  # full-width ｏｆｆｅｎｓｅ： (NFKC, gemini)
+            self.assertTrue(is_ungrantable_capability(cap), cap)
+        for cap in ("net.get:example.com", "fs.read:project", "shell.exec", "offense",
+                    "offensive", "offense_shape", "", "not.offense:x"):
+            self.assertFalse(is_ungrantable_capability(cap), cap)
+        for junk in (None, 123, ("offense:x",), b"offense:x"):   # a non-str is not this namespace
+            self.assertFalse(is_ungrantable_capability(junk), repr(junk))
+
+    def test_issue_policy_strips_the_prohibited_namespace(self):
+        # A signed envelope never carries an offense: cap — it is stripped before signing; the legit
+        # capability alongside it survives and still grants.
+        d = interpret(policy(caps=("fs.read:project", "offense:evil.com")),
+                      [sig(Facet.ATTENTION, 1.0)], KEY)
+        self.assertNotIn("offense:evil.com", d.allowed_capabilities)
+        self.assertEqual(d.allowed_capabilities, ("fs.read:project",))
+        self.assertFalse(d.grants_capability("offense:evil.com"))
+        self.assertTrue(d.grants_capability("fs.read:project"))
+
+    def test_grants_capability_refuses_offense_even_if_present_in_allowed(self):
+        # THE load-bearing structural guarantee: even a HAND-BUILT / mis-wired directive that somehow
+        # lists an offense: capability cannot grant it — grants_capability refuses the namespace
+        # unconditionally, before the membership check. Nothing downstream of a directive can authorize
+        # the prohibited class.
+        d = Directive(
+            subject="s", policy_id="p", compute_budget=10, verification_depth=3,
+            retention_class="semantic", routing_hint="", adaptation_eligibility=AdaptationEligibility.NONE,
+            adaptation_rationale=AdaptationRationale.NOT_REQUESTED,
+            allowed_capabilities=("offense:evil.com", "fs.read:project"),
+            reconfigure=Reconfigure.BETWEEN_TURN, interpreter_version="test",
+        )
+        self.assertIn("offense:evil.com", d.allowed_capabilities)   # it IS present in the tuple...
+        self.assertFalse(d.grants_capability("offense:evil.com"))   # ...yet it is NOT granted (structural)
+        self.assertTrue(d.grants_capability("fs.read:project"))     # the legit one is unaffected
+
+    def test_reserved_prefix_tuple_is_the_single_source(self):
+        # Pin the namespace so a future edit that empties it (fail-open) is caught.
+        self.assertIn("offense:", RESERVED_UNGRANTABLE_PREFIXES)
+
+    def test_issue_policy_is_total_on_malformed_capabilities(self):
+        # gemini FRAG-01: a malformed granted_capabilities must fail closed (no capabilities), never
+        # raise at this boundary. None and a bare str (which would iterate into characters) both -> ().
+        from salienceos.interpreter import issue_policy
+        for bad in (None, "fs.read:project"):
+            p = issue_policy("p", "s", bad, 10, 1000, 0, 3, "semantic", False, 2, 0.4, False, KEY)
+            self.assertEqual(p.granted_capabilities, ())
 
 
 class AdaptationNeedsPolicySwitch(unittest.TestCase):
