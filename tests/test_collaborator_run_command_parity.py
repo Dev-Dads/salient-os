@@ -22,6 +22,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from collaborator import netns
+from collaborator.contained import SHELL_CONTAINED_AUTONOMY_CAP
 from collaborator.governance import DENIED, HELD, RAN, govern_action
 from collaborator.loop import approve
 from collaborator.policycaps import mint, workspace_subject
@@ -30,9 +31,30 @@ from collaborator.toolcall import ToolIntent
 from collaborator.tools import ACT_THEN_REPORT, PROPOSE_FIRST, SEALED_TOOLS, held_action_seal, toolset
 
 _CAPS = ("fs.read:project", "fs.write:project", "shell.exec")
-# code protection is deferred (False in this build); patch it True so the CODE floor stands down and
-# only the NETWORK floor (B1) governs the outcome under test.
+# "protection earns autonomy": an autonomous run_command earns autonomy only with BOTH verified code
+# protection AND a signed shell.contained_autonomy grant, and then runs CONTAINED (bwrap). Patch the
+# probe True to stand the CODE-PROTECTION half down; the signed cap is granted via _signed_autonomy.
 _CODE_UP = patch("collaborator.governance.code_protection_available", return_value=True)
+
+
+def _contained(argv, workspace, *, roots_with_witness=None, unshare_net=True):
+    # Simulate a host that DOES contain (real bwrap is Linux-only + absent on this dev host / some CI).
+    # isolated follows unshare_net; protected True. The Linux @skipUnless proof exercises the real thing.
+    return [str(a) for a in argv], unshare_net, True
+
+
+def _uncontained(argv, workspace, *, roots_with_witness=None, unshare_net=True):
+    return [str(a) for a in argv], False, False   # a host that CANNOT contain (bwrap absent / probe fails)
+
+
+def _signed_autonomy(tmp, *, extra=()):
+    """A SIGNED session carrying shell.contained_autonomy (+ extras like shell.raw_network) — the signed
+    half of the earned-autonomy gate (mutable session.capabilities can NEVER earn it, F5)."""
+    key = b"caps-key"
+    signed = mint(("shell.exec", SHELL_CONTAINED_AUTONOMY_CAP, *extra),
+                  {"run_command": ACT_THEN_REPORT}, "admin", workspace_subject(tmp), key)
+    return Session(workspace=tmp, policy_caps=signed, caps_key=key,
+                   leash_overrides={"run_command": ACT_THEN_REPORT})
 
 
 # The EXECUTOR's real isolation depends on the host (Linux+userns isolates; this Windows dev host and
@@ -42,10 +64,6 @@ _CODE_UP = patch("collaborator.governance.code_protection_available", return_val
 # versa. The Linux @skipUnless IsolationProof tests exercise the real thing.
 def _unisolated(argv):
     return [str(a) for a in argv], False
-
-
-def _isolated(argv):
-    return [str(a) for a in argv], True
 
 
 def _session(tmp, *, caps=_CAPS, **kw):
@@ -66,21 +84,19 @@ class IsolationEarnsAutonomyFloor(unittest.TestCase):
             self.assertEqual(d.leash, PROPOSE_FIRST)
 
     def test_atr_shell_runs_with_SIGNED_raw_network_optin(self):
-        # The SIGNED, default-deny opt-in ACCEPTS raw reach on this host -> the floor stands down and
-        # the shell may auto-run (act_then_report). The isolation flag stays HONESTLY False (real
-        # netns is unavailable on this dev host — the executor never claims isolation it lacks).
+        # Earned autonomy (verified protection + signed shell.contained_autonomy) PLUS a signed
+        # shell.raw_network opt-in -> the shell auto-runs CONTAINED but with the network SHARED
+        # (--share-net): network_isolated stays HONESTLY False (ran raw, under the signed opt-in),
+        # while the code roots are still read-only (code_protected True).
         with tempfile.TemporaryDirectory() as tmp, _CODE_UP, \
                 patch("collaborator.governance.netns_available", return_value=False), \
-                patch("collaborator.tools.wrap_no_network", side_effect=_unisolated):
-            key = b"caps-key"
-            signed = mint(("shell.exec", netns.SHELL_RAW_NETWORK_CAP),
-                          {"run_command": ACT_THEN_REPORT}, "admin", workspace_subject(tmp), key)
-            s = Session(workspace=tmp, policy_caps=signed, caps_key=key,
-                        leash_overrides={"run_command": ACT_THEN_REPORT})
+                patch("collaborator.tools.wrap_contained", side_effect=_contained):
+            s = _signed_autonomy(tmp, extra=(netns.SHELL_RAW_NETWORK_CAP,))
             d = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "structured"))
-            self.assertEqual(d.status, RAN)                 # opt-in lets an UNISOLATED shell auto-run
+            self.assertEqual(d.status, RAN)
             self.assertEqual(d.leash, ACT_THEN_REPORT)
-            self.assertIs(d.network_isolated, False)        # honest — ran raw, under the signed opt-in
+            self.assertIs(d.network_isolated, False)        # raw-network opt-in -> --share-net -> not isolated
+            self.assertIs(d.code_protected, True)           # earned path IS contained (code roots ro)
 
     def test_UNSIGNED_raw_network_optin_does_NOT_stand_the_floor_down(self):
         # red-team F1: the raw-reach opt-in is the "run raw unattended" signal, so — like the emission
@@ -94,19 +110,19 @@ class IsolationEarnsAutonomyFloor(unittest.TestCase):
             self.assertEqual(d.status, HELD)
             self.assertEqual(d.leash, PROPOSE_FIRST)
 
-    def test_atr_shell_runs_when_isolation_available(self):
-        # Verified netns available AND the executor genuinely isolates -> autonomy is NOT withheld and
-        # the shell auto-runs. On this non-Linux dev host real netns is absent, so wrap_no_network is
-        # patched to simulate a host that DOES isolate (the Linux IsolationProof tests exercise the
-        # real thing); with the isolation actually achieved, require_isolation is satisfied.
+    def test_atr_shell_earns_autonomy_contained(self):
+        # Earned autonomy: verified protection + a signed shell.contained_autonomy grant + a host that
+        # contains -> the shell auto-runs CONTAINED, network isolated (bwrap --unshare-net) and code
+        # roots read-only. netns_available patched True so the orthogonal network floor also stands down.
         with tempfile.TemporaryDirectory() as tmp, _CODE_UP, \
                 patch("collaborator.governance.netns_available", return_value=True), \
-                patch("collaborator.tools.wrap_no_network", side_effect=_isolated):
-            s = _session(tmp, leash_overrides={"run_command": ACT_THEN_REPORT})
+                patch("collaborator.tools.wrap_contained", side_effect=_contained):
+            s = _signed_autonomy(tmp)
             d = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "structured"))
             self.assertEqual(d.status, RAN)
             self.assertEqual(d.leash, ACT_THEN_REPORT)
-            self.assertIs(d.network_isolated, True)
+            self.assertIs(d.network_isolated, True)         # no raw opt-in -> --unshare-net -> isolated
+            self.assertIs(d.code_protected, True)           # code roots ro inside the sandbox
 
     def test_default_leash_shell_is_held_regardless(self):
         # run_command's default leash is already propose_first, so a shell without a loosening
@@ -318,46 +334,45 @@ class RedTeamFixes(unittest.TestCase):
 
     def test_exec_code_floor_belt_denies_autonomous_unprotected_shell(self):
         # N2: the CODE floor is re-asserted at execution too — a direct autonomous (not human_gated)
-        # run_command reaching execute_and_verify while code protection is unavailable is DENIED,
-        # symmetric with the network floor and the floor doing all the work today.
+        # run_command reaching execute_and_verify without the earned-autonomy gate (verified protection +
+        # a signed shell.contained_autonomy grant; this unsigned session has neither) is DENIED before it
+        # can reach the executor, symmetric with the network floor.
         from collaborator.governance import execute_and_verify
         from collaborator.tools import get_tool
         with tempfile.TemporaryDirectory() as tmp:
-            s = _session(tmp)
+            s = _session(tmp)   # unsigned -> no signed contained_autonomy grant
             held = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "structured"))
             d = execute_and_verify(s, get_tool("run_command"), held.directive, held.action_id,
                                    dict(held.args), leash=ACT_THEN_REPORT, human_gated=False)
             self.assertEqual(d.status, DENIED)
-            self.assertIn("code protection unavailable", d.reason)
+            self.assertIn("contained-autonomy unavailable", d.reason)
 
-    def test_exec_network_floor_refuses_autonomous_unisolated_shell(self):
-        # F3 (real belief<->behaviour binding): with code protection available, a direct autonomous
-        # run_command with no verified netns and no signed opt-in is REFUSED BY THE EXECUTOR (it cannot
-        # isolate) -> FAILED, bound to the ACTUAL isolation result, not the govern-time belief.
-        from collaborator.governance import execute_and_verify
-        from collaborator.tools import get_tool
+    def test_exec_refuses_autonomous_shell_when_host_cannot_contain(self):
+        # F3 on the CODE axis (real belief<->behaviour binding): govern BELIEVES protection is available
+        # (patched) and the operator SIGNED contained_autonomy, so the gate stands down and the shell
+        # auto-runs — but the EXECUTOR cannot actually contain (wrap_contained returns not-protected), so
+        # it REFUSES to run. The guarantee is bound to the executor's REAL containment result, never a
+        # govern belief; code_protected is honestly False and nothing ran.
         with tempfile.TemporaryDirectory() as tmp, _CODE_UP, \
-                patch("collaborator.tools.wrap_no_network", side_effect=_unisolated):
-            s = _session(tmp)   # unsigned -> no opt-in
-            held = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "structured"))
-            d = execute_and_verify(s, get_tool("run_command"), held.directive, held.action_id,
-                                   dict(held.args), leash=ACT_THEN_REPORT, human_gated=False)
+                patch("collaborator.governance.netns_available", return_value=True), \
+                patch("collaborator.tools.wrap_contained", side_effect=_uncontained):
+            s = _signed_autonomy(tmp)   # earns the gate; the executor still can't contain on this host
+            d = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "structured"))
             self.assertEqual(d.status, "failed")
-            self.assertIn("isolation required", (d.result.error if d.result else ""))
-            self.assertIs(d.network_isolated, False)
+            self.assertIn("code protection required but unavailable", (d.result.error if d.result else ""))
+            self.assertIs(d.code_protected, False)
 
     def test_exec_belt_not_keyed_on_leash_string(self):
         # N1: the execution belt keys on `not human_gated` (an autonomous execution), NOT the leash
-        # string — a propose_first leash with human_gated=False can't slip past the isolation refusal.
+        # string — a propose_first leash with human_gated=False can't slip past the earned-autonomy gate.
         from collaborator.governance import execute_and_verify
         from collaborator.tools import get_tool
-        with tempfile.TemporaryDirectory() as tmp, _CODE_UP, \
-                patch("collaborator.tools.wrap_no_network", side_effect=_unisolated):
-            s = _session(tmp)
+        with tempfile.TemporaryDirectory() as tmp:
+            s = _session(tmp)   # unsigned -> no earned-autonomy grant
             held = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "structured"))
             d = execute_and_verify(s, get_tool("run_command"), held.directive, held.action_id,
                                    dict(held.args), leash=PROPOSE_FIRST, human_gated=False)
-            self.assertEqual(d.status, "failed")            # still refused, not run raw
+            self.assertEqual(d.status, DENIED)              # keyed on not-human_gated -> gated, not run
 
     def test_human_approved_shell_unaffected_by_exec_belt(self):
         # A human-approved held shell is the human's call -> the execution belt does not refuse it.

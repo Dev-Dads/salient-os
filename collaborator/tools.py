@@ -41,7 +41,7 @@ from salienceos.verifier.observers import SupervisedResult, run_supervised
 from salienceos.verifier.signing import sha256_bytes
 
 from collaborator import egress
-from collaborator.codefence import code_protection_available
+from collaborator.contained import protection_unverified, setup_failed, wrap_contained
 from collaborator.netns import isolation_unverified, wrap_no_network
 
 COLLABORATOR_TOOLS_VERSION = "0.1.0"
@@ -358,7 +358,8 @@ def _exec_read(workspace, args: dict) -> Execution:
     return Execution(result=ToolResult(ok=True, output=target.read_text(encoding="utf-8", errors="replace")))
 
 
-def _exec_command(workspace, args: dict, *, require_isolation: bool = False) -> Execution:
+def _exec_command(workspace, args: dict, *, require_isolation: bool = False,
+                  require_code_protection: bool = False) -> Execution:
     cmd = args.get("command")
     if isinstance(cmd, str):
         argv = shlex.split(cmd)
@@ -368,24 +369,47 @@ def _exec_command(workspace, args: dict, *, require_isolation: bool = False) -> 
         return Execution(result=ToolResult(ok=False, error="command must be a string or list"))
     if not argv:
         return Execution(result=ToolResult(ok=False, error="empty command"))
-    # ADR 0003 revisit #1: run the shell inside a fresh network namespace with no route out, so
-    # a raw socket / curl / git can't egress — web_fetch (the mediated client) is the sole path
-    # off the machine. Fails closed to unisolated + a False flag where netns is unavailable.
-    run_argv, isolated = wrap_no_network(argv)
-    # ADR 0003 revisit #1a: when the caller REQUIRES isolation (an autonomous, un-opted-in shell) but
-    # this host cannot verifiably provide it, REFUSE to run — bind the run to the ACTUAL isolation
-    # result, not a govern-time belief (red-team F3). Prevention: the command never starts, so no raw
-    # egress can occur. A human-approved run or a signed raw-reach opt-in sets require_isolation False.
+    if require_code_protection:
+        # AUTONOMY path (ADR 0003 revisit #1 / F-6 "protection earns autonomy"): an autonomous shell runs
+        # ONLY CONTAINED — the code roots read-only, no $HOME/secrets in view, cleared env, and (unless a
+        # signed raw-reach opt-in set require_isolation=False) a fresh routeless netns. bwrap does BOTH
+        # mount + net containment on its OWN path (never nested under netns's --map-root-user, which would
+        # inherit CAP_SYS_ADMIN and defeat the ro-bind). REFUSE to run if this host can't verifiably
+        # contain — bind the guarantee to the ACTUAL containment, not a govern belief (red-team F3).
+        try:
+            os.makedirs(os.path.join(str(workspace), ".sandbox-home"), exist_ok=True)  # rw HOME in-fence
+        except OSError:
+            pass
+        run_argv, isolated, protected = wrap_contained(argv, workspace, unshare_net=require_isolation)
+        if not protected:
+            return Execution(
+                result=ToolResult(ok=False,
+                                  error="code protection required but unavailable on this host — not run"),
+                network_isolated=False, code_protected=False)
+    else:
+        # HUMAN-approved / opted-in path: uncontained BY DESIGN (maintenance keeps full filesystem reach).
+        # Network still isolated via netns (ADR 0003 revisit #1) so the mediated client stays the sole
+        # egress path; fails closed to unisolated + a False flag where netns is unavailable.
+        run_argv, isolated = wrap_no_network(argv)
+        protected = False
+    # ADR 0003 revisit #1a: when the caller REQUIRES isolation but this host can't verifiably provide it,
+    # REFUSE to run (the command never starts, no raw egress). A human-approved run or a signed raw-reach
+    # opt-in sets require_isolation=False. On the contained path bwrap provides isolation, verified by the
+    # per-run guard below rather than this belief pre-check.
     if require_isolation and not isolated:
         return Execution(
             result=ToolResult(ok=False,
                               error="network isolation required but unavailable on this host — not run"),
-            network_isolated=False, code_protected=code_protection_available())
+            network_isolated=False, code_protected=protected)
     res = run_supervised(run_argv, cwd=workspace)
-    # If the per-run guard tripped (child was NOT in a fresh netns), the command did not run — no
-    # egress — and we correct the flag to False so it never falsely claims isolation (red-team).
+    # A per-run guard trip means the command did NOT run — correct the honest flags so we never falsely
+    # claim isolation (netns exit 44) or protection (codefence exit 45 / a bwrap setup failure).
     if isolated and isolation_unverified(res.returncode, res.stderr):
         isolated = False
+    if protected and (protection_unverified(res.returncode, res.stderr)
+                      or isolation_unverified(res.returncode, res.stderr)
+                      or setup_failed(res.returncode, res.stderr)):
+        protected = False
     ok = res.returncode == 0
     out = (res.stdout or b"").decode("utf-8", "replace")
     err = (res.stderr or b"").decode("utf-8", "replace")
@@ -396,9 +420,10 @@ def _exec_command(workspace, args: dict, *, require_isolation: bool = False) -> 
         # artifact branch, so observe_action/snapshot_tree never run — there is NO write-set observation
         # for a shell (honest: a post-exec workspace tripwire was deferred by the Harm A panel, not built)
         artifact_hashes={}, network_isolated=isolated,
-        # F-6 Harm A: honest — False until the OS-level read-only-bind protection lands. While False
-        # the seam withholds run_command autonomy, so an unfenced shell never AUTO-runs.
-        code_protected=code_protection_available(),
+        # The REAL, per-run VERIFIED containment result (NOT a govern-time belief): True only on the
+        # autonomy path where the in-child guard proved the code roots read-only; False on the
+        # human-approved path, which is uncontained by design.
+        code_protected=protected,
     )
 
 
@@ -483,16 +508,19 @@ _EXECUTORS = {"write_file": _exec_write, "read_file": _exec_read,
 
 
 def execute_tool(tool: Tool, workspace, args: dict, *, egress_preview: bool = False,
-                 egress_auth: "str | None" = None, require_isolation: bool = False) -> Execution:
+                 egress_auth: "str | None" = None, require_isolation: bool = False,
+                 require_code_protection: bool = False) -> Execution:
     """Run a resolved tool. Raises WorkspaceError on an escaping path (the caller turns that into
     a DENY); other failures come back as ``ok=False`` results. ``egress_preview``/``egress_auth``
     are host-side values the governance seam threads for net_post ONLY (the audit-preview flag and
     the host-injected credential); every other tool ignores them, so the model can never reach
-    them through ``args``. ``require_isolation`` is threaded to run_command ONLY: when True the shell
-    REFUSES to run unless verified netns isolation is achieved (ADR 0003 #1a — an autonomous,
-    un-opted-in shell can never egress raw)."""
+    them through ``args``. ``require_isolation``/``require_code_protection`` are threaded to run_command
+    ONLY: when True the shell REFUSES to run unless verified netns isolation (ADR 0003 #1a) resp. verified
+    bwrap containment of the code roots (ADR 0003 revisit #1 / F-6) is achieved — so an autonomous shell
+    can never egress raw nor run with its own code writable (bound to the executor's REAL result)."""
     if tool.name == "net_post":
         return _exec_net_post(workspace, args, keep_preview=egress_preview, auth=egress_auth)
     if tool.name == "run_command":
-        return _exec_command(workspace, args, require_isolation=require_isolation)
+        return _exec_command(workspace, args, require_isolation=require_isolation,
+                             require_code_protection=require_code_protection)
     return _EXECUTORS[tool.name](workspace, args)

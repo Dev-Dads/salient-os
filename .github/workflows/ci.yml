@@ -32,10 +32,18 @@ jobs:
       - name: Show Python
         run: python --version
 
-      # Let the ADR 0003 revisit-#1 netns isolation PROOF actually run: Ubuntu 24.04 can block
-      # unprivileged user namespaces via AppArmor. Best-effort (|| true) — a no-op where already
-      # permitted; without it the isolation test would just skip, not fail.
-      - name: Enable unprivileged user namespaces (netns isolation tests)
+      # Install bubblewrap so the "protection earns autonomy" contained-execution LIVE proof
+      # (tests/test_collaborator_contained.py::ContainmentProofLinux) actually runs instead of silently
+      # skipping — bwrap is NOT preinstalled on ubuntu-latest, and where it is absent
+      # containment_available() is False (the honest fallback), so the proof would skip and certify
+      # nothing. This is a system binary, not a Python dependency (the verifier stays stdlib-only).
+      - name: Install bubblewrap (contained run_command proof)
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+
+      # Let the ADR 0003 revisit-#1 netns isolation PROOF and the bwrap containment proof actually run:
+      # Ubuntu 24.04 can block unprivileged user namespaces via AppArmor. Best-effort (|| true) — a no-op
+      # where already permitted; without it the isolation/containment tests would just skip, not fail.
+      - name: Enable unprivileged user namespaces (netns + bwrap containment tests)
         run: |
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
           sudo sysctl -w kernel.unprivileged_userns_clone=1 || true

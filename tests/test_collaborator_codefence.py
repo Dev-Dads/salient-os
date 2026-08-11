@@ -44,9 +44,14 @@ class CodeRootModel(unittest.TestCase):
             self.assertTrue(p.is_dir())
             self.assertTrue(p.is_absolute())
 
-    def test_protection_is_unavailable_in_this_build(self):
-        # OS-level prevention is deferred; while False the seam withholds run_command autonomy.
-        self.assertFalse(codefence.code_protection_available())
+    def test_code_protection_delegates_to_containment_probe(self):
+        # code_protection_available() is now a REAL, cached host probe: it delegates to
+        # contained.containment_available (True only where bwrap verifiably contains the code roots).
+        # Off-Linux / no bwrap it is False = the withheld-autonomy behaviour. Patch both directions.
+        with patch("collaborator.contained.containment_available", return_value=False):
+            self.assertFalse(codefence.code_protection_available())
+        with patch("collaborator.contained.containment_available", return_value=True):
+            self.assertTrue(codefence.code_protection_available())
 
 
 class DisjointnessGuard(unittest.TestCase):

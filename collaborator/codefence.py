@@ -117,6 +117,26 @@ def disjoint_from_code(workspace) -> None:
                 "shell must never be able to reach the rules it runs under)")
 
 
+def protected_roots_with_witness() -> "tuple[tuple[Path, Path], ...]":
+    """``(root_dir, witness_file)`` per resolved code slot. The witness is the module ``__file__`` the root
+    was resolved from — guaranteed to exist INSIDE the root (a slot with no resolvable ``__file__`` was
+    already dropped by ``_resolved_roots``). Consumed by ``contained.py``'s in-child guard, which must tell
+    "ro-bound + unwritable" (protected) from "absent" (the wrapper silently didn't apply): absence must
+    never count as proof, so it checks a witness that is present iff the ro-bind actually took. Derived from
+    the SAME ``_code_slots`` single source of truth as ``PROTECTED_ROOTS`` — the two cannot desync."""
+    out: list[tuple[Path, Path]] = []
+    for _name, mod_file in _code_slots():
+        if not mod_file:
+            continue
+        try:
+            witness = Path(mod_file).resolve()
+        except (OSError, ValueError, RuntimeError):
+            continue
+        if witness.is_file() and witness.parent.is_dir():
+            out.append((witness.parent, witness))
+    return tuple(out)
+
+
 def names_code_root(command) -> str:
     """POROUS, best-effort tag of a ``run_command`` whose ``command`` literally names a protected
     code root. Returns the matched root path(s) joined by ``,`` (empty string = no literal match).
@@ -144,15 +164,15 @@ def names_code_root(command) -> str:
 
 
 def code_protection_available() -> bool:
-    """Govern-time predictor: does ``run_command`` run with its write-reach to the Collaborator's
-    own code STRUCTURALLY prevented?
+    """Govern-time predictor: can ``run_command`` ACTUALLY run with its write-reach to the Collaborator's
+    own code (``PROTECTED_ROOTS``) STRUCTURALLY prevented on THIS host?
 
-    **False in this build.** OS-level prevention (a read-only bind-mount of ``PROTECTED_ROOTS`` in a
-    nested user namespace, or bubblewrap ``--ro-bind``) is a deferred follow-up (the single-level
-    bind is defeatable by the mapped-root child — CVE-2014-5206 / ``MNT_LOCK_READONLY``; see the
-    F-6 plan). While this is False the seam withholds ``run_command`` autonomy so an unprotected
-    shell can never auto-run — it always gets a human hand. When the follow-up lands this becomes a
-    real, cached host probe (mirroring ``netns.netns_available()``), and ``run_command`` earns
-    autonomy on hosts where the read-only bind is verified. Kept as a function (not a constant) so
-    that landing is a one-body change and every call site is already wired."""
-    return False
+    A REAL, VERIFIED, cached host probe (mirrors ``netns.netns_available()``): delegates to
+    ``contained.containment_available``, which runs a bwrap-contained probe child whose in-child guard
+    PROVES each protected root is present, unwritable, and mounted read-only (not merely "bwrap exists").
+    True only where that verifies. Off-Linux / no bwrap / user namespaces blocked ⇒ **False** — the seam
+    then withholds ``run_command`` autonomy so an unprotected shell can never auto-run (exactly the
+    behaviour before this landed). NEVER a silent claim of protection. Lazy import keeps ``codefence`` the
+    single source of *what* is protected (stdlib-only), while ``contained`` owns *how* (Linux/bwrap)."""
+    from collaborator import contained
+    return contained.containment_available(protected_roots_with_witness())
