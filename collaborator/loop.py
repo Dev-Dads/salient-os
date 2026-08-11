@@ -25,6 +25,7 @@ from collaborator.governance import (
     reauthorized_or_denied,
 )
 from collaborator.codefence import names_code_root
+from collaborator.sensitivepaths import names_sensitive_path
 from collaborator.toolcall import ToolIntent, parse_message
 from collaborator.tools import (
     ACT_THEN_REPORT,
@@ -187,6 +188,15 @@ def approve(session, decision: Decision) -> Decision:
             and names_code_root(args.get("command"))):
         return Decision(decision.action_id, decision.tool, DENIED,
                         "code root: proposer-authored command re-denied at approval",
+                        decision.leash, directive=decision.directive, args=args,
+                        origin=decision.origin)
+    # PR 1a Harm B: same re-assertion for a COLLABORATOR-originated held run_command mutated post-hold
+    # to name an operator secret. DiD-over-DiD — the MINOR-B run_command seal below already fails ANY
+    # post-hold arg mutation; this adds only the specific reason + symmetry with the code-root re-deny.
+    if (decision.origin == "collaborator" and decision.tool == "run_command"
+            and names_sensitive_path(args.get("command"))):
+        return Decision(decision.action_id, decision.tool, DENIED,
+                        "sensitive path: proposer-authored command re-denied at approval",
                         decision.leash, directive=decision.directive, args=args,
                         origin=decision.origin)
     # MINOR-B (ADR 0003; net.post-FIX red-team): bind approval of a held run_command / write_file to

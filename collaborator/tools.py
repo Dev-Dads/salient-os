@@ -392,7 +392,9 @@ def _exec_command(workspace, args: dict, *, require_isolation: bool = False) -> 
     return Execution(
         result=ToolResult(ok=ok, output=out, error=err),
         supervised=res, exit_code=res.returncode,
-        write_set=(),  # nothing declared; observe_action's write-set diff catches undeclared writes
+        write_set=(),  # run_command is verify_mode="exit": govern's exit-branch returns BEFORE the
+        # artifact branch, so observe_action/snapshot_tree never run — there is NO write-set observation
+        # for a shell (honest: a post-exec workspace tripwire was deferred by the Harm A panel, not built)
         artifact_hashes={}, network_isolated=isolated,
         # F-6 Harm A: honest — False until the OS-level read-only-bind protection lands. While False
         # the seam withholds run_command autonomy, so an unfenced shell never AUTO-runs.
