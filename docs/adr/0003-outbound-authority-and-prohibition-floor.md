@@ -238,8 +238,26 @@ proposer context (`research.py:143-145`) → the proposer's user message
   no `unshare`, userns disabled) the shell runs unisolated and the run is **honestly flagged**
   `network_isolated=False` — never a silent claim. Scope limit: a network namespace isolates
   the *network*, not the filesystem or *pathname* UNIX-socket IPC — so a network-capable local
-  daemon socket (notably a Docker socket, `systemd-resolved`, a local proxy) is a residual
-  confused-deputy path on hosts that expose one; `--mount`/seccomp is the follow-up hardening.
+  daemon socket (a Docker/containerd/podman socket, the DBus system bus, `systemd-resolved`, a
+  local proxy) is a confused-deputy path on hosts that expose one.
+  - **Revisit #1b (deputy seal, `collaborator/maintain.py`).** That confused-deputy path is now
+    closed for the ENUMERATED deputies: a human/opted-in `run_command` runs in a bubblewrap
+    MAINTENANCE SANDBOX with a FULL read-write host view (maintenance keeps its reach) where those
+    sockets are bound to `/dev/null` and — the load-bearing part — **all caps are dropped**
+    (`--cap-drop ALL` + `--disable-userns`), so the payload has no `CAP_SYS_ADMIN` to `umount` the
+    mask (the naive `unshare`-only mask is defeatable in one `umount`, since that netns runs as
+    mapped-root — proven on a live host; the sandbox's un-removability is proven the same way). The
+    in-child guard verifies per run that the netns is fresh, `CapEff` is all-zero, and each deputy
+    is masked, emitting a POSITIVE token only then; verification whitelists on it (fail closed). A
+    real-uid-0 collaborator, where bwrap cannot drop caps, trips the `CapEff` check → the sandbox
+    reports unavailable → fall back to the routeless netns (honest). **Residuals, honestly:** the
+    mask is a BLOCKLIST (a socket not enumerated — rootless docker at `/run/user/<uid>/docker.sock`,
+    `$SSH_AUTH_SOCK`, a DB socket, an arbitrary local proxy — still slips); and because the view is
+    full-FS WRITE, an approved-but-adversarial command can still LAUNDER egress asynchronously
+    (plant a cron/unit/key a later un-isolated process runs). The seal raises the SYNCHRONOUS-egress
+    bar to the (higher) laundering bar; it does not make the deliberately-trusted maintenance path
+    leak-proof. The enforced OBSERVED-route rebuild (bwrap joins a helper-prepared routed netns) is
+    the separate follow-up that returns observed maintenance network.
 - **Known seam-fallers the tiered model does not fully close** (documented, not
   hidden): exfil of the operator's *own* secret to an allowlisted-for-read host (the
   missing axis is *what leaves*, not *where to*); and offense *through* a sanctioned
