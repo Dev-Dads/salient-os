@@ -311,12 +311,33 @@ class EgressObserverProofLinux(unittest.TestCase):
         except OSError:
             pass
 
-    def test_legit_egress_reconciles_clean(self):
+    def test_legit_egress_is_independently_observed_and_accounted_for(self):
+        # The guarantee for OUR egress: its dest is INDEPENDENTLY observed by the kernel vantage AND is NOT
+        # mis-flagged as unexpected against our own claim. We do NOT assert machine-wide `reconciled is True`
+        # here: matching ALL outbound TCP (the F-01 fix) means any SAME-UID co-tenant egress in the window
+        # (e.g. a CI runner agent's own connections) legitimately makes `reconciled=False` — the documented
+        # same-uid co-tenant residual, not a fault in our egress's reconciliation. That per-dest property is
+        # robust on a shared-uid host; `reconciled is True` is proven reachable separately below.
         before = eo.begin()
         self._connect("1.1.1.1", 443)
         r = eo.end(before, [("1.1.1.1", 443)])
-        self.assertIs(r.reconciled, True)
-        self.assertIn(("1.1.1.1", 443), r.observed_dests)
+        self.assertIsNotNone(r.reconciled)                     # strong vantage produced a verdict (not None)
+        self.assertIn(("1.1.1.1", 443), r.observed_dests)      # the kernel really saw our connection
+        self.assertNotIn(("1.1.1.1", 443), r.unexpected)       # our claimed dest is accounted for, not mis-flagged
+
+    def test_a_quiet_window_can_reconcile_true(self):
+        # `reconciled is True` IS reachable when the uid's window is quiet. Retry to ride out bursty same-uid
+        # co-tenant egress on a shared runner (the residual); one clean window proves True works. If no window
+        # is quiet in several tries (a very busy shared-uid host), skip honestly rather than flake — the
+        # per-dest guarantee above already carries the load-bearing proof.
+        for _ in range(8):
+            before = eo.begin()
+            self._connect("1.1.1.1", 443)
+            r = eo.end(before, [("1.1.1.1", 443)])
+            if r.reconciled is True:
+                self.assertIn(("1.1.1.1", 443), r.observed_dests)
+                return
+        self.skipTest("no quiet same-uid window in 8 tries (busy shared-uid host) — co-tenant residual")
 
     def test_stray_second_connection_is_caught(self):
         before = eo.begin()

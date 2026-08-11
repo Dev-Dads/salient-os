@@ -43,6 +43,10 @@ action; these evade it and are the enforced-chokepoint follow-up's job, NOT v0 d
   * A ROOT-compromised client that flushes/edits the kernel state — the root-compromised-host residual (same
     stance as the bwrap CVE work).
   * Same-uid CO-TENANT egress (another honest process of the uid) → a false-positive discrepancy, not a miss.
+    The all-outbound-TCP rule (needed to catch a reused pre-established connection) WIDENS this vs a SYN-only
+    rule: any same-uid connection with traffic in the window is observed, so on a SHARED-uid host (a busy CI
+    runner) a legit egress can reconcile False. On the real deploy the Collaborator's uid is dedicated, so
+    this is quiet; either way it's EVIDENCE (a loud ⚠), never a deny, and never a miss.
   * A same-uid SYN in the narrow delete-then-create window INSIDE `begin()` (not the fetch body): the hook is
     up before `begin()` returns, so this is a setup-race miss only, under the serial-executor assumption.
   * PORT policing is egress.py's job, not the observer's: it reconciles ``(ip, port)`` exactly as claimed
