@@ -40,7 +40,7 @@ from salienceos.verifier import Stakes
 from salienceos.verifier.observers import SupervisedResult, run_supervised
 from salienceos.verifier.signing import sha256_bytes
 
-from collaborator import egress
+from collaborator import codefence, egress
 from collaborator.contained import verified_ok, wrap_contained
 from collaborator.netns import isolation_unverified, wrap_no_network
 
@@ -376,6 +376,15 @@ def _exec_command(workspace, args: dict, *, require_isolation: bool = False,
         # mount + net containment on its OWN path (never nested under netns's --map-root-user, which would
         # inherit CAP_SYS_ADMIN and defeat the ro-bind). REFUSE to run if this host can't verifiably
         # contain — bind the guarantee to the ACTUAL containment, not a govern belief (red-team F3).
+        # RE-ASSERT workspace ⟂ code at the MOMENT OF USE (red-team F5): Session construction resolved the
+        # workspace once; a workspace symlink repointed into a code root afterwards would otherwise get a
+        # rw bind of the code at the ws path. disjoint_from_code re-resolves and fails CLOSED here.
+        try:
+            codefence.disjoint_from_code(workspace)
+        except ValueError as exc:   # WorkspaceOverlapsCodeError — the resolved ws now overlaps a code root
+            return Execution(
+                result=ToolResult(ok=False, error=f"workspace overlaps a code root — not run ({exc})"),
+                network_isolated=False, code_protected=False)
         try:
             os.makedirs(os.path.join(str(workspace), ".sandbox-home"), exist_ok=True)  # rw HOME in-fence
         except OSError:

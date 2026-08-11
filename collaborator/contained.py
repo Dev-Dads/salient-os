@@ -26,6 +26,16 @@ shell only.
 Linux-only, stdlib-only, NO new Python dependency (bwrap is a system binary resolved like `unshare`).
 Where bwrap is absent / user namespaces are blocked / non-Linux, containment is UNAVAILABLE and the seam
 withholds autonomy (honest flag, exactly today's behaviour) — never a fake fence.
+
+SCOPE (honest — the guarantee is PER-RUN, not end-to-end). Containment makes THIS autonomous run unable to
+write the code roots. The workspace is bound READ-WRITE (it must be, to be useful), and it is SHARED with
+the uncontained human/maintenance path (which runs with `cwd=workspace` and full filesystem reach by
+design). So a contained autonomous run can DROP a file into the workspace that a human later approves and
+runs UNCONTAINED (`sh ./build.sh`) — laundering an effect the contained run could not perform directly.
+This is the same confused-deputy class as the deceived-human + deliberately-unfenced-maintenance residuals,
+and it is NOT introduced here: an autonomous `write_file` is already a workspace dropper. Closing it is a
+separate axis (separate the autonomy workspace from the human maintenance cwd, or seal the exact bytes a
+human approves against later workspace mutation) — tracked as a follow-up, not a per-run-containment defect.
 """
 
 from __future__ import annotations
@@ -234,9 +244,10 @@ def protection_unverified(returncode: int, stderr) -> bool:
 
 
 def setup_failed(returncode: int, stderr) -> bool:
-    """True iff bwrap itself failed during SETUP (the payload never ran). Safety is intact (nothing ran),
-    but the negative-sentinel convention can't distinguish it, so the caller DOWNGRADES protected->False
-    (fail-safe only; never used to upgrade) — mirrors the netns deferred-hardening note in ADR 0003."""
+    """True iff bwrap itself failed during SETUP (the payload never ran, stderr carries bwrap's own prefix).
+    Retained for diagnostics/tests only: the autonomy path no longer downgrades on this negative signal —
+    the POSITIVE verified_ok() token already makes a setup failure fail CLOSED (no token => not protected)
+    regardless of bwrap's message, which is strictly broader than this prefix match."""
     text = stderr if isinstance(stderr, str) else (stderr or b"").decode("utf-8", "replace")
     return returncode != 0 and text.startswith("bwrap:")
 
@@ -244,30 +255,34 @@ def setup_failed(returncode: int, stderr) -> bool:
 def containment_available(roots_with_witness=None) -> bool:
     """True iff an autonomous run_command can ACTUALLY run with PROTECTED_ROOTS read-only on THIS host —
     VERIFIED, not merely "bwrap exists": a probe child runs the SAME argv template and its in-child guard
-    proves each root is present, unwritable, and ro-mounted, and the netns is fresh. Cached — a property
-    of the host, not of any call. Mirrors netns.netns_available()."""
+    proves each root is present, unwritable, and ro-mounted, and the netns is fresh. Mirrors
+    netns.netns_available().
+
+    The cached ``_available`` is the DEFAULT host-property probe (the real code roots) and is consulted
+    ONLY when ``roots_with_witness`` is not supplied — an explicit-pairs caller (tests) always probes
+    fresh, so it can never receive the cached answer for a DIFFERENT set of roots."""
     global _available
-    if _available is not None:
+    use_cache = roots_with_witness is None
+    if use_cache and _available is not None:
         return _available
     pairs = _roots_with_witness() if roots_with_witness is None else tuple(roots_with_witness)
-    if sys.platform != "linux" or not os.path.isfile(_BWRAP_BIN) or not pairs:
-        _available = False
-        return _available
-    tmp = tempfile.mkdtemp(prefix="salient-contain-probe-")
-    try:
-        run_argv, isolated, protected = wrap_contained([_SH_BIN, "-c", "exit 0"], tmp,
-                                                        roots_with_witness=pairs, unshare_net=True)
-        if not protected:
-            _available = False
-            return _available
-        r = subprocess.run(run_argv, capture_output=True, timeout=20, check=False)
-        # rc==0 only if the guard verified BOTH halves (fresh netns AND every root ro) and the payload ran.
-        _available = (r.returncode == 0 and isolated)
-    except (OSError, subprocess.SubprocessError):
-        _available = False
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
-    return _available
+    result = False
+    if sys.platform == "linux" and os.path.isfile(_BWRAP_BIN) and pairs:
+        tmp = tempfile.mkdtemp(prefix="salient-contain-probe-")
+        try:
+            run_argv, isolated, protected = wrap_contained([_SH_BIN, "-c", "exit 0"], tmp,
+                                                            roots_with_witness=pairs, unshare_net=True)
+            if protected:
+                r = subprocess.run(run_argv, capture_output=True, timeout=20, check=False)
+                # rc==0 only if the guard verified BOTH halves (fresh netns AND every root ro) and ran.
+                result = (r.returncode == 0 and isolated)
+        except (OSError, subprocess.SubprocessError):
+            result = False
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+    if use_cache:
+        _available = result
+    return result
 
 
 def _reset_probe_cache_for_tests():

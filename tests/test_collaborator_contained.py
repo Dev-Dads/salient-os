@@ -165,6 +165,20 @@ class Witness(unittest.TestCase):
             self.assertIn(root, codefence.PROTECTED_ROOTS)
 
 
+class ExecuteTimeWorkspaceReassert(unittest.TestCase):
+    """F5 (red-team): the contained executor re-asserts workspace ⟂ code at the MOMENT OF USE, so a
+    workspace repointed into a code root AFTER Session construction is refused (fail closed). The check
+    runs before wrap_contained, so this holds cross-platform without real bwrap."""
+
+    def test_contained_run_refuses_workspace_overlapping_a_code_root(self):
+        from collaborator import tools
+        code_root = codefence.PROTECTED_ROOTS[0]
+        ex = tools._exec_command(str(code_root), {"command": ["echo", "hi"]}, require_code_protection=True)
+        self.assertFalse(ex.result.ok)
+        self.assertIn("overlaps a code root", ex.result.error)
+        self.assertIs(ex.code_protected, False)
+
+
 @unittest.skipUnless(contained.containment_available(), "bwrap containment unavailable on this host")
 class ContainmentProofLinux(unittest.TestCase):
     """LIVE: a real contained child genuinely has the code roots read-only and no secrets in view."""

@@ -175,4 +175,7 @@ def code_protection_available() -> bool:
     behaviour before this landed). NEVER a silent claim of protection. Lazy import keeps ``codefence`` the
     single source of *what* is protected (stdlib-only), while ``contained`` owns *how* (Linux/bwrap)."""
     from collaborator import contained
-    return contained.containment_available(protected_roots_with_witness())
+    # No-arg: contained defaults to protected_roots_with_witness() (the SAME pairs) AND consults its cached
+    # host-property probe, which it only does for this default set — an explicit-pairs caller always
+    # re-probes, so the cache can never return a stale answer for a different root set.
+    return contained.containment_available()
