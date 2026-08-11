@@ -41,7 +41,7 @@ from salienceos.verifier.observers import SupervisedResult, run_supervised
 from salienceos.verifier.signing import sha256_bytes
 
 from collaborator import egress
-from collaborator.contained import protection_unverified, setup_failed, wrap_contained
+from collaborator.contained import verified_ok, wrap_contained
 from collaborator.netns import isolation_unverified, wrap_no_network
 
 COLLABORATOR_TOOLS_VERSION = "0.1.0"
@@ -402,14 +402,19 @@ def _exec_command(workspace, args: dict, *, require_isolation: bool = False,
                               error="network isolation required but unavailable on this host — not run"),
             network_isolated=False, code_protected=protected)
     res = run_supervised(run_argv, cwd=workspace)
-    # A per-run guard trip means the command did NOT run — correct the honest flags so we never falsely
-    # claim isolation (netns exit 44) or protection (codefence exit 45 / a bwrap setup failure).
-    if isolated and isolation_unverified(res.returncode, res.stderr):
+    if require_code_protection:
+        # CONTAINED autonomy path — WHITELIST on the guard's POSITIVE proof token. Keep protected (and the
+        # network isolation the same guard proves fresh) ONLY if that token is present, so verification
+        # fails CLOSED by construction: a bwrap setup error with ANY message, a pathological root path that
+        # breaks the guard, or any tripped check leaves no token => not protected, and a payload can neither
+        # forge its absence nor forge presence to any effect (external-panel hardening, PR #39 cert).
+        verified = verified_ok(res.returncode, res.stderr)
+        protected = protected and verified
+        isolated = isolated and verified
+    elif isolated and isolation_unverified(res.returncode, res.stderr):
+        # HUMAN/opted-in netns path: a per-run guard trip (exit 44) means the command did NOT run — correct
+        # the flag so we never falsely claim isolation. Certified netns path, unchanged.
         isolated = False
-    if protected and (protection_unverified(res.returncode, res.stderr)
-                      or isolation_unverified(res.returncode, res.stderr)
-                      or setup_failed(res.returncode, res.stderr)):
-        protected = False
     ok = res.returncode == 0
     out = (res.stdout or b"").decode("utf-8", "replace")
     err = (res.stderr or b"").decode("utf-8", "replace")

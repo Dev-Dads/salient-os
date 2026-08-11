@@ -23,6 +23,7 @@ from unittest.mock import patch
 
 from collaborator import netns
 from collaborator.contained import SHELL_CONTAINED_AUTONOMY_CAP
+from collaborator.contained import _CODEFENCE_VERIFIED_SENTINEL as _CONTAINED_VERIFIED_SENTINEL
 from collaborator.governance import DENIED, HELD, RAN, govern_action
 from collaborator.loop import approve
 from collaborator.policycaps import mint, workspace_subject
@@ -39,8 +40,13 @@ _CODE_UP = patch("collaborator.governance.code_protection_available", return_val
 
 def _contained(argv, workspace, *, roots_with_witness=None, unshare_net=True):
     # Simulate a host that DOES contain (real bwrap is Linux-only + absent on this dev host / some CI).
-    # isolated follows unshare_net; protected True. The Linux @skipUnless proof exercises the real thing.
-    return [str(a) for a in argv], unshare_net, True
+    # A genuinely-contained run's in-child guard emits its POSITIVE proof token to stderr before exec, and
+    # the executor whitelists code_protected on that token — so the simulated command must emit the SAME
+    # token (cross-platform via python) for the run to count as verified, exactly as the real guard would.
+    # isolated follows unshare_net; protected True. The Linux @skipUnless proof exercises the real guard.
+    proof = [sys.executable, "-c",
+             "import sys; sys.stderr.write(%r + '\\n')" % _CONTAINED_VERIFIED_SENTINEL]
+    return proof, unshare_net, True
 
 
 def _uncontained(argv, workspace, *, roots_with_witness=None, unshare_net=True):

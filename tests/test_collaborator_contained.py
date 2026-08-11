@@ -40,6 +40,18 @@ class HonestFallback(unittest.TestCase):
         argv, isolated, protected = contained.wrap_contained(["echo", "hi"], "/tmp/x", roots_with_witness=())
         self.assertFalse(protected)
 
+    def test_shell_hostile_root_path_cannot_claim_protection(self):
+        # A pathological root/witness path (newline, double-quote, or the '|' delimiter) would corrupt the
+        # in-child guard's shell-word list — refuse containment at the source (fail closed) rather than
+        # build a malformed guard. External-panel hardening (PR #39): the guard-string-embedding fragility.
+        for bad in ("/tmp/a\nb/collaborator", '/tmp/a"b/collaborator', "/tmp/a|b/collaborator"):
+            with self.subTest(bad=bad):
+                pairs = ((Path(bad), Path(bad + "/codefence.py")),)
+                self.assertFalse(contained._pairs_shell_safe(pairs))
+                _argv, _iso, protected = contained.wrap_contained(["echo", "hi"], "/tmp/x",
+                                                                  roots_with_witness=pairs)
+                self.assertFalse(protected)
+
 
 class Sentinels(unittest.TestCase):
     def test_protection_unverified_only_on_exit_45_with_sentinel(self):
@@ -52,6 +64,15 @@ class Sentinels(unittest.TestCase):
         self.assertTrue(contained.setup_failed(1, "bwrap: No permissions to create new namespace"))
         self.assertFalse(contained.setup_failed(0, "bwrap: whatever"))   # rc 0 -> the payload ran fine
         self.assertFalse(contained.setup_failed(1, "some other error"))  # not a bwrap setup failure
+
+    def test_verified_ok_is_the_positive_whitelist_and_rc_independent(self):
+        # The AUTHORITATIVE signal: True iff the guard's positive proof token is present — regardless of the
+        # payload's exit code (a genuinely-contained payload may fail, e.g. a failing test), so a non-zero
+        # rc with the token still counts as protected; absence of the token never does (fail closed).
+        self.assertTrue(contained.verified_ok(0, "x SALIENT_CODEFENCE_VERIFIED"))
+        self.assertTrue(contained.verified_ok(1, "SALIENT_CODEFENCE_VERIFIED\nsome test failed"))
+        self.assertFalse(contained.verified_ok(0, "no token here"))       # no proof => not protected
+        self.assertFalse(contained.verified_ok(45, "SALIENT_CODEFENCE_UNVERIFIED"))  # guard tripped
 
     def test_signed_cap_constant(self):
         self.assertEqual(contained.SHELL_CONTAINED_AUTONOMY_CAP, "shell.contained_autonomy")
@@ -74,6 +95,14 @@ class GuardScript(unittest.TestCase):
         # no net half when check_net is False
         self.assertNotIn("SALIENT_NETNS_UNVERIFIED", g)
         self.assertNotIn("exit 44", g)
+
+    def test_positive_proof_token_emitted_only_after_checks_before_exec(self):
+        # The whitelist crux: the guard emits its positive proof token AFTER all checks and IMMEDIATELY
+        # before exec — so a tripped check (which `exit`s earlier) never reaches it => fail closed.
+        g = contained._guarded_script(12345, self._PAIRS, check_net=True)
+        self.assertIn("SALIENT_CODEFENCE_VERIFIED", g)
+        self.assertLess(g.index("SALIENT_CODEFENCE_VERIFIED"), g.index('exec "$@"'))
+        self.assertGreater(g.index("SALIENT_CODEFENCE_VERIFIED"), g.index("mountinfo"))  # after the ro check
 
     def test_net_half_present_when_check_net(self):
         g = contained._guarded_script(12345, self._PAIRS, check_net=True)
@@ -161,6 +190,23 @@ class ContainmentProofLinux(unittest.TestCase):
             r = subprocess.run(argv, capture_output=True, timeout=30, text=True)
             self.assertIn("DONE", r.stdout)
             self.assertNotIn("root:", r.stdout)                     # /etc/shadow masked with /dev/null (empty)
+
+    def test_guard_emits_positive_proof_token_on_a_real_contained_run(self):
+        with tempfile.TemporaryDirectory() as ws:
+            argv, _iso, _p = contained.wrap_contained([contained._SH_BIN, "-c", "echo ok"], ws)
+            r = subprocess.run(argv, capture_output=True, timeout=30, text=True)
+            self.assertTrue(contained.verified_ok(r.returncode, r.stderr))  # real proof present
+
+    def test_payload_forging_negative_sentinel_does_not_defeat_positive_proof(self):
+        # A contained payload that mimics the guard's FAILURE signal (negative sentinel + exit 45) must NOT
+        # flip the verdict: the guard already emitted its POSITIVE token before exec, so verified_ok stays
+        # True (the run WAS contained). Closes the payload-forged false-downgrade the panel flagged.
+        with tempfile.TemporaryDirectory() as ws:
+            argv, _iso, _p = contained.wrap_contained(
+                [contained._SH_BIN, "-c", "echo SALIENT_CODEFENCE_UNVERIFIED >&2; exit 45"], ws)
+            r = subprocess.run(argv, capture_output=True, timeout=30, text=True)
+            self.assertEqual(r.returncode, 45)                               # the payload's own rc
+            self.assertTrue(contained.verified_ok(r.returncode, r.stderr))   # still verified — no false downgrade
 
 
 if __name__ == "__main__":

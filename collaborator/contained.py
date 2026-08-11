@@ -47,9 +47,19 @@ COLLABORATOR_CONTAINED_VERSION = "0.1.0"
 # operator-ratcheted, never lifted by the mere presence of bwrap on a host.
 SHELL_CONTAINED_AUTONOMY_CAP = "shell.contained_autonomy"
 
-# Sentinel + exit code the in-child guard prints when a protected root is NOT verifiably read-only, so the
-# caller corrects code_protected -> False rather than falsely claiming protection. The NET half reuses
-# netns's own sentinel/exit-44 so netns.isolation_unverified() keeps working unchanged.
+# The POSITIVE proof the in-child guard emits AFTER every check passed (netns fresh AND each code root
+# present + unwritable + ro-mounted), immediately before it execs the payload. Verification is WHITELISTED
+# on this token (verified_ok): the caller keeps code_protected=True ONLY if it is present, so ANY setup or
+# guard failure — a bwrap setup error with any message, a pathological root path that breaks the guard, a
+# tripped check — yields NO token and fails CLOSED by construction (not by enumerating every failure mode).
+# A payload cannot forge its ABSENCE (it is written before the payload runs) nor forge PRESENCE to any
+# effect (the payload only runs at all if the guard already passed and emitted it). External-panel
+# hardening (PR #39 certification): closes the blacklist-fragility + the payload-forged false-downgrade.
+_CODEFENCE_VERIFIED_SENTINEL = "SALIENT_CODEFENCE_VERIFIED"
+
+# Negative sentinel + exit code the guard prints when a protected root is NOT verifiably read-only. Kept
+# for diagnostics (and protection_unverified below); the AUTHORITATIVE signal is now the POSITIVE token
+# above. The NET half reuses netns's own sentinel/exit-44 so netns.isolation_unverified() is unchanged.
 _CODEFENCE_UNVERIFIED_SENTINEL = "SALIENT_CODEFENCE_UNVERIFIED"
 _CODEFENCE_UNVERIFIED_EXIT = 45
 
@@ -72,10 +82,15 @@ _SH_BIN = _resolve(["/bin/sh", "/usr/bin/sh", "/system/bin/sh"], "sh")
 # /root, /run (docker.sock), /sys, or the host `/`.
 _RO_SYSTEM = tuple(p for p in ("/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/etc")
                    if os.path.isdir(p))
-# Belt over the whole-/etc ro-bind: shadow /dev/null over the highest-value secret files so even a read
-# returns empty. (Under DAC these are root-only anyway, and we cap-drop; this is defence in depth.)
-_MASK = tuple(p for p in ("/etc/shadow", "/etc/gshadow", "/etc/sudoers", "/etc/ssh")
-              if os.path.exists(p))
+# Belt over the whole-/etc ro-bind: hide the highest-value host secrets even from a read. A mask must
+# match the TARGET's type or bwrap aborts setup ("Can't create file at /etc/ssh: Is a directory") and
+# containment would be reported UNAVAILABLE on essentially every host — so classify at import from what
+# THIS host actually has: a FILE secret is shadowed by /dev/null (empty, unreadable content); a DIRECTORY
+# secret (/etc/ssh host keys) by an empty tmpfs. Under DAC these are root-only and we cap-drop + never map
+# root (the sandbox is the real unprivileged uid), so the private keys are already unreadable — this is
+# defence in depth, and it must never be the thing that makes an otherwise-capable host fail closed.
+_MASK_FILES = tuple(p for p in ("/etc/shadow", "/etc/gshadow", "/etc/sudoers") if os.path.isfile(p))
+_MASK_DIRS = tuple(p for p in ("/etc/ssh",) if os.path.isdir(p))
 
 _available = None  # cached host-property probe (None = not yet probed)
 
@@ -86,6 +101,19 @@ def _roots_with_witness():
     so the guard can tell "ro-bound + unwritable" (protected) from "absent" (the wrapper silently didn't
     apply): absence must never count as proof of protection."""
     return codefence.protected_roots_with_witness()
+
+
+def _pairs_shell_safe(pairs) -> bool:
+    """Refuse containment on a (pathological, never-legit) layout whose root/witness path embeds a newline,
+    a double-quote, or the ``|`` spec delimiter — such a path would corrupt the in-child guard's quoted
+    shell-word list, so we NEVER build a malformed guard from it (fail closed at the source; the positive
+    proof token would also catch the resulting broken guard, this is the belt). Real code-root paths never
+    contain these; a deployment that does simply cannot earn autonomy on this host."""
+    for r, w in pairs:
+        for s in (r.as_posix(), w.as_posix()):
+            if "\n" in s or '"' in s or "|" in s:
+                return False
+    return True
 
 
 def _guarded_script(parent_ino: "int | None", pairs, *, check_net: bool) -> str:
@@ -113,7 +141,9 @@ def _guarded_script(parent_ino: "int | None", pairs, *, check_net: bool) -> str:
         f'exit {_CODEFENCE_UNVERIFIED_EXIT} ;; esac; '
         f'done;'
     )
-    return net + code + ' exec "$@"'
+    # Emit the POSITIVE proof ONLY after every check above passed (a failing check `exit`s first, before
+    # this line), immediately before handing control to the payload. verified_ok() whitelists on it.
+    return net + code + f' echo {_CODEFENCE_VERIFIED_SENTINEL} >&2; exec "$@"'
 
 
 def _bwrap_argv(workspace, pairs, *, unshare_net: bool, parent_ino: "int | None", inner):
@@ -133,8 +163,10 @@ def _bwrap_argv(workspace, pairs, *, unshare_net: bool, parent_ino: "int | None"
     ]
     for p in _RO_SYSTEM:
         argv += ["--ro-bind", p, p]
-    for p in _MASK:                                       # /dev/null over secrets, AFTER the /etc bind
+    for p in _MASK_FILES:                                 # /dev/null over secret FILES, AFTER the /etc bind
         argv += ["--ro-bind", "/dev/null", p]
+    for p in _MASK_DIRS:                                  # empty tmpfs over secret DIRS (e.g. /etc/ssh)
+        argv += ["--tmpfs", p]
     for root, _witness in pairs:                          # THE GUARANTEE — code roots read-only, identity-bound
         rp = str(root)
         argv += ["--ro-bind", rp, rp]
@@ -168,7 +200,8 @@ def wrap_contained(argv, workspace, *, roots_with_witness=None, unshare_net: boo
     to run an autonomous shell, so nothing executes uncontained."""
     argv = [str(a) for a in (argv or [])]
     pairs = _roots_with_witness() if roots_with_witness is None else tuple(roots_with_witness)
-    if not argv or sys.platform != "linux" or not os.path.isfile(_BWRAP_BIN) or not pairs:
+    if (not argv or sys.platform != "linux" or not os.path.isfile(_BWRAP_BIN)
+            or not pairs or not _pairs_shell_safe(pairs)):
         return argv, False, False
     parent_ino = netns._netns_ino() if unshare_net else None
     inner = _guarded_script(parent_ino, pairs, check_net=unshare_net)
@@ -177,10 +210,25 @@ def wrap_contained(argv, workspace, *, roots_with_witness=None, unshare_net: boo
     return run_argv, unshare_net, True
 
 
+def verified_ok(returncode: int, stderr) -> bool:
+    """AUTHORITATIVE, WHITELIST check that a contained run was genuinely protected: True iff the in-child
+    guard emitted its POSITIVE proof token — which it does ONLY after the netns was verified fresh AND
+    every code root was verified present, unwritable, and ro-mounted, immediately before exec. The caller
+    keeps code_protected=True ONLY when this is True, so verification fails CLOSED by construction: any
+    setup/guard failure (a bwrap error with ANY message, a pathological root path, a tripped check) leaves
+    no token. Deliberately RETURNCODE-INDEPENDENT — a genuinely-contained payload may exit non-zero (a
+    failing test) yet was still protected; the token, written before exec, proves that. A payload cannot
+    forge absence (already written) nor forge presence to any effect (it runs only if the guard passed and
+    already emitted it)."""
+    text = stderr if isinstance(stderr, str) else (stderr or b"").decode("utf-8", "replace")
+    return _CODEFENCE_VERIFIED_SENTINEL in text
+
+
 def protection_unverified(returncode: int, stderr) -> bool:
     """True iff a contained run failed CLOSED because a code root was not verifiably read-only (the per-run
-    guard tripped, exit 45). The caller then reports code_protected=False honestly — protection was
-    attempted but not verified, and the command did NOT run, so no unprotected shell executed."""
+    guard tripped, exit 45). Retained for diagnostics/tests; the AUTHORITATIVE signal is now the POSITIVE
+    verified_ok() token (this negative sentinel is not used to downgrade on the autonomy path, so a payload
+    that mimics it can no longer force a false code_protected=False)."""
     text = stderr if isinstance(stderr, str) else (stderr or b"").decode("utf-8", "replace")
     return returncode == _CODEFENCE_UNVERIFIED_EXIT and _CODEFENCE_UNVERIFIED_SENTINEL in text
 
