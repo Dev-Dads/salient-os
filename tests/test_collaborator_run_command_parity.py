@@ -67,7 +67,9 @@ def _signed_autonomy(tmp, *, extra=()):
 # many CI sandboxes do not). Tests that reach the executor autonomously and assert an
 # isolation-dependent outcome patch wrap_no_network to force a DETERMINISTIC result — otherwise the
 # same test passes on Windows (no netns) and fails on an Ubuntu runner (netns available) or vice
-# versa. The Linux @skipUnless IsolationProof tests exercise the real thing.
+# versa. On a bwrap-capable host the human path prefers the maintenance sandbox, so such tests also
+# patch maintain.maintenance_available -> False to reach that patched fallback. The Linux @skipUnless
+# IsolationProof / MaintenanceSandboxProofLinux tests exercise the real thing.
 def _unisolated(argv):
     return [str(a) for a in argv], False
 
@@ -299,7 +301,11 @@ class RedTeamFixes(unittest.TestCase):
         # approve(), a Decision is returned, the action is not lost to a raise). Run UNWRAPPED so the
         # missing binary raises FileNotFoundError from subprocess (the F6b catch path) rather than
         # becoming a shell "command not found" exit 127 inside the netns wrapper on Linux.
+        # Force the UNWRAPPED path on both the maintenance-sandbox route (Linux+bwrap, maintenance_available)
+        # and its netns fallback, so subprocess raises FileNotFoundError (the F6b catch) rather than the
+        # binary becoming a shell "exit 127" inside a wrapper.
         with tempfile.TemporaryDirectory() as tmp, \
+                patch("collaborator.maintain.maintenance_available", return_value=False), \
                 patch("collaborator.tools.wrap_no_network", side_effect=_unisolated):
             s = _session(tmp)
             held = govern_action(s, ToolIntent(

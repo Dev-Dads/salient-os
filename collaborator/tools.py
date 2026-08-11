@@ -40,7 +40,7 @@ from salienceos.verifier import Stakes
 from salienceos.verifier.observers import SupervisedResult, run_supervised
 from salienceos.verifier.signing import sha256_bytes
 
-from collaborator import codefence, egress, egressobserver
+from collaborator import codefence, egress, egressobserver, maintain
 from collaborator.contained import verified_ok, wrap_contained
 from collaborator.netns import isolation_unverified, wrap_no_network
 
@@ -372,6 +372,7 @@ def _exec_command(workspace, args: dict, *, require_isolation: bool = False,
         return Execution(result=ToolResult(ok=False, error="command must be a string or list"))
     if not argv:
         return Execution(result=ToolResult(ok=False, error="empty command"))
+    sandboxed = False  # True only on the human path when the bwrap maintenance sandbox wrapped the command
     if require_code_protection:
         # AUTONOMY path (ADR 0003 revisit #1 / F-6 "protection earns autonomy"): an autonomous shell runs
         # ONLY CONTAINED — the code roots read-only, no $HOME/secrets in view, cleared env, and (unless a
@@ -399,10 +400,19 @@ def _exec_command(workspace, args: dict, *, require_isolation: bool = False,
                                   error="code protection required but unavailable on this host — not run"),
                 network_isolated=False, code_protected=False)
     else:
-        # HUMAN-approved / opted-in path: uncontained BY DESIGN (maintenance keeps full filesystem reach).
-        # Network still isolated via netns (ADR 0003 revisit #1) so the mediated client stays the sole
-        # egress path; fails closed to unisolated + a False flag where netns is unavailable.
-        run_argv, isolated = wrap_no_network(argv)
+        # HUMAN-approved / opted-in path: FULL filesystem reach BY DESIGN (maintenance must not break).
+        # Prefer the bwrap MAINTENANCE SANDBOX (ADR 0003 revisit #1b, maintain.py): a full read-write host
+        # view with the egress-deputy sockets (docker.sock, ...) UN-REMOVABLY masked — cap-drop blocks the
+        # `umount` a mapped-root netns child could otherwise use to reveal them — plus a routeless netns, so
+        # egress.py stays the sole IP path AND the confused-deputy path is closed. Where the sandbox is
+        # unavailable (non-Linux / no bwrap / userns blocked / a real-root collaborator where caps can't be
+        # dropped) fall back to the certified routeless netns wrap: today's behaviour + the documented
+        # docker.sock residual, never a fake seal.
+        if maintain.maintenance_available():
+            run_argv, isolated, sandboxed = maintain.wrap_maintenance(argv, workspace, unshare_net=True)
+        else:
+            run_argv, isolated = wrap_no_network(argv)
+            sandboxed = False
         protected = False
     # ADR 0003 revisit #1a: when the caller REQUIRES isolation but this host can't verifiably provide it,
     # REFUSE to run (the command never starts, no raw egress). A human-approved run or a signed raw-reach
@@ -423,9 +433,15 @@ def _exec_command(workspace, args: dict, *, require_isolation: bool = False,
         verified = verified_ok(res.returncode, res.stderr)
         protected = protected and verified
         isolated = isolated and verified
+    elif sandboxed:
+        # HUMAN maintenance SANDBOX (ADR 0003 revisit #1b) — WHITELIST on maintain's POSITIVE proof token.
+        # Keep network_isolated True ONLY if the in-child guard proved the netns fresh, ALL caps dropped (so
+        # the deputy mask is un-removable), and every deputy socket masked, immediately before exec. Any
+        # fail-closed guard trip (net/caps/mask) leaves no token and the command did NOT run.
+        isolated = isolated and maintain.verified_ok(res.returncode, res.stderr)
     elif isolated and isolation_unverified(res.returncode, res.stderr):
-        # HUMAN/opted-in netns path: a per-run guard trip (exit 44) means the command did NOT run — correct
-        # the flag so we never falsely claim isolation. Certified netns path, unchanged.
+        # HUMAN/opted-in netns FALLBACK path: a per-run guard trip (exit 44) means the command did NOT run —
+        # correct the flag so we never falsely claim isolation. Certified netns path, unchanged.
         isolated = False
     ok = res.returncode == 0
     out = (res.stdout or b"").decode("utf-8", "replace")

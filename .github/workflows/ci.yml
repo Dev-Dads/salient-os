@@ -66,5 +66,14 @@ jobs:
         run: |
           python -c "import sys; from collaborator import egressobserver as eo; t=eo.observer_available(); print('egress observer tier =', t); sys.exit(0 if t==eo.TIER_STRONG else 'nft egress observer strong tier unavailable on CI - the skipUnless live proof would silently skip; investigate (nftables? passwordless sudo?) before trusting green.')"
 
+      # Same no-silent-skip guard for the ADR 0003 #1b MAINTENANCE SANDBOX (deputy seal): its LIVE proof —
+      # incl. the crux "the deputy mask survives an umount attempt" — is @skipUnless(maintenance_available()),
+      # so a regression that disabled cap-drop (which is exactly what makes the mask un-removable) would SKIP
+      # and read as a pass. Assert the sandbox IS available on this Linux job (bwrap + userns + non-root
+      # runner) so any such regression fails loudly here instead of silently skipping the umount proof.
+      - name: Assert bwrap maintenance sandbox is available (no silent skip of the umount proof)
+        run: |
+          python -c "import sys; from collaborator import maintain; ok=maintain.maintenance_available(); print('maintenance_available =', ok); sys.exit(0 if ok else 'bwrap maintenance sandbox unavailable on CI - the skipUnless deputy-mask/umount live proof would silently skip and certify nothing; investigate before trusting green.')"
+
       - name: Run test suite
         run: python -m unittest discover -s tests -v
