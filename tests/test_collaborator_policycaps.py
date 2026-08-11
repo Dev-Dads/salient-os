@@ -63,6 +63,19 @@ class SignVerify(unittest.TestCase):
     def test_verify_is_total(self):
         self.assertFalse(verify("not-a-signed-caps", CAPS_KEY, "/ws"))  # never raises
 
+    def test_mint_rejects_the_prohibited_offense_namespace(self):
+        # ADR 0004 (ADR 0003 revisit #4): the operator cannot even construct a grant that names the
+        # structurally un-grantable prohibited class — fail LOUD at mint (the belt closest to where
+        # the operator writes authority). A legit capability alongside is irrelevant; the whole mint
+        # is refused.
+        with self.assertRaises(ValueError):
+            mint(("offense:evil.com",), {}, "admin", "/ws", CAPS_KEY)
+        with self.assertRaises(ValueError):
+            mint(("fs.write:project", "offense:evil.com"), {"write_file": "act_then_report"},
+                 "admin", "/ws", CAPS_KEY)
+        # a normal grant is unaffected
+        self.assertTrue(verify(mint(("fs.write:project",), {}, "admin", "/ws", CAPS_KEY), CAPS_KEY, "/ws"))
+
 
 class NoWiden(unittest.TestCase):
     def test_mutable_capabilities_cannot_widen(self):

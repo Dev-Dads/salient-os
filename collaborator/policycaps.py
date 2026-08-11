@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from collaborator.tools import ACT_THEN_REPORT, NOTIFY_ONLY, PROPOSE_FIRST
+from salienceos.interpreter.policy import is_ungrantable_capability
 
 COLLABORATOR_POLICYCAPS_VERSION = "0.1.0"
 
@@ -76,8 +77,18 @@ def mint(capabilities, leash_caps, issuer: str, subject: str, key: bytes) -> Sig
     for _name, level in items:
         if level not in _LEASH_RANK:
             raise ValueError(f"leash_cap must be one of {tuple(_LEASH_RANK)}, got {level!r}")
+    # ADR 0004 (ADR 0003 revisit #4): the operator cannot even CONSTRUCT a grant naming the
+    # structurally prohibited class — the reserved `offense:` namespace. Fail LOUD at mint (like the
+    # leash validation above), the belt closest to where the operator writes authority. Core also
+    # strips it at issue_policy and refuses it in grants_capability, so a grant that somehow carried
+    # it would still never authorize — but there is no legitimate reason to mint one.
+    caps_list = tuple(str(c) for c in capabilities)
+    for c in caps_list:
+        if is_ungrantable_capability(c):
+            raise ValueError(f"capability {c!r} names the structurally un-grantable prohibited "
+                             "namespace (ADR 0004) and cannot be minted into a grant")
     caps = PolicyCaps(
-        capabilities=tuple(str(c) for c in capabilities),
+        capabilities=caps_list,
         leash_caps=tuple(items),
         issuer=str(issuer), subject=str(subject),
     )
