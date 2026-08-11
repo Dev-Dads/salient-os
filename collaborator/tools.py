@@ -40,7 +40,7 @@ from salienceos.verifier import Stakes
 from salienceos.verifier.observers import SupervisedResult, run_supervised
 from salienceos.verifier.signing import sha256_bytes
 
-from collaborator import codefence, egress
+from collaborator import codefence, egress, egressobserver
 from collaborator.contained import verified_ok, wrap_contained
 from collaborator.netns import isolation_unverified, wrap_no_network
 
@@ -100,6 +100,9 @@ class Execution:
     write_set: tuple[str, ...] = ()
     artifact_hashes: dict = field(default_factory=dict)
     egress: "egress.EgressRecord | None" = None  # ADR 0003: channel-integrity audit of a net.get
+    egress_obs: "egressobserver.ReconcileResult | None" = None  # ADR 0003 #1b: the INDEPENDENT-vantage
+                                            # reconcile of the record against kernel-observed egress
+                                            # (None = not an egress tool / not observed on this host)
     network_isolated: "bool | None" = None  # ADR 0003 revisit #1: run_command ran in a netns
                                             # (None = not a network-isolable tool)
     code_protected: "bool | None" = None  # F-6 Harm A: run_command ran with its write-reach to the
@@ -441,14 +444,28 @@ def _exec_command(workspace, args: dict, *, require_isolation: bool = False,
     )
 
 
+def _egress_claimed(rec) -> list:
+    """The ``(ip, port)`` an EgressRecord CLAIMS it connected to, for independent reconciliation. Egress
+    is HTTPS-only (:443, non-443 refused), so the single claimed endpoint is the resolved IP on 443 —
+    empty if the request was refused before it resolved/connected (then any observed egress is unexpected)."""
+    return [(rec.resolved_ip, 443)] if getattr(rec, "resolved_ip", None) else []
+
+
 def _exec_web_fetch(workspace, args: dict) -> Execution:
     """ADR 0003 Tier 1: a mediated, safety-contracted GET. Authority (the net.get:<host>
     capability) is already checked in the governance gate; here we just perform the fetch
     through the single mediated client and return its channel-integrity record. The surfaced
-    output is length-capped; the raw body is not persisted (only its hash, in the record)."""
+    output is length-capped; the raw body is not persisted (only its hash, in the record).
+
+    ADR 0003 #1b: the fetch runs inside an INDEPENDENT egress-observation window — the kernel's own
+    account of what this uid connected to (nft strong tier / /proc fallback), reconciled against the
+    record, so a second in-process client or a wrong destination is caught by a vantage OUTSIDE the
+    egress client (no-op + honest 'unchecked' where no vantage exists)."""
     url = str(args.get("url") or "")
+    _before = egressobserver.begin()
     result = egress.fetch(url)
     rec = result.record
+    obs = egressobserver.end(_before, _egress_claimed(rec))
     ok = rec.ok
     if ok:
         # Tag the body UNTRUSTED at the SOURCE so EVERY consumer of web bytes (a direct tool call
@@ -462,7 +479,7 @@ def _exec_web_fetch(workspace, args: dict) -> Execution:
         output = ""
     return Execution(
         result=ToolResult(ok=ok, output=output, error=("" if ok else rec.error)),
-        egress=rec,
+        egress=rec, egress_obs=obs,
     )
 
 
@@ -499,8 +516,10 @@ def _exec_net_post(workspace, args: dict, *, keep_preview: bool = False,
     if body is None:
         body = ""
     content_type = str(args.get("content_type") or egress.DEFAULT_POST_CONTENT_TYPE)
+    _before = egressobserver.begin()   # ADR 0003 #1b: independent-vantage observation around the emission
     result = egress.post(url, body, content_type=content_type, auth=auth, keep_preview=keep_preview)
     rec = result.record
+    obs = egressobserver.end(_before, _egress_claimed(rec))
     ok = rec.ok
     if ok:
         head = (f"[{rec.status}] POST {rec.canonical_dest} (sent {rec.request_body_len}b, got "
@@ -512,7 +531,7 @@ def _exec_net_post(workspace, args: dict, *, keep_preview: bool = False,
         output = ""
     return Execution(
         result=ToolResult(ok=ok, output=output, error=("" if ok else rec.error)),
-        egress=rec,
+        egress=rec, egress_obs=obs,
     )
 
 

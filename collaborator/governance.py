@@ -123,6 +123,13 @@ class Decision:
     # ADR 0003: the channel-integrity egress record for a net.get (audit only), and an
     # AUDIT-ONLY offense-shape tag (never a deny — the boundary is structural default-deny).
     egress: object = None
+    # ADR 0003 #1b: the INDEPENDENT-vantage reconcile verdict for an egress action (tri-state, honest):
+    # True = the strong (race-free) kernel vantage confirmed every observed destination is accounted for
+    # by the record ("hands didn't lie"); False = a discrepancy was OBSERVED (a dest the record can't
+    # explain — a second in-process client / wrong dest); None = unchecked (no vantage, or the racy /proc
+    # fallback saw nothing — never a false "verified"). EVIDENCE, not a gate (P-01): it flags, never denies.
+    egress_reconciled: "bool | None" = None
+    egress_discrepancy: str = ""   # the observed-vs-claimed note when egress_reconciled is False
     offense_flag: str = ""
     # ADR 0003 revisit #1: whether a run_command ran network-isolated (netns). None for tools
     # that are not network-isolable; True/False honestly reflects whether isolation applied.
@@ -162,12 +169,24 @@ class Decision:
             tail += f"  ⚑ code-touch audit: {self.code_touch}"
         if self.secret_touch:  # PR 1a Harm B — audit-only tag (never a deny)
             tail += f"  ⚑ secret-touch audit: {self.secret_touch}"
+        if self.egress_reconciled is False:  # ADR 0003 #1b — an OBSERVED discrepancy (never a deny; evidence)
+            tail += f"  ⚠ EGRESS DISCREPANCY (independently observed): {self.egress_discrepancy}"
+        elif self.egress_reconciled is True:
+            tail += "  🔒 egress world-observed (reconciled)"
         if self.status == RAN:
             out = (self.result.output if self.result else "") or "(no output)"
-            # An egress action is channel-LOGGED, not world-verified (the mediated client both makes
-            # AND records the request; ADR 0003 — no independent observer). Don't claim verification
-            # it doesn't have; this line is fed back into the model's history (red-team minor).
-            claim = "ran, channel-logged (NOT world-verified)" if self.egress is not None else "ran, verified"
+            # An egress action's honesty depends on the INDEPENDENT observer (ADR 0003 #1b): world-observed
+            # + reconciled is the "hands can't lie" upgrade; a discrepancy is surfaced loudly; without a
+            # vantage it is only channel-logged (the mediated client both makes AND records the request).
+            # Never claim verification it doesn't have — this line is fed back into the model's history.
+            if self.egress is None:
+                claim = "ran, verified"
+            elif self.egress_reconciled is True:
+                claim = "ran, egress world-observed (reconciled)"
+            elif self.egress_reconciled is False:
+                claim = "ran, EGRESS DISCREPANCY independently observed"
+            else:
+                claim = "ran, channel-logged (independent egress observation unavailable here)"
             return f"[{self.tool} ✓ {claim}] {out}{tail}"
         if self.status == FAILED:
             err = (self.result.error if self.result else "") or "did not clear verification"
@@ -694,9 +713,12 @@ def execute_and_verify(session, tool: Tool, directive, action_id: str, args: dic
                             cleared=False, result=execution.result, directive=directive, args=args)
         ok = bool(execution.result.ok)
         reason = f"egress {rec.canonical_dest} [{rec.status}]" if ok else rec.error
+        obs = execution.egress_obs   # ADR 0003 #1b: the independent reconcile verdict (may be None)
         return Decision(action_id, tool.name, RAN if ok else FAILED, reason, leash,
                         cleared=ok, result=execution.result, directive=directive, args=args,
-                        egress=rec)
+                        egress=rec,
+                        egress_reconciled=(obs.reconciled if obs is not None else None),
+                        egress_discrepancy=(obs.note if (obs is not None and obs.reconciled is False) else ""))
 
     # Command with no declared artifact: clearance is the SUPERVISOR's exit code
     # (its own view of the child, not the tool's self-report) — a nonzero exit

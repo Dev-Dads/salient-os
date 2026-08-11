@@ -37,8 +37,8 @@ jobs:
       # skipping — bwrap is NOT preinstalled on ubuntu-latest, and where it is absent
       # containment_available() is False (the honest fallback), so the proof would skip and certify
       # nothing. This is a system binary, not a Python dependency (the verifier stays stdlib-only).
-      - name: Install bubblewrap (contained run_command proof)
-        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+      - name: Install bubblewrap + nftables (contained + egress-observer live proofs)
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap nftables
 
       # Let the ADR 0003 revisit-#1 netns isolation PROOF and the bwrap containment proof actually run:
       # Ubuntu 24.04 can block unprivileged user namespaces via AppArmor. Best-effort (|| true) — a no-op
@@ -56,6 +56,15 @@ jobs:
       - name: Assert bwrap containment is available (no silent skip of the live proof)
         run: |
           python -c "import sys; from collaborator import contained; ok=contained.containment_available(); print('containment_available =', ok); sys.exit(0 if ok else 'bwrap containment unavailable on CI - the skipUnless live proof would silently skip and certify nothing; investigate before trusting green.')"
+
+      # Same no-silent-skip guard for the ADR 0003 #1b INDEPENDENT egress observer (Thread #2): its LIVE
+      # proof is @skipUnless(observer_available()==STRONG), so a broken strong tier would SKIP (= a false
+      # pass). Assert the nft strong vantage is available on this Linux job (nftables installed + the
+      # runner's passwordless sudo) so a regression fails loudly. The probe installs/reads/tears down its
+      # own scoped table only — it never touches any other nft table and needs no outbound.
+      - name: Assert nft egress observer strong tier is available (no silent skip)
+        run: |
+          python -c "import sys; from collaborator import egressobserver as eo; t=eo.observer_available(); print('egress observer tier =', t); sys.exit(0 if t==eo.TIER_STRONG else 'nft egress observer strong tier unavailable on CI - the skipUnless live proof would silently skip; investigate (nftables? passwordless sudo?) before trusting green.')"
 
       - name: Run test suite
         run: python -m unittest discover -s tests -v
