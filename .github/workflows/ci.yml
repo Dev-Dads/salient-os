@@ -54,7 +54,8 @@ jobs:
       # containment IS available on this Linux job so any regression that disables it FAILS LOUDLY here,
       # instead of silently skipping the proof. (userns is enabled above and proven by the netns proof.)
       - name: Assert bwrap containment is available (no silent skip of the live proof)
-        run: python -c "import sys; from collaborator import contained; ok=contained.containment_available(); print('containment_available =', ok); sys.exit(0 if ok else 'FAIL: bwrap containment unavailable on CI - the @skipUnless live proof would silently skip and certify nothing; investigate (mask type mismatch? userns blocked? bwrap flag unsupported?) before trusting green.')"
+        run: |
+          python -c "import sys; from collaborator import contained; ok=contained.containment_available(); print('containment_available =', ok); sys.exit(0 if ok else 'bwrap containment unavailable on CI - the skipUnless live proof would silently skip and certify nothing; investigate before trusting green.')"
 
       - name: Run test suite
         run: python -m unittest discover -s tests -v
