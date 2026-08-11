@@ -36,6 +36,7 @@ from salienceos.verifier.observers import observe_action, snapshot_tree
 
 from collaborator import egress
 from collaborator.codefence import code_protection_available, names_code_root
+from collaborator.sensitivepaths import names_sensitive_path
 from collaborator.netns import SHELL_RAW_NETWORK_CAP, netns_available
 from collaborator.tools import (
     ACT_THEN_REPORT,
@@ -131,6 +132,10 @@ class Decision:
     # F-6 Harm A audit-only tag: the run_command's command literally named a protected code root —
     # a POROUS recognizer, never a deny; the boundary is structural (see codefence.names_code_root).
     code_touch: str = ""
+    # PR 1a Harm B audit-only tag: the run_command literally named an operator sensitive host path
+    # (SSH/cloud/OS creds) — POROUS, never a deny. Unlike code_touch there is NO structural boundary
+    # here (the operator keeps full FS reach for an approved shell; see sensitivepaths).
+    secret_touch: str = ""
     # ADR 0003 Tier 2 (panel: approved != sent): a seal over a HELD EMISSION's consequential
     # payload (canonical dest + request target + content-type + body), captured at hold time. An
     # emission has no verifier, so approval re-checks this seal and REFUSES if the held args were
@@ -154,6 +159,8 @@ class Decision:
             tail += "  🔒 code-protected" if self.code_protected else "  ⚠ code NOT protected (unfenced shell)"
         if self.code_touch:  # F-6 Harm A — audit-only tag (never a deny)
             tail += f"  ⚑ code-touch audit: {self.code_touch}"
+        if self.secret_touch:  # PR 1a Harm B — audit-only tag (never a deny)
+            tail += f"  ⚑ secret-touch audit: {self.secret_touch}"
         if self.status == RAN:
             out = (self.result.output if self.result else "") or "(no output)"
             # An egress action is channel-LOGGED, not world-verified (the mediated client both makes
@@ -356,6 +363,28 @@ def govern_action(session, intent: ToolIntent, importance: "float | None" = None
                                 "Collaborator's own code"),
                         leash=leash, directive=directive, args=intent.args)
 
+    # --- sensitive-host-path hard-deny for PROPOSER-originated run_command (PR 1a Harm B) ------
+    # A proposer must never SELF-ORIGINATE a shell command naming the OPERATOR's sensitive host paths
+    # (SSH/cloud/OS creds). Unlike the code-root deny there is SOMETIMES a legit reason to touch these
+    # (e.g. `chmod 600 ~/.ssh/id_rsa` hardening) — but that is the HUMAN's to DIRECT, not the model's
+    # to self-originate: a one-click-approvable command that reads the operator's private keys is the
+    # confused-deputy surface this refuses (an adversarial / memory-poisoned proposer). DENY outright
+    # (operator-confirmed), keyed on the model-unforgeable intent.source == "proposed". SCOPE (owned,
+    # not hidden): ONLY the fully-autonomous PROPOSER channel is hard-denied. A USER/HOST-directed
+    # command AND the model's in-turn channel (source in {structured, content_*}) are deliberately
+    # UNAFFECTED here — byte-identical to the code-root deny's scope above. On the turn channel a
+    # secret-touching command is not denied but HELD with the ⚠ (names_sensitive_path) in the preview,
+    # and the run_command AUTONOMY-WITHHELD FLOOR below guarantees it can never AUTO-run — so the human
+    # hand + the ⚠ are the mitigation there (maintenance preserved; the deceived-human approve is the
+    # acknowledged residual). Placed after the code-root deny so a command naming BOTH surfaces the
+    # higher-severity code reason first. POROUS DiD — NO structural boundary here and none planned.
+    if (intent.name == "run_command" and getattr(intent, "source", "") == "proposed"
+            and names_sensitive_path(intent.args.get("command"))):
+        return Decision(action_id=action_id, tool=tool.name, status=DENIED,
+                        reason=("the proposer may not self-originate a command naming the operator's "
+                                "sensitive host paths (SSH/cloud/OS credentials); a human must direct it"),
+                        leash=leash, directive=directive, args=intent.args)
+
     # --- EMISSION FLOOR / auto-lift (ADR 0003 Tier 2) ------------------------
     # A side-effecting egress (net_post) is "acting on the world" — the less-reversible,
     # un-verifiable channel — so it is HUMAN-GATED by default. It may run autonomously
@@ -479,6 +508,11 @@ def govern_action(session, intent: ToolIntent, importance: "float | None" = None
         _named = names_code_root(args.get("command"))
         if _named:
             preview["names_code_root"] = _named
+        # PR 1a Harm B: surface any literal reference to an operator sensitive host path to the human
+        # holding the hand on this shell. POROUS/audit-grade — there is no fence here (see docstring).
+        _sensitive = names_sensitive_path(args.get("command"))
+        if _sensitive:
+            preview["names_sensitive_path"] = _sensitive
         # ADR 0003 revisit #1a: whether this shell will run with RAW network reach (no netns
         # isolation on this host) — the honest posture the approving human sees. LIVE off-Linux
         # (netns_available() is False), independent of whether the raw-reach opt-in was granted:
@@ -649,18 +683,21 @@ def execute_and_verify(session, tool: Tool, directive, action_id: str, args: dic
     if tool.verify_mode == "exit":
         offense_flag = flag_offense_shape(tool.name, args)  # audit-only tag, never a deny
         code_touch = names_code_root(args.get("command"))   # F-6 audit-only tag (porous), never a deny
+        secret_touch = names_sensitive_path(args.get("command"))  # PR 1a audit-only (porous), never a deny
         try:
             execution = execute_tool(tool, session.workspace, args, require_isolation=require_isolation)
         except WorkspaceError as exc:
             return Decision(action_id, tool.name, DENIED, str(exc), leash, directive=directive,
-                            args=args, offense_flag=offense_flag, code_touch=code_touch)
+                            args=args, offense_flag=offense_flag, code_touch=code_touch,
+                            secret_touch=secret_touch)
         except Exception as exc:  # noqa: BLE001 — a shell that can't even START (missing binary,
             # unbalanced quotes -> shlex ValueError, NUL in argv) must FAIL honestly, never raise out
             # of approve()/govern_action (which promise never to raise) and never burn the held
             # action_id with no audit record. Mirrors the egress + artifact branches' broad backstop.
             return Decision(action_id, tool.name, FAILED, f"command error: {type(exc).__name__}",
                             leash, cleared=False, directive=directive, args=args,
-                            offense_flag=offense_flag, code_touch=code_touch)
+                            offense_flag=offense_flag, code_touch=code_touch,
+                            secret_touch=secret_touch)
         cleared = bool(execution.result.ok)
         if cleared:
             reason = "supervised exit 0"
@@ -674,7 +711,8 @@ def execute_and_verify(session, tool: Tool, directive, action_id: str, args: dic
                         leash, cleared=cleared, result=execution.result, directive=directive,
                         args=args, offense_flag=offense_flag,
                         network_isolated=execution.network_isolated,
-                        code_protected=execution.code_protected, code_touch=code_touch)
+                        code_protected=execution.code_protected, code_touch=code_touch,
+                        secret_touch=secret_touch)
 
     # verify_mode == "artifact": build envelope BEFORE running, snapshot, execute
     # receipt from the REAL result, observe world independently, govern.

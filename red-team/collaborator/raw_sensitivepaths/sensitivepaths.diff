@@ -1,0 +1,407 @@
+diff --git a/collaborator/governance.py b/collaborator/governance.py
+index 7a97216..fa3ba30 100644
+--- a/collaborator/governance.py
++++ b/collaborator/governance.py
+@@ -36,6 +36,7 @@ from salienceos.verifier.observers import observe_action, snapshot_tree
+ 
+ from collaborator import egress
+ from collaborator.codefence import code_protection_available, names_code_root
++from collaborator.sensitivepaths import names_sensitive_path
+ from collaborator.netns import SHELL_RAW_NETWORK_CAP, netns_available
+ from collaborator.tools import (
+     ACT_THEN_REPORT,
+@@ -131,6 +132,10 @@ class Decision:
+     # F-6 Harm A audit-only tag: the run_command's command literally named a protected code root —
+     # a POROUS recognizer, never a deny; the boundary is structural (see codefence.names_code_root).
+     code_touch: str = ""
++    # PR 1a Harm B audit-only tag: the run_command literally named an operator sensitive host path
++    # (SSH/cloud/OS creds) — POROUS, never a deny. Unlike code_touch there is NO structural boundary
++    # here (the operator keeps full FS reach for an approved shell; see sensitivepaths).
++    secret_touch: str = ""
+     # ADR 0003 Tier 2 (panel: approved != sent): a seal over a HELD EMISSION's consequential
+     # payload (canonical dest + request target + content-type + body), captured at hold time. An
+     # emission has no verifier, so approval re-checks this seal and REFUSES if the held args were
+@@ -154,6 +159,8 @@ class Decision:
+             tail += "  🔒 code-protected" if self.code_protected else "  ⚠ code NOT protected (unfenced shell)"
+         if self.code_touch:  # F-6 Harm A — audit-only tag (never a deny)
+             tail += f"  ⚑ code-touch audit: {self.code_touch}"
++        if self.secret_touch:  # PR 1a Harm B — audit-only tag (never a deny)
++            tail += f"  ⚑ secret-touch audit: {self.secret_touch}"
+         if self.status == RAN:
+             out = (self.result.output if self.result else "") or "(no output)"
+             # An egress action is channel-LOGGED, not world-verified (the mediated client both makes
+@@ -356,6 +363,28 @@ def govern_action(session, intent: ToolIntent, importance: "float | None" = None
+                                 "Collaborator's own code"),
+                         leash=leash, directive=directive, args=intent.args)
+ 
++    # --- sensitive-host-path hard-deny for PROPOSER-originated run_command (PR 1a Harm B) ------
++    # A proposer must never SELF-ORIGINATE a shell command naming the OPERATOR's sensitive host paths
++    # (SSH/cloud/OS creds). Unlike the code-root deny there is SOMETIMES a legit reason to touch these
++    # (e.g. `chmod 600 ~/.ssh/id_rsa` hardening) — but that is the HUMAN's to DIRECT, not the model's
++    # to self-originate: a one-click-approvable command that reads the operator's private keys is the
++    # confused-deputy surface this refuses (an adversarial / memory-poisoned proposer). DENY outright
++    # (operator-confirmed), keyed on the model-unforgeable intent.source == "proposed". SCOPE (owned,
++    # not hidden): ONLY the fully-autonomous PROPOSER channel is hard-denied. A USER/HOST-directed
++    # command AND the model's in-turn channel (source in {structured, content_*}) are deliberately
++    # UNAFFECTED here — byte-identical to the code-root deny's scope above. On the turn channel a
++    # secret-touching command is not denied but HELD with the ⚠ (names_sensitive_path) in the preview,
++    # and the run_command AUTONOMY-WITHHELD FLOOR below guarantees it can never AUTO-run — so the human
++    # hand + the ⚠ are the mitigation there (maintenance preserved; the deceived-human approve is the
++    # acknowledged residual). Placed after the code-root deny so a command naming BOTH surfaces the
++    # higher-severity code reason first. POROUS DiD — NO structural boundary here and none planned.
++    if (intent.name == "run_command" and getattr(intent, "source", "") == "proposed"
++            and names_sensitive_path(intent.args.get("command"))):
++        return Decision(action_id=action_id, tool=tool.name, status=DENIED,
++                        reason=("the proposer may not self-originate a command naming the operator's "
++                                "sensitive host paths (SSH/cloud/OS credentials); a human must direct it"),
++                        leash=leash, directive=directive, args=intent.args)
++
+     # --- EMISSION FLOOR / auto-lift (ADR 0003 Tier 2) ------------------------
+     # A side-effecting egress (net_post) is "acting on the world" — the less-reversible,
+     # un-verifiable channel — so it is HUMAN-GATED by default. It may run autonomously
+@@ -479,6 +508,11 @@ def govern_action(session, intent: ToolIntent, importance: "float | None" = None
+         _named = names_code_root(args.get("command"))
+         if _named:
+             preview["names_code_root"] = _named
++        # PR 1a Harm B: surface any literal reference to an operator sensitive host path to the human
++        # holding the hand on this shell. POROUS/audit-grade — there is no fence here (see docstring).
++        _sensitive = names_sensitive_path(args.get("command"))
++        if _sensitive:
++            preview["names_sensitive_path"] = _sensitive
+         # ADR 0003 revisit #1a: whether this shell will run with RAW network reach (no netns
+         # isolation on this host) — the honest posture the approving human sees. LIVE off-Linux
+         # (netns_available() is False), independent of whether the raw-reach opt-in was granted:
+@@ -649,18 +683,21 @@ def execute_and_verify(session, tool: Tool, directive, action_id: str, args: dic
+     if tool.verify_mode == "exit":
+         offense_flag = flag_offense_shape(tool.name, args)  # audit-only tag, never a deny
+         code_touch = names_code_root(args.get("command"))   # F-6 audit-only tag (porous), never a deny
++        secret_touch = names_sensitive_path(args.get("command"))  # PR 1a audit-only (porous), never a deny
+         try:
+             execution = execute_tool(tool, session.workspace, args, require_isolation=require_isolation)
+         except WorkspaceError as exc:
+             return Decision(action_id, tool.name, DENIED, str(exc), leash, directive=directive,
+-                            args=args, offense_flag=offense_flag, code_touch=code_touch)
++                            args=args, offense_flag=offense_flag, code_touch=code_touch,
++                            secret_touch=secret_touch)
+         except Exception as exc:  # noqa: BLE001 — a shell that can't even START (missing binary,
+             # unbalanced quotes -> shlex ValueError, NUL in argv) must FAIL honestly, never raise out
+             # of approve()/govern_action (which promise never to raise) and never burn the held
+             # action_id with no audit record. Mirrors the egress + artifact branches' broad backstop.
+             return Decision(action_id, tool.name, FAILED, f"command error: {type(exc).__name__}",
+                             leash, cleared=False, directive=directive, args=args,
+-                            offense_flag=offense_flag, code_touch=code_touch)
++                            offense_flag=offense_flag, code_touch=code_touch,
++                            secret_touch=secret_touch)
+         cleared = bool(execution.result.ok)
+         if cleared:
+             reason = "supervised exit 0"
+@@ -674,7 +711,8 @@ def execute_and_verify(session, tool: Tool, directive, action_id: str, args: dic
+                         leash, cleared=cleared, result=execution.result, directive=directive,
+                         args=args, offense_flag=offense_flag,
+                         network_isolated=execution.network_isolated,
+-                        code_protected=execution.code_protected, code_touch=code_touch)
++                        code_protected=execution.code_protected, code_touch=code_touch,
++                        secret_touch=secret_touch)
+ 
+     # verify_mode == "artifact": build envelope BEFORE running, snapshot, execute
+     # receipt from the REAL result, observe world independently, govern.
+diff --git a/collaborator/loop.py b/collaborator/loop.py
+index ee459b5..d16ceb1 100644
+--- a/collaborator/loop.py
++++ b/collaborator/loop.py
+@@ -25,6 +25,7 @@ from collaborator.governance import (
+     reauthorized_or_denied,
+ )
+ from collaborator.codefence import names_code_root
++from collaborator.sensitivepaths import names_sensitive_path
+ from collaborator.toolcall import ToolIntent, parse_message
+ from collaborator.tools import (
+     ACT_THEN_REPORT,
+@@ -189,6 +190,15 @@ def approve(session, decision: Decision) -> Decision:
+                         "code root: proposer-authored command re-denied at approval",
+                         decision.leash, directive=decision.directive, args=args,
+                         origin=decision.origin)
++    # PR 1a Harm B: same re-assertion for a COLLABORATOR-originated held run_command mutated post-hold
++    # to name an operator secret. DiD-over-DiD — the MINOR-B run_command seal below already fails ANY
++    # post-hold arg mutation; this adds only the specific reason + symmetry with the code-root re-deny.
++    if (decision.origin == "collaborator" and decision.tool == "run_command"
++            and names_sensitive_path(args.get("command"))):
++        return Decision(decision.action_id, decision.tool, DENIED,
++                        "sensitive path: proposer-authored command re-denied at approval",
++                        decision.leash, directive=decision.directive, args=args,
++                        origin=decision.origin)
+     # MINOR-B (ADR 0003; net.post-FIX red-team): bind approval of a held run_command / write_file to
+     # the EXACT consequential args the human saw — the by-reference-mutation (TOCTOU) vector the
+     # emission seal closes for net_post, now closed uniformly for the other unbounded-reach tools. A
+diff --git a/collaborator/sensitivepaths.py b/collaborator/sensitivepaths.py
+new file mode 100644
+index 0000000..26363cf
+--- /dev/null
++++ b/collaborator/sensitivepaths.py
+@@ -0,0 +1,89 @@
++"""Best-effort recognition of a ``run_command`` naming the OPERATOR's sensitive host paths
++(SSH keys, cloud/OS credentials) — a DIFFERENT concern from ``codefence`` (which protects the
++Collaborator's OWN code). Cross-platform, stdlib-only, NO new dependency.
++
++DEFENCE-IN-DEPTH ONLY — **NOT a boundary, and — unlike ``codefence`` — there is NO planned
++structural boundary here.** ``codefence`` has a *deferred* real fence (``code_protection_available``
++graduates to an OS-level read-only bind); this module does not, and none is coming: the operator
++DELIBERATELY keeps a human-approved ``run_command`` at full filesystem reach so system maintenance is
++not broken. Nothing here structurally contains a shell's read of a host secret. This module ONLY
++
++  * hard-denies a PROPOSER self-originating a secret-touching shell command (the confused-deputy
++    one-click trap — an adversarial / memory-poisoned proposer surfacing ``cat ~/.ssh/id_rsa`` with a
++    plausible rationale for a tired human to approve),
++  * surfaces a ``⚠`` in the human approval preview, and
++  * carries an audit-only tag on execution.
++
++A shell reaches a secret WITHOUT naming it literally — a variable, ``$HOME``/``~`` built at runtime,
++base64, a glob, ``tar czf - ~``, ``/proc/self/environ``, an ``env`` dump — and ALL of those are OUT OF
++SCOPE by construction, exactly as in ``codefence.names_code_root``. The marker list therefore errs hard
++toward PRECISION over recall: missing some is acceptable (this was never a fence), but a FALSE ``⚠``
++that noise-blinds the approving human, or an over-deny of legitimate work, is the real failure. Do NOT
++mistake this recognizer for containment; the containment story for the operator's secrets is the 1b
++contained-execution view (``bwrap --clearenv`` + least-privilege mount ns) on the *autonomy* path only.
++"""
++
++from __future__ import annotations
++
++COLLABORATOR_SENSITIVEPATHS_VERSION = "0.1.0"
++
++# HIGH-PRECISION, cross-platform markers of the OPERATOR's host secrets. Matched as a substring on the
++# separator-normalized, LOWERCASED command text (see ``names_sensitive_path``). Directory markers keep a
++# trailing "/"; multi-tenant dirs use a TWO-SEGMENT form (".aws/credentials", NOT bare ".aws") so a
++# benign mention of the parent (e.g. editing ~/.aws/config region settings) does not fire.
++#
++# DELIBERATE EXCLUSIONS (documented, not omissions):
++#   * ".env" — a substring hit on .env.example/.env.local/.env.sample/.envrc; it would ⚠ nearly every
++#     dev command AND over-deny `cp .env.example .env` on the proposer path. It is also the WRONG AXIS:
++#     .env is workspace-local project config, not a HOST secret. Excluded — recall loss is acceptable.
++#   * ".npmrc" — touched constantly by npm / CI / Dockerfiles → noise.
++#   * bare "credentials.json" / "login data" (unanchored) — too generic.
++# BROAD-RECALL EXCEPTION (the one place we favour recall over precision, deliberately): ".ssh/" matches
++# the WHOLE key directory, so a proposed command touching a NON-secret sibling (".ssh/config",
++# ".ssh/known_hosts", "chmod 700 ~/.ssh/") is also denied. That is intended: a custom-named private key
++# (~/.ssh/id_company, ~/.ssh/deploy_key) would slip a filename-only list, so the crown-jewel directory
++# is treated as deny-and-redirect for a PROPOSER (proposer-only, fully recoverable by human direction).
++# The module's "precision over recall" default holds everywhere else; ".ssh/" is the marked exception.
++# Accepted porous false-positive: dumb substring means "id_rsa" also hits "grid_rsa" (e.g. cloning a
++# repo literally named that) — rare, and on the DENY path it only affects a model-authored proposer
++# command (recoverable via human-direction). Kept faithful to ``names_code_root`` (dumb substring, no
++# token anchoring) and documented rather than complicated. The trailing "borderline tier" (.pypirc,
++# .docker/config.json) is safe to drop first if an FP-audit complains.
++_SENSITIVE_MARKERS: "tuple[str, ...]" = (
++    # SSH — the whole dir is sensitive, plus the distinctive private-key filenames
++    ".ssh/", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "authorized_keys",
++    # cloud-provider credentials (two-segment anchored so ~/.aws/config etc. does not fire)
++    ".aws/credentials", ".config/gcloud", ".azure/", ".kube/config",
++    # generic secret files
++    ".netrc", "_netrc", ".pgpass", ".git-credentials", ".gnupg/",
++    # OS secret stores (unix)
++    "/etc/shadow", "/etc/gshadow", "/etc/sudoers",
++    # OS / browser keychains
++    "login.keychain", "login.keychain-db", "google/chrome/user data",
++    # borderline tier (registry / vcs / registry-auth) — drop first if an FP-audit complains
++    ".pypirc", ".docker/config.json",
++)
++
++
++def names_sensitive_path(command) -> str:
++    """POROUS, best-effort tag of a ``run_command`` whose ``command`` literally names one of the
++    operator's sensitive host paths (``_SENSITIVE_MARKERS``). Returns the matched marker(s) joined by
++    ``,`` (empty string = no literal match). DEFENCE-IN-DEPTH ONLY — NOT a boundary (module docstring).
++
++    Mirrors ``codefence.names_code_root`` (join list/tuple argv with spaces, normalize ``\\`` -> ``/``,
++    substring test) with ONE deliberate divergence: it also LOWERCASES the haystack. ``names_code_root``
++    matches EXACT resolved absolute paths so it needs no folding; these markers are conventional short
++    lowercase names, and Windows/macOS filesystems are case-insensitive — folding buys cross-platform
++    recall (``C:\\Users\\me\\.SSH\\id_rsa``) at negligible false-positive cost for THIS specific list."""
++    if isinstance(command, (list, tuple)):
++        text = " ".join(str(c) for c in command)
++    else:
++        text = str(command or "")
++    if not text:
++        return ""
++    hay = text.replace("\\", "/").lower()
++    matched: list[str] = []
++    for marker in _SENSITIVE_MARKERS:  # markers are pre-lowercased literals
++        if marker in hay and marker not in matched:
++            matched.append(marker)
++    return ",".join(matched)
+diff --git a/collaborator/tools.py b/collaborator/tools.py
+index 71642a9..1f6b30c 100644
+--- a/collaborator/tools.py
++++ b/collaborator/tools.py
+@@ -392,7 +392,9 @@ def _exec_command(workspace, args: dict, *, require_isolation: bool = False) ->
+     return Execution(
+         result=ToolResult(ok=ok, output=out, error=err),
+         supervised=res, exit_code=res.returncode,
+-        write_set=(),  # nothing declared; observe_action's write-set diff catches undeclared writes
++        write_set=(),  # run_command is verify_mode="exit": govern's exit-branch returns BEFORE the
++        # artifact branch, so observe_action/snapshot_tree never run — there is NO write-set observation
++        # for a shell (honest: a post-exec workspace tripwire was deferred by the Harm A panel, not built)
+         artifact_hashes={}, network_isolated=isolated,
+         # F-6 Harm A: honest — False until the OS-level read-only-bind protection lands. While False
+         # the seam withholds run_command autonomy, so an unfenced shell never AUTO-runs.
+diff --git a/tests/test_collaborator_sensitivepaths.py b/tests/test_collaborator_sensitivepaths.py
+new file mode 100644
+index 0000000..391a389
+--- /dev/null
++++ b/tests/test_collaborator_sensitivepaths.py
+@@ -0,0 +1,156 @@
++"""PR 1a "Harm B" — the OPERATOR's sensitive host paths as a porous, best-effort recognizer.
++
++Pins the cheap, cross-platform defence-in-depth layer over run_command's unfenced filesystem reach,
++WITHOUT hard-fencing run_command (which would kill system maintenance):
++
++* the POROUS recognizer (names_sensitive_path) — explicitly NOT a boundary, and unlike codefence NO
++  structural boundary is planned (negative cases + the precision exclusions encode that),
++* the proposer hard-deny (DENY outright — operator-confirmed) + the approve-time re-deny,
++* the human-preview ⚠ + the audit-only execution tag (never a deny),
++* maintenance preserved: a USER/HOST-directed secret-touching command is untouched (held then runs).
++
++The highest-value test is test_env_example_is_NOT_matched: `.env` is deliberately EXCLUDED so the
++recognizer does not noise-blind the human on routine dev commands nor over-deny legit proposer work.
++"""
++
++import sys
++import tempfile
++import unittest
++
++from collaborator import sensitivepaths
++from collaborator.governance import DENIED, HELD, RAN, govern_action
++from collaborator.loop import approve
++from collaborator.session import Session
++from collaborator.toolcall import ToolIntent
++
++
++def _shell_session(tmp, **kw):
++    return Session(workspace=tmp, capabilities=("fs.read:project", "fs.write:project", "shell.exec"), **kw)
++
++
++# A hermetic secret-shaped literal — a fixed string, never the real $HOME (keeps the test deterministic
++# across machines and CI, and never actually reads anyone's key).
++_SECRET = "/home/op/.ssh/id_rsa"
++
++
++class NamesSensitivePathRecognizer(unittest.TestCase):
++    """POROUS, HIGH-PRECISION defence-in-depth — negative cases ENCODE that it is not a boundary."""
++
++    def test_matches_ssh_key_in_list(self):
++        got = sensitivepaths.names_sensitive_path(["cat", "/home/u/.ssh/id_rsa"])
++        self.assertIn("id_rsa", got)
++        self.assertIn(".ssh/", got)
++
++    def test_matches_aws_credentials_in_string(self):
++        self.assertIn(".aws/credentials", sensitivepaths.names_sensitive_path("cat ~/.aws/credentials"))
++
++    def test_matches_etc_shadow(self):
++        self.assertIn("/etc/shadow", sensitivepaths.names_sensitive_path(["cp", "/etc/shadow", "/tmp/x"]))
++
++    def test_windows_backslash_and_case_normalized(self):
++        # pins BOTH the "\\" -> "/" normalization AND the lowercasing divergence from names_code_root
++        got = sensitivepaths.names_sensitive_path(r"type C:\Users\me\.SSH\id_rsa")
++        self.assertIn(".ssh/", got)
++        self.assertIn("id_rsa", got)
++
++    def test_env_example_is_NOT_matched(self):
++        # THE landmine test: a substring match on ".env" would fire on routine dev commands and
++        # over-deny the proposer. `.env` is deliberately excluded (wrong axis + noise).
++        self.assertEqual(sensitivepaths.names_sensitive_path("cp .env.example .env"), "")
++        self.assertEqual(sensitivepaths.names_sensitive_path(["cat", ".env.local"]), "")
++        self.assertEqual(sensitivepaths.names_sensitive_path(["cat", ".envrc"]), "")
++
++    def test_npmrc_is_NOT_matched(self):
++        # npm/CI/Dockerfiles touch .npmrc constantly — excluded to avoid alarm fatigue.
++        cmd = ["npm", "config", "set", "//r/:_authToken=x", "--userconfig", ".npmrc"]
++        self.assertEqual(sensitivepaths.names_sensitive_path(cmd), "")
++
++    def test_aws_config_not_matched_but_credentials_is(self):
++        # two-segment anchoring: ~/.aws/config (routine region settings) must NOT fire; credentials must.
++        self.assertEqual(sensitivepaths.names_sensitive_path("cat ~/.aws/config"), "")
++        self.assertTrue(sensitivepaths.names_sensitive_path("cat ~/.aws/credentials"))
++
++    def test_benign_and_empty(self):
++        self.assertEqual(sensitivepaths.names_sensitive_path(["echo", "hello"]), "")
++        self.assertEqual(sensitivepaths.names_sensitive_path(""), "")
++        self.assertEqual(sensitivepaths.names_sensitive_path(None), "")
++
++    def test_porous_dynamic_construction_is_NOT_caught(self):
++        # A shell that builds the path at runtime (a var, no literal marker) sails past — exactly why
++        # this is DiD and NOT a boundary. Pins the porousness so nobody mistakes it for a fence.
++        self.assertEqual(
++            sensitivepaths.names_sensitive_path(["sh", "-c", 'k=$(cat cfg); cat "$k"']), "")
++
++    def test_multiple_markers_joined(self):
++        got = sensitivepaths.names_sensitive_path(["sh", "-c", "cat ~/.ssh/id_rsa ~/.aws/credentials"])
++        self.assertIn("id_rsa", got)
++        self.assertIn(".aws/credentials", got)
++        self.assertIn(",", got)  # multiple markers, comma-joined
++
++
++class GovernSensitivePathSlot(unittest.TestCase):
++    def test_proposer_command_naming_secret_is_hard_denied(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            s = _shell_session(tmp)
++            d = govern_action(s, ToolIntent("run_command", {"command": ["cat", _SECRET]}, "proposed"))
++            self.assertEqual(d.status, DENIED)
++            self.assertIn("sensitive host paths", d.reason)
++
++    def test_proposer_env_example_is_NOT_denied(self):
++        # the landmine exclusion holds END TO END: a proposed `cp .env.example .env` is not denied by
++        # this rule — it is merely HELD (proposer run_command floors to propose_first).
++        with tempfile.TemporaryDirectory() as tmp:
++            s = _shell_session(tmp)
++            d = govern_action(s, ToolIntent(
++                "run_command", {"command": ["cp", ".env.example", ".env"]}, "proposed"))
++            self.assertNotEqual(d.status, DENIED)
++            self.assertEqual(d.status, HELD)
++
++    def test_user_directed_secret_command_not_denied_and_runs(self):
++        # maintenance preserved: a user/host-directed command naming a secret is NOT hard-denied (only
++        # the PROPOSER path is); it is HELD by the leash and runs under a human hand. `echo` is harmless.
++        with tempfile.TemporaryDirectory() as tmp:
++            s = _shell_session(tmp)
++            held = govern_action(s, ToolIntent("run_command", {"command": ["echo", _SECRET]}, "structured"))
++            self.assertEqual(held.status, HELD)
++            self.assertNotEqual(held.status, DENIED)
++            d = approve(s, held)              # the human hand: echo runs (not re-denied for user origin)
++            self.assertEqual(d.status, RAN)
++
++    def test_held_preview_surfaces_named_sensitive_path(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            s = _shell_session(tmp)
++            held = govern_action(s, ToolIntent("run_command", {"command": ["echo", _SECRET]}, "structured"))
++            self.assertEqual(held.status, HELD)
++            self.assertIn("id_rsa", held.preview.get("names_sensitive_path", ""))
++
++    def test_executed_run_command_secret_tag_is_audit_only(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            s = _shell_session(tmp)
++            held = govern_action(s, ToolIntent("run_command", {"command": ["echo", _SECRET]}, "structured"))
++            d = approve(s, held)
++            self.assertEqual(d.status, RAN)                 # the tag NEVER turns a RAN into a DENIED
++            self.assertTrue(d.secret_touch)                 # honest audit tag present
++            self.assertIn("secret-touch audit", d.summary())
++
++
++class ApproveReDeniesMutatedSensitivePath(unittest.TestCase):
++    def test_approve_re_denies_a_mutated_collaborator_command(self):
++        # a held COLLABORATOR-origin run_command mutated after origination to name a secret is refused
++        # at the moment of use (symmetric with the code-root re-deny), not consumed. NOTE: freeze_args
++        # makes held.args a dict whose "command" is an immutable tuple — so we REASSIGN the dict key
++        # (mirrors the codefence test); mutating the tuple in place would raise TypeError.
++        with tempfile.TemporaryDirectory() as tmp:
++            s = _shell_session(tmp)
++            held = govern_action(s, ToolIntent("run_command", {"command": ["echo", "hi"]}, "structured"))
++            self.assertEqual(held.status, HELD)
++            held.origin = "collaborator"                    # as if a proposer raised the hold
++            held.args["command"] = ["cat", _SECRET]         # mutated post-origination (key reassign)
++            d = approve(s, held)
++            self.assertEqual(d.status, DENIED)
++            self.assertIn("sensitive path", d.reason)
++            self.assertFalse(held.consumed)                 # retryable, not burned
++
++
++if __name__ == "__main__":
++    sys.exit(unittest.main())
