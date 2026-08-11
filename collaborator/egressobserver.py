@@ -30,6 +30,24 @@ Reconciliation is EVIDENCE, not a gate (P-01: it INFORMS/flags, never grants): a
 record does not explain raises `egress_reconciled=False` + a discrepancy note; a clean strong-tier match is
 the "hands didn't lie" upgrade. Confinement so nothing CAN egress unobserved (an enforced netns chokepoint)
 is the deferred full-parity follow-up; this observes, it does not enforce.
+
+RESIDUALS (honest — the strong tier OBSERVES the Collaborator uid's outbound TCP to non-loopback dests, per
+action; these evade it and are the enforced-chokepoint follow-up's job, NOT v0 defects):
+  * A second channel on a DIFFERENT uid (a setuid/helper) — the hook is uid-scoped by design.
+  * A LOOPBACK / local forward proxy (a client → 127.0.0.1 → the proxy egresses): the loopback hop is
+    excluded (to avoid noise from legit localhost services), and the proxy's onward hop is a different uid.
+    The same residual netns lists (a "local forward proxy").
+  * UDP / DNS / QUIC exfil — the hook is TCP-only (matching UDP would flag every DNS lookup as noise).
+  * Egress whose bytes fall ENTIRELY BETWEEN windows (a connection that neither opens nor sends during any
+    observed action) — per-action windows only cover the action; continuous observation is the follow-up.
+  * A ROOT-compromised client that flushes/edits the kernel state — the root-compromised-host residual (same
+    stance as the bwrap CVE work).
+  * Same-uid CO-TENANT egress (another honest process of the uid) → a false-positive discrepancy, not a miss.
+  * A same-uid SYN in the narrow delete-then-create window INSIDE `begin()` (not the fetch body): the hook is
+    up before `begin()` returns, so this is a setup-race miss only, under the serial-executor assumption.
+  * PORT policing is egress.py's job, not the observer's: it reconciles ``(ip, port)`` exactly as claimed
+    (`_egress_claimed` pins :443) and does not independently enforce the HTTPS-only contract — a record that
+    lied about the PORT to an already-claimed IP is egress.py's contract to keep, out of this vantage's scope.
 """
 
 from __future__ import annotations
@@ -54,9 +72,11 @@ TIER_UNAVAILABLE = "none"  # no vantage on this host → egress_observed=False
 
 def _resolve(candidates, name: str) -> str:
     """Absolute path to a system binary, resolved at import (before any run_command could plant a shadow),
-    identical in spirit to netns._resolve."""
+    identical in spirit to netns._resolve. Requires an EXECUTABLE regular file: a present-but-non-exec
+    binary, or a `sudo` wrapper that ignores `-n` and prompts, would otherwise let `_run_nft` block until
+    its timeout on every call (external-panel fix gpt-F3). shutil.which already only returns executables."""
     for p in candidates:
-        if os.path.isfile(p):
+        if os.path.isfile(p) and os.access(p, os.X_OK):
             return p
     return shutil.which(name) or candidates[0]
 
@@ -77,19 +97,36 @@ def _uid() -> int:
     return os.getuid() if hasattr(os, "getuid") else -1
 
 
+def _canon_ip(ip) -> str:
+    """Canonical (compressed) IP text so the record's resolved_ip and the kernel's rendering compare equal
+    regardless of textual form (esp. IPv6). Fail-safe: an unparseable value is returned unchanged."""
+    import ipaddress
+    try:
+        return ipaddress.ip_address(str(ip)).compressed
+    except (ValueError, TypeError):
+        return str(ip)
+
+
 def _nft_ruleset(uid: int) -> str:
-    """The passive, uid-scoped OUTPUT observer. Both address families; new-connection (pure SYN) only;
-    `update` a dynamic set of ``daddr . dport`` + bump a counter; `policy accept` (never drops)."""
+    """The passive, uid-scoped OUTPUT observer. Both address families; EVERY outbound TCP packet (NOT just
+    the SYN) `update`s a dynamic set of ``daddr . dport`` + bumps a counter; `policy accept` (never drops).
+
+    Matching every packet (not only the SYN) is the fix for the pre-established-connection evasion (external
+    panel F-01): a second in-process client that reuses a connection opened BEFORE this window still sends
+    data packets DURING it, and each one adds its destination to the set — so it cannot exfil unobserved
+    while a benign new fetch reconciles clean. (A connection that is idle for the whole window sends nothing
+    to observe; a connection whose bytes fall entirely BETWEEN windows is the documented between-windows
+    residual the enforced chokepoint closes.)"""
     return f"""table inet {_NFT_TABLE} {{
   set dests4 {{ type ipv4_addr . inet_service; flags dynamic,timeout; timeout 10m; }}
   set dests6 {{ type ipv6_addr . inet_service; flags dynamic,timeout; timeout 10m; }}
-  counter conns {{}}
+  counter pkts {{}}
   chain out {{
     type filter hook output priority 0; policy accept;
-    meta skuid {uid} ip  daddr != 127.0.0.0/8 tcp flags & (syn|ack) == syn \
-      update @dests4 {{ ip daddr  . tcp dport }} counter name conns
-    meta skuid {uid} ip6 daddr != ::1         tcp flags & (syn|ack) == syn \
-      update @dests6 {{ ip6 daddr . tcp dport }} counter name conns
+    meta skuid {uid} ip  daddr != 127.0.0.0/8 meta l4proto tcp \
+      update @dests4 {{ ip daddr  . tcp dport }} counter name pkts
+    meta skuid {uid} ip6 daddr != ::1         meta l4proto tcp \
+      update @dests6 {{ ip6 daddr . tcp dport }} counter name pkts
   }}
 }}
 """
@@ -139,27 +176,54 @@ class EgressSnapshot:
         return self.tier != TIER_UNAVAILABLE
 
 
-def _parse_nft_set(json_text: str) -> "set[tuple[str, int]]":
+def _elem_concat(elem) -> "list | None":
+    """Best-effort extract the ``[ip, port]`` concat from ONE nft set element, tolerating both the bare
+    (`{"concat":[…]}`) and the counter-wrapped (`{"elem":{"val":{"concat":[…]}}}`) shapes. Returns None if
+    the element does not carry a 2-tuple concat. Total — never raises on an unexpected shape."""
+    val = elem.get("elem", elem) if isinstance(elem, dict) else elem
+    inner = val.get("val", val) if isinstance(val, dict) else val
+    concat = inner.get("concat") if isinstance(inner, dict) else None
+    return concat if (isinstance(concat, list) and len(concat) == 2) else None
+
+
+def _parse_nft_set(json_text: str) -> "set | None":
+    """Parse `nft -j list set` output into ``{(ip, port)}``. Returns **None** on ANY parse/structural failure
+    so the caller treats a failed read as UNCHECKED, never as a clean EMPTY observation — the fail-closed
+    posture that stops a false "verified" when a real connection went unparsed (external-panel fix qwen
+    ID-03). None is returned when: JSON is unparseable; the top level isn't a dict; NO ``set`` object appears
+    (nft always emits exactly one for `list set`); ``elem`` is present but not a list; OR an element is
+    present that does NOT decode to a valid ``(ip, port)`` — a present-but-undecodable element (nft JSON
+    schema skew, or an injected non-concat element) is UNTRUSTWORTHY, because the element we dropped could be
+    the very destination a discrepancy would flag. Only a ``set`` object with a genuinely EMPTY element list
+    returns an empty set — the one legitimate "observed nothing" reading."""
     import json
-    out: set = set()
     try:
         doc = json.loads(json_text)
     except (ValueError, TypeError):
-        return out
+        return None
+    if not isinstance(doc, dict):
+        return None
+    out: set = set()
+    found_set = False
     for obj in doc.get("nftables", []):
         s = obj.get("set") if isinstance(obj, dict) else None
-        if not s:
+        if s is None:
             continue
-        for elem in s.get("elem", []):
-            val = elem.get("elem", elem) if isinstance(elem, dict) else elem
-            concat = val.get("val", val).get("concat") if isinstance(val, dict) else None
-            if isinstance(concat, list) and len(concat) == 2:
-                ip, port = concat[0], concat[1]
-                try:
-                    out.add((str(ip), int(port)))
-                except (ValueError, TypeError):
-                    continue
-    return out
+        found_set = True                       # nft emitted the set object; its element list is the truth
+        elems = s.get("elem", [])
+        if elems is None:
+            elems = []
+        if not isinstance(elems, list):
+            return None                        # 'elem' present but not a list => schema mismatch, UNCHECKED
+        for elem in elems:
+            concat = _elem_concat(elem)
+            if concat is None:
+                return None                    # element present but undecodable => UNCHECKED (fail closed)
+            try:
+                out.add((str(concat[0]), int(concat[1])))
+            except (ValueError, TypeError):
+                return None                    # a malformed ip/port in a real element => UNCHECKED
+    return out if found_set else None          # no set object => a schema mismatch/failure, NOT "empty"
 
 
 def _nft_snapshot() -> "EgressSnapshot | None":
@@ -171,8 +235,11 @@ def _nft_snapshot() -> "EgressSnapshot | None":
             r = _run_nft(["-j", "list", "set", "inet", _NFT_TABLE, setname])
             if r.returncode != 0:
                 return None
-            dests |= _parse_nft_set(r.stdout)
-        rc = _run_nft(["-j", "list", "counter", "inet", _NFT_TABLE, "conns"])
+            parsed = _parse_nft_set(r.stdout)
+            if parsed is None:                 # a parse/schema failure is UNCHECKED, never a clean empty
+                return None
+            dests |= parsed
+        rc = _run_nft(["-j", "list", "counter", "inet", _NFT_TABLE, "pkts"])
         count = 0
         if rc.returncode == 0:
             try:
@@ -259,20 +326,25 @@ def observer_available() -> str:
     global _available_tier
     if _available_tier is not None:
         return _available_tier
-    _available_tier = TIER_UNAVAILABLE
     if sys.platform != "linux":
+        _available_tier = TIER_UNAVAILABLE      # platform is immutable — safe to cache permanently
         return _available_tier
+    tier = TIER_UNAVAILABLE
     if install():
         try:
             if _nft_snapshot() is not None:
-                _available_tier = TIER_STRONG
+                tier = TIER_STRONG
         finally:
             teardown()
-        if _available_tier == TIER_STRONG:
-            return _available_tier
-    if _proc_snapshot() is not None:
-        _available_tier = TIER_PROC
-    return _available_tier
+    if tier != TIER_STRONG and _proc_snapshot() is not None:
+        tier = TIER_PROC
+    # Cache ONLY a POSITIVE result. A transient 'none' (a momentary sudo/nft hiccup at first probe) is left
+    # UNCACHED so a later egress re-probes and self-heals, instead of pinning the observer off for the whole
+    # process lifetime (external-panel fix gpt-F4/F6, grok-F-04). Evidence-only, so re-probe cost is bounded
+    # by egress frequency and dominated by the egress's own network I/O.
+    if tier != TIER_UNAVAILABLE:
+        _available_tier = tier
+    return tier
 
 
 @dataclass(frozen=True)
@@ -280,12 +352,21 @@ class ReconcileResult:
     """The independent-observation verdict for one egress action. EVIDENCE, not a gate.
 
     ``reconciled`` is TRI-STATE and honest about fidelity:
-      * ``True``  — the STRONG (race-free) vantage confirmed every observed destination is accounted for
+      * ``True``  — the STRONG (race-free) vantage confirmed every observed DESTINATION is accounted for
         by the record (the "hands didn't lie" upgrade).
       * ``False`` — a discrepancy was OBSERVED (a destination the record does not explain, or — strong tier
-        only — a claimed connection the kernel never saw). Positive evidence of a mismatch, at any tier.
+        only — a claimed DESTINATION the kernel never saw). Positive evidence of a mismatch, at any tier.
       * ``None``  — UNCHECKED: no vantage (UNAVAILABLE), or the racy `/proc` fallback saw no discrepancy but
-        cannot positively confirm a clean run. Never a false "verified"."""
+        cannot positively confirm a clean run. Never a false "verified".
+
+    SCOPE (external-panel gpt-F1): the verdict is over the DESTINATION SET — WHICH ``(ip, port)`` the uid's
+    egress reached — because that is what "hands can't lie about WHERE data went" requires. It deliberately
+    does NOT assert per-destination connection MULTIPLICITY: the strong-tier counter tallies PACKETS (TCP
+    retransmits/keepalives inflate it), so it is not a connection count, and comparing it to a claim count
+    would manufacture false discrepancies on every multi-packet request. A record over-claiming a repeat
+    connection to an ALREADY-observed, already-authorized destination is therefore reconciled ``True`` — it
+    is not concealed egress (the bytes still went only where the record says). The dangerous direction — a
+    connection to a destination the record HID — is a NEW dest and is caught by ``unexpected`` at any tier."""
     reconciled: "bool | None"
     tier: str
     observed_dests: frozenset = field(default_factory=frozenset)
@@ -309,9 +390,11 @@ def reconcile(before: EgressSnapshot, after: EgressSnapshot, claimed) -> Reconci
     if tier == TIER_UNAVAILABLE:
         return ReconcileResult(reconciled=None, tier=tier,
                                note="egress not independently observed on this host (no vantage)")
-    claimed_set = frozenset((str(ip), int(port)) for ip, port in claimed if ip)
+    # Canonicalize IPs on BOTH sides (compressed form) so a textual difference between the record's
+    # resolved_ip and the kernel's rendering (esp. IPv6) can't manufacture a false discrepancy (F-05).
+    claimed_set = frozenset((_canon_ip(ip), int(port)) for ip, port in claimed if ip)
     # New destinations attributable to THIS action = what appeared after but not before.
-    observed = frozenset(after.dests - before.dests)
+    observed = frozenset((_canon_ip(ip), port) for ip, port in (after.dests - before.dests))
     unexpected = frozenset(observed - claimed_set)
     claimed_unobserved = frozenset(claimed_set - observed) if tier == TIER_STRONG else frozenset()
     conn_delta = max(0, after.conn_count - before.conn_count) if tier == TIER_STRONG else len(observed)
@@ -335,8 +418,9 @@ def begin() -> EgressSnapshot:
     the current live-socket sample. UNAVAILABLE: an honest empty marker. Never raises."""
     tier = observer_available()
     if tier == TIER_STRONG:
-        install()                                      # fresh, empty → BEFORE is empty by construction
-        return EgressSnapshot(tier=TIER_STRONG)
+        if not install():                              # install FAILED → no clean fresh table this window;
+            return EgressSnapshot(tier=TIER_UNAVAILABLE)  # unchecked, never a stale-table result (F-03)
+        return EgressSnapshot(tier=TIER_STRONG)        # fresh, empty → BEFORE is empty by construction
     if tier == TIER_PROC:
         return _proc_snapshot() or EgressSnapshot(tier=TIER_PROC)
     return EgressSnapshot(tier=TIER_UNAVAILABLE)
@@ -347,8 +431,14 @@ def end(before: EgressSnapshot, claimed) -> ReconcileResult:
     destinations. STRONG: read the table, tear it down (scoped), reconcile. PROC: re-sample. Never raises."""
     tier = before.tier
     if tier == TIER_STRONG:
-        after = _nft_snapshot() or EgressSnapshot(tier=TIER_UNAVAILABLE)
+        after = _nft_snapshot()
         teardown()
+        if after is None:
+            # The strong tier was set up for THIS action but the read failed (table removed/unreadable/
+            # unparseable). Honest UNCHECKED that is DISTINCT from "this host has no vantage" (gpt-F2 /
+            # qwen-ID01): tier stays STRONG, reconciled=None — never masked as a clean or a no-vantage run.
+            return ReconcileResult(reconciled=None, tier=TIER_STRONG, note="strong-tier observer read failed "
+                                   "for this action (table missing/unreadable/unparseable) — unchecked")
         return reconcile(before, after, claimed)
     if tier == TIER_PROC:
         after = _proc_snapshot() or EgressSnapshot(tier=TIER_PROC)

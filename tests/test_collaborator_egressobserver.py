@@ -24,9 +24,30 @@ class NftJsonParse(unittest.TestCase):
              '{"elem":{"val":{"concat":["8.8.8.8",80]}}}]}}]}')
         self.assertEqual(eo._parse_nft_set(j), {("1.1.1.1", 443), ("8.8.8.8", 80)})
 
-    def test_garbage_is_empty_not_a_raise(self):
-        self.assertEqual(eo._parse_nft_set("not json"), set())
-        self.assertEqual(eo._parse_nft_set('{"nftables":[]}'), set())
+    def test_parse_fails_closed_to_none(self):
+        # malformed / schema-mismatch → None (UNCHECKED), never a silent empty that could mint a false clean
+        self.assertIsNone(eo._parse_nft_set("not json"))
+        self.assertIsNone(eo._parse_nft_set('{"nftables":[]}'))    # no set object = a failure, not "empty"
+        # a valid, genuinely-empty set → empty set (a legitimate observation, distinct from a parse failure)
+        self.assertEqual(eo._parse_nft_set('{"nftables":[{"set":{"name":"dests4"}}]}'), set())
+        self.assertEqual(eo._parse_nft_set('{"nftables":[{"set":{"name":"dests4","elem":[]}}]}'), set())
+
+    def test_present_but_undecodable_elements_are_none_not_empty(self):
+        # qwen ID-03 (full close): a `set` object WITH elements that don't carry a 2-concat (nft JSON schema
+        # skew, or an injected non-concat element) must fail CLOSED to None — an element we silently dropped
+        # could be the very destination a discrepancy would flag. NOT an empty "observed nothing" reading.
+        self.assertIsNone(eo._parse_nft_set('{"nftables":[{"set":{"name":"dests4","elem":["not-a-dict"]}}]}'))
+        self.assertIsNone(eo._parse_nft_set(
+            '{"nftables":[{"set":{"name":"dests4","elem":[{"elem":{"val":{"nope":[1,2]}}}]}}]}'))
+        # a PARTIAL decode (one good element, one undecodable) is also UNCHECKED — never a partial truth
+        self.assertIsNone(eo._parse_nft_set(
+            '{"nftables":[{"set":{"name":"dests4","elem":['
+            '{"elem":{"val":{"concat":["1.1.1.1",443]}}},{"bogus":true}]}}]}'))
+        # a real element carrying a non-integer port is a malformed real element → UNCHECKED
+        self.assertIsNone(eo._parse_nft_set(
+            '{"nftables":[{"set":{"name":"dests4","elem":[{"elem":{"val":{"concat":["1.1.1.1","https"]}}}]}}]}'))
+        # 'elem' present but not a list → schema mismatch → UNCHECKED
+        self.assertIsNone(eo._parse_nft_set('{"nftables":[{"set":{"name":"dests4","elem":{"x":1}}}]}'))
 
 
 class ProcDecode(unittest.TestCase):
@@ -153,6 +174,81 @@ class OffPlatformHonest(unittest.TestCase):
         self.assertIn(eo._NFT_BIN, eo._NFT)
         if eo._NFT[0] != eo._NFT_BIN:
             self.assertEqual(eo._NFT[:2], [eo._SUDO_BIN, "-n"])
+
+
+class PanelFixes(unittest.TestCase):
+    """External-panel-driven hardening (PR #40 certification): each fix pinned so it can't regress."""
+
+    def test_ruleset_matches_all_tcp_not_just_syn(self):
+        # F-01: matching every outbound TCP packet (not only the SYN) is what catches a pre-established
+        # connection reused in-window — the rule must NOT be SYN-gated.
+        body = eo._nft_ruleset(1000)
+        self.assertIn("l4proto tcp", body)
+        self.assertNotIn("syn", body)
+
+    def test_snapshot_parse_failure_is_none_not_empty(self):
+        # qwen ID-03: nft returns rc==0 but unparseable JSON → _nft_snapshot must be None (UNCHECKED),
+        # never an empty-dests STRONG snapshot that could reconcile to a false True.
+        ok = subprocess.CompletedProcess([], 0, stdout="garbage-not-json", stderr="")
+        with patch.object(eo, "_run_nft", return_value=ok):
+            self.assertIsNone(eo._nft_snapshot())
+
+    def test_begin_unavailable_when_install_fails(self):
+        # F-03: a failed install() must NOT leave a STRONG before-marker over a possibly-stale table.
+        with patch.object(eo, "observer_available", return_value=eo.TIER_STRONG), \
+             patch.object(eo, "install", return_value=False):
+            self.assertEqual(eo.begin().tier, eo.TIER_UNAVAILABLE)
+
+    def test_end_strong_read_failure_is_unchecked_and_distinct_from_no_vantage(self):
+        # gpt-F2/qwen-ID01: the strong tier was set up but the read failed → reconciled None, tier STAYS
+        # STRONG (an observer failure, honestly distinct from "this host has no vantage").
+        with patch.object(eo, "_nft_snapshot", return_value=None), patch.object(eo, "teardown"):
+            r = eo.end(eo.EgressSnapshot(tier=eo.TIER_STRONG), [("1.1.1.1", 443)])
+            self.assertIsNone(r.reconciled)
+            self.assertEqual(r.tier, eo.TIER_STRONG)
+            self.assertIn("read failed", r.note)
+
+    def test_ip_canonicalization_kills_ipv6_textform_false_discrepancy(self):
+        # F-05: an expanded-form observed IPv6 must reconcile clean against a compressed claimed IPv6.
+        after = eo.EgressSnapshot(dests=frozenset({("2001:db8:0:0:0:0:0:1", 443)}), tier=eo.TIER_STRONG)
+        r = eo.reconcile(eo.EgressSnapshot(tier=eo.TIER_STRONG), after, [("2001:db8::1", 443)])
+        self.assertIs(r.reconciled, True)
+
+    def test_dest_set_scope_dup_claim_is_true_but_hidden_new_dest_is_false(self):
+        # gpt-F1: the verdict is over the DESTINATION SET, not connection multiplicity (the strong counter is
+        # PACKETS, not connections). A record over-claiming a repeat connection to an ALREADY-observed dest is
+        # NOT concealed egress → True. The dangerous direction (bytes to a HIDDEN, un-claimed dest) is a NEW
+        # dest and MUST be caught as unexpected → False. This pins that the scope choice is safe.
+        before = eo.EgressSnapshot(tier=eo.TIER_STRONG)
+        # over-claim: record claims two connections to the one observed dest; kernel saw the dest → True
+        dup = eo.reconcile(before, eo.EgressSnapshot(dests=frozenset({("1.1.1.1", 443)}), conn_count=1,
+                           tier=eo.TIER_STRONG), [("1.1.1.1", 443), ("1.1.1.1", 443)])
+        self.assertIs(dup.reconciled, True)
+        # concealment: a second, un-claimed destination the record hid → False, surfaced as unexpected
+        hid = eo.reconcile(before, eo.EgressSnapshot(dests=frozenset({("1.1.1.1", 443), ("9.9.9.9", 443)}),
+                           conn_count=2, tier=eo.TIER_STRONG), [("1.1.1.1", 443)])
+        self.assertIs(hid.reconciled, False)
+        self.assertIn(("9.9.9.9", 443), hid.unexpected)
+
+    def test_transient_none_is_not_cached_but_positive_is(self):
+        # gpt-F4/F6, grok-F-04: a transient 'none' at first probe must NOT pin the observer off for the
+        # process lifetime; only a POSITIVE tier is cached. (Non-Linux caches UNAVAILABLE permanently — the
+        # platform is immutable — so this behaviour is asserted on the Linux probe path.)
+        if sys.platform != "linux":
+            self.skipTest("Linux-only self-heal path")
+        eo._reset_probe_cache_for_tests()
+        try:
+            with patch.object(eo, "install", return_value=False), \
+                 patch.object(eo, "_proc_snapshot", return_value=None):
+                self.assertEqual(eo.observer_available(), eo.TIER_UNAVAILABLE)
+                self.assertIsNone(eo._available_tier)          # NOT cached → a later probe can self-heal
+            with patch.object(eo, "install", return_value=False), \
+                 patch.object(eo, "_proc_snapshot",
+                              return_value=eo.EgressSnapshot(tier=eo.TIER_PROC)):
+                self.assertEqual(eo.observer_available(), eo.TIER_PROC)
+                self.assertEqual(eo._available_tier, eo.TIER_PROC)   # positive result IS cached
+        finally:
+            eo._reset_probe_cache_for_tests()
 
 
 class SeamWiring(unittest.TestCase):
