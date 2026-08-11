@@ -137,17 +137,20 @@ class BlastRadiusSafety(unittest.TestCase):
 
     def test_teardown_only_deletes_our_table(self):
         calls = self._capture(eo.teardown)
-        self.assertEqual(calls, [["delete", "table", "inet", "salient_obs"]])
+        self.assertEqual(calls, [["delete", "table", "inet", eo._NFT_TABLE]])
+        self.assertTrue(eo._NFT_TABLE.startswith("salient_obs"))   # our reserved, uid-scoped namespace
 
     def test_install_never_flushes_and_scopes_to_our_table(self):
         calls = self._capture(eo.install)
         flat = " ".join(tok for c in calls for tok in c)
         self.assertNotIn("flush", flat)
         self.assertNotIn("ruleset", flat)
-        # every table-affecting call names ONLY salient_obs; the create is `-f -` (stdin ruleset)
+        # every table-affecting call names ONLY our reserved table (never a foreign filter/nat/...); the
+        # create is `-f -` (stdin ruleset). Uses eo._NFT_TABLE (uid-scoped on Linux) so it holds cross-host.
+        self.assertTrue(eo._NFT_TABLE.startswith("salient_obs"))
         for c in calls:
             if "table" in c:
-                self.assertIn("salient_obs", c)
+                self.assertIn(eo._NFT_TABLE, c)
         self.assertTrue(any(c[:2] == ["-f", "-"] for c in calls))
 
     def test_ruleset_body_scopes_to_our_table_and_is_policy_accept(self):
@@ -229,6 +232,25 @@ class PanelFixes(unittest.TestCase):
                            conn_count=2, tier=eo.TIER_STRONG), [("1.1.1.1", 443)])
         self.assertIs(hid.reconciled, False)
         self.assertIn(("9.9.9.9", 443), hid.unexpected)
+
+    def test_observer_raise_is_isolated_never_fails_a_good_egress(self):
+        # gpt/grok highest-value fix: begin()/end() are ISOLATED in the executor — if either raises, the
+        # observation degrades to None and the good egress stands; the raise never reaches governance's
+        # except->FAILED to convert a successful fetch into a FAILED action.
+        from collaborator import tools
+        with patch.object(tools.egressobserver, "begin", side_effect=RuntimeError("boom")), \
+             patch.object(tools.egressobserver, "end", side_effect=RuntimeError("boom")):
+            b = tools._observe_begin()
+            self.assertIsNone(b)                                      # begin raise -> None (no vantage)
+            self.assertIsNone(tools._observe_end(b, [("1.1.1.1", 443)]))       # before=None -> no reconcile
+            self.assertIsNone(tools._observe_end(object(), [("1.1.1.1", 443)]))  # end raise -> None, not a raise
+
+    def test_table_name_is_uid_scoped_reserved_namespace(self):
+        # qwen NOT-CERT close: the ONE table is a reserved, uid-scoped name so the idempotent reinstall can
+        # never delete a foreign same-name table (a real host firewall is never named salient_obs_u<uid>).
+        self.assertTrue(eo._NFT_TABLE.startswith("salient_obs"))
+        if sys.platform == "linux":
+            self.assertRegex(eo._NFT_TABLE, r"^salient_obs_u\d+$")
 
     def test_transient_none_is_not_cached_but_positive_is(self):
         # gpt-F4/F6, grok-F-04: a transient 'none' at first probe must NOT pin the observer off for the
@@ -349,7 +371,7 @@ class EgressObserverProofLinux(unittest.TestCase):
     def test_teardown_leaves_no_table(self):
         eo.install()
         eo.teardown()
-        r = eo._run_nft(["list", "table", "inet", "salient_obs"])
+        r = eo._run_nft(["list", "table", "inet", eo._NFT_TABLE])
         self.assertNotEqual(r.returncode, 0)          # our table is gone
 
 

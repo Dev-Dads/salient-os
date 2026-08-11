@@ -451,6 +451,28 @@ def _egress_claimed(rec) -> list:
     return [(rec.resolved_ip, 443)] if getattr(rec, "resolved_ip", None) else []
 
 
+def _observe_begin():
+    """Open an egress-observation window, ISOLATED so the observer can NEVER block a good egress: any
+    unexpected raise degrades to 'no vantage' (None), never propagates into the executor's failure path
+    (external-panel gpt/grok highest-value fix — begin/end are written not to raise, this makes the
+    'an observer failure never fails an otherwise-good egress' headline robust even against a future bug)."""
+    try:
+        return egressobserver.begin()
+    except Exception:
+        return None
+
+
+def _observe_end(before, claimed):
+    """Close the window opened by ``_observe_begin`` and reconcile — ISOLATED (a raise → None, never a
+    failed egress). ``before is None`` (begin failed) → no reconcile."""
+    if before is None:
+        return None
+    try:
+        return egressobserver.end(before, claimed)
+    except Exception:
+        return None
+
+
 def _exec_web_fetch(workspace, args: dict) -> Execution:
     """ADR 0003 Tier 1: a mediated, safety-contracted GET. Authority (the net.get:<host>
     capability) is already checked in the governance gate; here we just perform the fetch
@@ -462,10 +484,10 @@ def _exec_web_fetch(workspace, args: dict) -> Execution:
     record, so a second in-process client or a wrong destination is caught by a vantage OUTSIDE the
     egress client (no-op + honest 'unchecked' where no vantage exists)."""
     url = str(args.get("url") or "")
-    _before = egressobserver.begin()
+    _before = _observe_begin()
     result = egress.fetch(url)
     rec = result.record
-    obs = egressobserver.end(_before, _egress_claimed(rec))
+    obs = _observe_end(_before, _egress_claimed(rec))
     ok = rec.ok
     if ok:
         # Tag the body UNTRUSTED at the SOURCE so EVERY consumer of web bytes (a direct tool call
@@ -516,10 +538,10 @@ def _exec_net_post(workspace, args: dict, *, keep_preview: bool = False,
     if body is None:
         body = ""
     content_type = str(args.get("content_type") or egress.DEFAULT_POST_CONTENT_TYPE)
-    _before = egressobserver.begin()   # ADR 0003 #1b: independent-vantage observation around the emission
+    _before = _observe_begin()   # ADR 0003 #1b: independent-vantage observation around the emission (isolated)
     result = egress.post(url, body, content_type=content_type, auth=auth, keep_preview=keep_preview)
     rec = result.record
-    obs = egressobserver.end(_before, _egress_claimed(rec))
+    obs = _observe_end(_before, _egress_claimed(rec))
     ok = rec.ok
     if ok:
         head = (f"[{rec.status}] POST {rec.canonical_dest} (sent {rec.request_body_len}b, got "

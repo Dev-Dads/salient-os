@@ -21,8 +21,9 @@ Two tiers, probed like `netns.netns_available()` / `contained.containment_availa
     call. Point-in-time (a sub-sample connection can be missed) and no byte counts, but needs no privilege.
   * UNAVAILABLE — non-Linux / no nft+privilege / no /proc → ``egress_observed=False``. Never a fake claim.
 
-STRICTLY SCOPED, fail-safe blast radius: this module ONLY ever creates/deletes ``table inet salient_obs``
-(via `nft delete table`, error-tolerant) — it NEVER runs `nft flush ruleset` or touches any other table, so
+STRICTLY SCOPED, fail-safe blast radius: this module ONLY ever creates/deletes its OWN reserved, uid-scoped
+``table inet salient_obs_u<uid>`` (via `nft delete table`, error-tolerant) — it NEVER runs `nft flush ruleset`
+or touches any other table, and the uid-scoped name cannot collide with an operator's real firewall table, so
 it cannot disturb a host firewall. The rule is `policy accept` and purely observational (`update`+`counter`),
 so it never drops a packet. Linux-only, stdlib-only, NO new dependency (nft is a system binary).
 
@@ -64,9 +65,14 @@ from dataclasses import dataclass, field
 
 COLLABORATOR_EGRESSOBSERVER_VERSION = "0.1.0"
 
-# The ONE table this module ever creates or deletes. Teardown is `nft delete table inet salient_obs` —
-# scoped, error-tolerant, NEVER `flush ruleset`, so a host firewall is untouchable by this observer.
-_NFT_TABLE = "salient_obs"
+# The ONE table this module ever creates or deletes — a RESERVED, uid-scoped name so it can never
+# collide with (and therefore never clobber) an operator's real firewall table. Teardown is
+# `nft delete table inet <this>` — scoped, error-tolerant, NEVER `flush ruleset`, so a host firewall is
+# untouchable by this observer. The uid suffix (external-panel qwen) makes the idempotent per-action
+# reinstall unable to delete a foreign same-name table; it stays stable across a process's restarts (same
+# uid → same name → cleans only OUR own leftover), unlike a pid suffix which would leak a table per run.
+_UID_AT_IMPORT = os.getuid() if hasattr(os, "getuid") else -1
+_NFT_TABLE = f"salient_obs_u{_UID_AT_IMPORT}" if _UID_AT_IMPORT >= 0 else "salient_obs"
 
 # Honest tier labels (mirrors the netns/contained honest-flag posture).
 TIER_STRONG = "nft"        # privileged kernel OUTPUT hook — race-free, uid-attributed, unbypassable
