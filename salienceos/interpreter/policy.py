@@ -104,12 +104,17 @@ def issue_policy(
     allow_immediate_reconfigure: bool,
     policy_key: bytes,
 ) -> PolicyCaps:
+    # Total / fail-closed: a malformed granted_capabilities (None, or a bare str/bytes that would
+    # otherwise iterate into single characters) yields NO capabilities — the hardest fail-closed —
+    # rather than raising at this boundary (external-panel gemini FRAG-01; pre-existing, hardened here).
+    _caps = () if (granted_capabilities is None
+                   or isinstance(granted_capabilities, (str, bytes))) else granted_capabilities
     caps = PolicyCaps(
         policy_id=policy_id,
         subject=subject,
         # ADR 0004: a prohibited-namespace capability never rides in a signed envelope. Stripped here
         # (defense in depth + clean audit); grants_capability refuses it unconditionally regardless.
-        granted_capabilities=tuple(c for c in granted_capabilities if not is_ungrantable_capability(c)),
+        granted_capabilities=tuple(c for c in _caps if not is_ungrantable_capability(c)),
         min_budget=min_budget,
         max_budget=max_budget,
         min_verification=min_verification,

@@ -113,6 +113,14 @@ class ProhibitedNamespaceIsUngrantable(unittest.TestCase):
         # Pin the namespace so a future edit that empties it (fail-open) is caught.
         self.assertIn("offense:", RESERVED_UNGRANTABLE_PREFIXES)
 
+    def test_issue_policy_is_total_on_malformed_capabilities(self):
+        # gemini FRAG-01: a malformed granted_capabilities must fail closed (no capabilities), never
+        # raise at this boundary. None and a bare str (which would iterate into characters) both -> ().
+        from salienceos.interpreter import issue_policy
+        for bad in (None, "fs.read:project"):
+            p = issue_policy("p", "s", bad, 10, 1000, 0, 3, "semantic", False, 2, 0.4, False, KEY)
+            self.assertEqual(p.granted_capabilities, ())
+
 
 class AdaptationNeedsPolicySwitch(unittest.TestCase):
     def test_no_adaptation_without_policy_allow(self):
