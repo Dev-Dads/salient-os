@@ -8,6 +8,7 @@ fail-closed directive (no capabilities at all), not a trusted one.
 """
 
 import enum
+import unicodedata
 from dataclasses import dataclass, field
 
 from salienceos.verifier.signing import sign, signature_valid
@@ -32,9 +33,15 @@ RESERVED_UNGRANTABLE_PREFIXES = ("offense:",)
 def is_ungrantable_capability(capability) -> bool:
     """True if `capability` names the structurally prohibited class (a reserved prefix). Total —
     a non-string is not a capability string, so it is not (this) prohibited namespace (False).
-    Case-INSENSITIVE: the reserved prefixes are lowercase, so a case variant (``OFFENSE:``) cannot
-    slip a future offense-tool's derived capability past the reservation."""
-    return isinstance(capability, str) and capability.casefold().startswith(RESERVED_UNGRANTABLE_PREFIXES)
+
+    Normalized before matching so a CONFUSABLE cannot slip a variant past the reservation:
+    NFKC compatibility-folds full-width / compatibility forms (``ｏｆｆｅｎｓｅ：`` -> ``offense:``,
+    external-panel gemini), then casefold handles case (``OFFENSE:``). The reserved prefixes are
+    already ASCII-lowercase, so a legitimate ASCII capability is unaffected."""
+    if not isinstance(capability, str):
+        return False
+    normalized = unicodedata.normalize("NFKC", capability).casefold()
+    return normalized.startswith(RESERVED_UNGRANTABLE_PREFIXES)
 
 
 class VerificationDepth(enum.IntEnum):

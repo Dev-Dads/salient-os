@@ -74,7 +74,8 @@ class ProhibitedNamespaceIsUngrantable(unittest.TestCase):
 
     def test_recognizer_matrix(self):
         for cap in ("offense:example.com", "offense:", "offense:1.2.3.4",
-                    "OFFENSE:example.com", "Offense:x"):   # case-insensitive — no variant slips through
+                    "OFFENSE:example.com", "Offense:x",     # case-insensitive
+                    "ｏｆｆｅｎｓｅ：x"):  # full-width ｏｆｆｅｎｓｅ： (NFKC, gemini)
             self.assertTrue(is_ungrantable_capability(cap), cap)
         for cap in ("net.get:example.com", "fs.read:project", "shell.exec", "offense",
                     "offensive", "offense_shape", "", "not.offense:x"):

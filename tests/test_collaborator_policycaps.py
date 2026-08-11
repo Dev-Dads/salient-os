@@ -17,6 +17,7 @@ from collaborator.policycaps import (
     granted_capabilities,
     leash_cap,
     mint,
+    sign,
     verify,
     workspace_subject,
 )
@@ -75,6 +76,20 @@ class SignVerify(unittest.TestCase):
                  "admin", "/ws", CAPS_KEY)
         # a normal grant is unaffected
         self.assertTrue(verify(mint(("fs.write:project",), {}, "admin", "/ws", CAPS_KEY), CAPS_KEY, "/ws"))
+
+    def test_granted_capabilities_strips_offense_from_a_hand_built_foreign_grant(self):
+        # mint() is only ONE construction path (external-panel grok/gpt): a VALID signed grant built
+        # directly (bypassing mint) could carry an offense: cap. The read path strips it too, so the
+        # prohibited namespace never rides into the seam — a legit cap alongside is unaffected.
+        with tempfile.TemporaryDirectory() as tmp:
+            subj = workspace_subject(tmp)
+            caps = PolicyCaps(("offense:evil.com", "fs.read:project"), (), "admin", subj)
+            foreign = SignedPolicyCaps(caps, sign(caps, CAPS_KEY))   # a genuinely-valid signature
+            self.assertTrue(verify(foreign, CAPS_KEY, subj))         # it DOES verify (built with the key)...
+            s = Session(workspace=tmp, policy_caps=foreign, caps_key=CAPS_KEY)
+            got = granted_capabilities(s)
+            self.assertNotIn("offense:evil.com", got)                # ...yet offense: never rides
+            self.assertIn("fs.read:project", got)
 
 
 class NoWiden(unittest.TestCase):

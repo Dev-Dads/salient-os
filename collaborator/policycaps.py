@@ -155,10 +155,16 @@ def granted_capabilities(session) -> tuple:
     authoritative — the mutable ``session.capabilities`` cannot widen them, and a grant that
     is absent-when-required or invalid -> () (fail closed). Not enforced (constructed with
     no grant) -> legacy ``session.capabilities``."""
+    # ADR 0004: the prohibited namespace never rides into the seam, even from a grant hand-built
+    # OUTSIDE mint() (mint's reject is only one construction path — external-panel grok/gpt). Filter
+    # both the legacy and the signed read paths; core's issue_policy strip + grants_capability refusal
+    # are the load-bearing belts regardless, so an offense: cap is authorized by NONE of the three.
     if not _enforced(session):
-        return tuple(getattr(session, "capabilities", ()))
+        return tuple(c for c in getattr(session, "capabilities", ()) if not is_ungrantable_capability(c))
     grant = _valid_grant(session)
-    return tuple(grant.caps.capabilities) if grant is not None else ()
+    if grant is None:
+        return ()
+    return tuple(c for c in grant.caps.capabilities if not is_ungrantable_capability(c))
 
 
 def leash_cap(session, tool_name: str):

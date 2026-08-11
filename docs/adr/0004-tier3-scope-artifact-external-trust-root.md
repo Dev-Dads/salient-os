@@ -62,9 +62,15 @@ invariant:
 - **`issue_policy` (`policy.py:66`)** — strip any reserved-namespace capability from
   `granted_capabilities` before signing, so a prohibited cap never even rides in a signed envelope
   (defense in depth + a clean audit trail; `grants_capability` refuses it regardless).
-- **`collaborator/policycaps.py mint`** — reject a reserved-namespace capability at mint time (fail
-  LOUD, like the leash-cap validation): the operator cannot even construct a grant that names the
-  prohibited class. The collaborator-side belt closest to where the operator writes authority.
+- **`collaborator/policycaps.py`** — `mint` rejects a reserved-namespace capability (fail LOUD, like
+  the leash-cap validation) so the ordinary authoring path cannot produce such a grant; and
+  `granted_capabilities` STRIPS the namespace on the read path, so even a grant hand-built OUTSIDE
+  `mint` (a valid signature over offense caps — the operator holds the HMAC key) never rides its
+  offense caps into the seam (external-panel grok/gpt: `mint` is only one construction path). Belts —
+  the load-bearing guarantee is core's `grants_capability` refusal, which holds regardless.
+
+The check is Unicode-normalized (NFKC + casefold) so a confusable — a full-width `ｏｆｆｅｎｓｅ：` or a
+case variant `OFFENSE:` — cannot slip a variant past the reservation (external-panel gemini).
 
 No existing capability (`fs.*`, `shell.exec`, `net.get:`, `net.post:`, `net.post.auto:`,
 `shell.raw_network`, `shell.contained_autonomy`) uses the `offense:` prefix, so nothing in the system
