@@ -49,6 +49,7 @@ class Session:
         emission_quota=None,
         provenance_store=None,
         emission_quota_store=None,
+        maint_fetch_max_bytes=None,
     ) -> None:
         self.workspace = Path(workspace)
         # F-6 Harm A: the workspace must be DISJOINT from the Collaborator's own code root
@@ -144,6 +145,20 @@ class Session:
         # (which hosts may be emitted-to) lives in the SIGNED caps — this map only supplies the
         # secret for a host already authorized. Default empty = no credential injected.
         self.egress_credentials = dict(egress_credentials or {})
+        # ADR 0006 — the MAINTENANCE artifact ceiling (host config, never model-chosen). Bounds how many
+        # bytes a single maint_fetch may stream into the workspace. None -> the module default (100 MiB).
+        # Fail LOUD at construction on a malformed value (like proactivity / emission_quota), so a typo
+        # can't silently disable the cap; a maint_fetch can never widen it (the seam threads this value,
+        # the model's args never carry it).
+        if maint_fetch_max_bytes is None:
+            from collaborator.egress import DEFAULT_MAINT_MAX_BYTES
+            self.maint_fetch_max_bytes = DEFAULT_MAINT_MAX_BYTES
+        elif isinstance(maint_fetch_max_bytes, bool) or not isinstance(maint_fetch_max_bytes, int):
+            raise ValueError("maint_fetch_max_bytes must be None or a positive int")
+        elif maint_fetch_max_bytes <= 0:
+            raise ValueError("maint_fetch_max_bytes must be a positive int (bytes)")
+        else:
+            self.maint_fetch_max_bytes = maint_fetch_max_bytes
         # ADR 0003 residual sweep — per-DESTINATION emission quota (host config, never model-chosen). The
         # egress caps + byte/time caps bound WHICH host + HOW BIG each emission is, but nothing bounded HOW
         # MANY: once a `net.post:<host>` (or an autonomous net.post.auto:<host>) grant is in hand, a session

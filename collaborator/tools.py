@@ -32,6 +32,7 @@ import os
 import re
 import shlex
 import sys
+import tempfile
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -136,6 +137,17 @@ _TOOLS: dict[str, Tool] = {
     "net_post": Tool("net_post", "net.post:__derived__", True, "net.post",
                      Stakes.NORMAL, PROPOSE_FIRST, verify_mode="egress_log", egress=True,
                      egress_method="POST"),
+    # ADR 0006: mediated MAINTENANCE artifact fetch — a human-gated GET that STREAMS a non-vendorable
+    # artifact (proprietary driver, licensed binary) to a workspace-fenced file. Authority is the DERIVED
+    # capability net.maint:<canonical-host>, a SEPARATE namespace from net.get/net.post (a read or emit
+    # grant never confers a maintenance fetch). NOT mutating in the emission sense — it does not act on the
+    # world beyond a bounded GET and the local write is workspace-fenced — so it never rides the
+    # net.post.auto autonomous-emission path. verify_mode "egress_log" (a channel-integrity record). Default
+    # leash PROPOSE_FIRST with NO auto-lift: every maintenance fetch takes a human hand. Same un-grantable
+    # sentinel static capability as web_fetch/net_post (a dropped egress=True fails closed, never a wildcard).
+    "maint_fetch": Tool("maint_fetch", "net.maint:__derived__", False, "net.maint",
+                        Stakes.NORMAL, PROPOSE_FIRST, verify_mode="egress_log", egress=True,
+                        egress_method="MAINT"),
 }
 
 
@@ -174,7 +186,7 @@ def flag_offense_shape(name: str, args: dict) -> str:
 # from one frozenset removes the two-hand-maintained-list drift that would otherwise be a silent
 # fail-open (a tool that gains a seal branch but is missing from the approve-time check would have a
 # seal MINTED but NEVER verified). Same lesson as codefence's `_code_slots()` single source (PR #35).
-SEALED_TOOLS = frozenset({"run_command", "write_file"})
+SEALED_TOOLS = frozenset({"run_command", "write_file", "maint_fetch"})
 
 
 def held_action_seal(tool_name: str, args: dict) -> str:
@@ -185,7 +197,9 @@ def held_action_seal(tool_name: str, args: dict) -> str:
     write_file's artifact verifier do NOT catch arg substitution (both re-derive from the SAME
     mutated args), so this seal — over a FROZEN payload (see ``freeze_args``) — is the actual
     approved==executed binding for these tools, not mere DiD. Returns "" for any tool not in
-    ``SEALED_TOOLS`` (read_file; the egress tools, which seal via ``emission_seal`` instead).
+    ``SEALED_TOOLS`` (read_file; net_post, which seals its url+body via ``emission_seal`` instead).
+    ``maint_fetch`` IS sealed here (over url+dest): it is an egress tool but has no emission BODY, so the
+    ``emission_seal`` path does not apply — its consequential identity is (url, dest).
 
     Framing mirrors ``emission_seal``: every field is LENGTH-PREFIXED (8-byte big-endian) so the
     encoding is injective — no boundary shift can move bytes between fields and collide two distinct
@@ -204,10 +218,14 @@ def held_action_seal(tool_name: str, args: dict) -> str:
             parts = [b"S", cmd.encode("utf-8", "surrogatepass")]
         else:
             parts = [b"N"]  # None / other -> the executor refuses; seal a stable non-empty marker
-    else:  # write_file — the only other member of SEALED_TOOLS
+    elif tool_name == "write_file":
         parts = [b"W",
                  str(args.get("path") or "").encode("utf-8", "surrogatepass"),
                  str(args.get("content") or "").encode("utf-8", "surrogatepass")]
+    else:  # maint_fetch — the held approval is bound to the EXACT (url, dest); a post-approval swap of
+        parts = [b"M",  # either is refused, exactly as run_command's command / write_file's path+content.
+                 str(args.get("url") or "").encode("utf-8", "surrogatepass"),
+                 str(args.get("dest") or "").encode("utf-8", "surrogatepass")]
     h = hashlib.sha256()
     # Bind the TOOL IDENTITY into the seal as its first field (external panel / grok), so a
     # Decision.tool rebind cannot replay one tool's sealed args as a different tool's action.
@@ -240,7 +258,10 @@ def freeze_args(args: dict) -> dict:
     # UNCONDITIONALLY (str() on an exact str returns the same object, so it's free), EXACTLY as
     # _exec_write will (str(x or "")), so the frozen value both seals and writes identically and no
     # in-window mutation (including a subclass __str__ re-evaluated later) can reach the disk.
-    for key in ("path", "content"):
+    # Also coerce maint_fetch's url/dest (ADR 0006) — both str, sealed and executed as str(x or "") —
+    # so a str-subclass with a drifting __str__ cannot seal one value and stage another. Harmless for
+    # tools without these keys (str() on an absent key is skipped).
+    for key in ("path", "content", "url", "dest"):
         if key in frozen:
             frozen[key] = str(frozen[key] or "")
     return frozen
@@ -523,6 +544,69 @@ def _exec_web_fetch(workspace, args: dict) -> Execution:
     )
 
 
+def _unlink_quiet(path) -> None:
+    """Best-effort delete of a partial/oversized artifact — fail closed never leaves staged bytes."""
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _exec_maint_fetch(workspace, args: dict, *, max_bytes: int = egress.DEFAULT_MAINT_MAX_BYTES) -> Execution:
+    """ADR 0006: a mediated, safety-contracted MAINTENANCE fetch — STREAM a non-vendorable artifact to a
+    workspace-fenced file. Authority (net.maint:<host>) is checked in the governance gate; here we perform
+    the GET through the single mediated client's streaming path and stage the bytes on disk. Fail closed:
+    an ineligible URL / unsafe IP / redirect / non-2xx / OVER-CAP is a non-ok record AND the partial file
+    is DELETED, so an oversized or truncated artifact never masquerades as a complete one. The bytes are
+    NOT surfaced to the model (only host, size, sha256 — in the record). ``max_bytes`` is a HOST value the
+    seam threads; the model can never reach it through ``args``.
+
+    ADR 0003 #1b: the fetch runs inside an INDEPENDENT egress-observation window, like the other egress
+    executors — the kernel's own account reconciled against the record (no-op where no vantage exists).
+
+    ATOMIC STAGING (maintfetch code panel, grok F5 / reproduced on Sparky): stream to a fresh mkstemp
+    temp file in the fenced parent, then os.replace() onto dest. We NEVER open dest itself for writing, so
+    a symlink AT dest — pre-planted (resolve_in_workspace already catches those) OR raced into place after
+    the fence check — is REPLACED, never written THROUGH (open(dest,'wb') would follow it out of the
+    fence; os.replace of the NAME does not). Dest is either the complete artifact or untouched — no partial
+    ever appears at dest. Residual (documented, shared with write_file): an INTERMEDIATE directory
+    component raced to a symlink still needs openat2(RESOLVE_NO_SYMLINKS); out of v0 scope, and the
+    workspace is human-gated + disjoint-from-code."""
+    url = str(args.get("url") or "")
+    rel = str(args.get("dest") or "")
+    target = resolve_in_workspace(workspace, rel)  # raises WorkspaceError -> denied upstream (fenced dest)
+    parent = os.path.dirname(str(target)) or str(workspace)
+    _before = _observe_begin()
+    tmp = None
+    try:
+        os.makedirs(parent, exist_ok=True)         # parent is the RESOLVED, fenced directory
+        fd, tmp = tempfile.mkstemp(dir=parent, prefix=".maintfetch-")  # fresh O_EXCL file, NOT dest's symlink
+        with os.fdopen(fd, "wb") as sink:
+            result = egress.fetch_to_file(url, sink, max_bytes=max_bytes)
+    except OSError as exc:  # mkdir/mkstemp/write failure -> fail closed, never raise out of the executor
+        if tmp is not None:
+            _unlink_quiet(tmp)
+        rec = egress._refused(egress.canonical_host(url) or "", "", 0,
+                              f"stage failed: {type(exc).__name__}").record   # _refused returns an EgressResult
+        return Execution(result=ToolResult(ok=False, error=rec.error), egress=rec,
+                         egress_obs=_observe_end(_before, _egress_claimed(rec)))
+    rec = result.record
+    obs = _observe_end(_before, _egress_claimed(rec))
+    if not rec.ok:
+        _unlink_quiet(tmp)      # ineligible/unsafe/redirect/non-2xx/over-cap -> discard temp; DEST UNTOUCHED
+        return Execution(result=ToolResult(ok=False, error=rec.error), egress=rec, egress_obs=obs)
+    try:
+        os.replace(tmp, target)   # atomic publish; replaces (never follows) a symlink/file already at dest
+    except OSError as exc:        # e.g. dest is a directory -> clean fail, temp discarded, dest untouched
+        _unlink_quiet(tmp)
+        rec = egress._refused(rec.canonical_dest, "", 0, f"publish failed: {type(exc).__name__}").record
+        return Execution(result=ToolResult(ok=False, error=rec.error), egress=rec, egress_obs=obs)
+    output = (f"[{rec.status}] fetched {rec.canonical_dest} -> {rel} "
+              f"({rec.response_len}b, sha256={(rec.response_hash or '')[:16]}…)")
+    return Execution(result=ToolResult(ok=True, output=output), egress=rec, egress_obs=obs,
+                     write_set=(rel,), artifact_hashes={rel: rec.response_hash})
+
+
 def _redact_credential(text: str, auth: "str | None") -> str:
     """Scrub a host-injected credential — and its bare, scheme-stripped token — out of emission
     OUTPUT. The outbound side never logs the credential, but a granted-but-hostile or debug endpoint
@@ -577,12 +661,13 @@ def _exec_net_post(workspace, args: dict, *, keep_preview: bool = False,
 
 _EXECUTORS = {"write_file": _exec_write, "read_file": _exec_read,
               "run_command": _exec_command, "web_fetch": _exec_web_fetch,
-              "net_post": _exec_net_post}
+              "net_post": _exec_net_post, "maint_fetch": _exec_maint_fetch}
 
 
 def execute_tool(tool: Tool, workspace, args: dict, *, egress_preview: bool = False,
                  egress_auth: "str | None" = None, require_isolation: bool = False,
-                 require_code_protection: bool = False) -> Execution:
+                 require_code_protection: bool = False,
+                 maint_max_bytes: int = egress.DEFAULT_MAINT_MAX_BYTES) -> Execution:
     """Run a resolved tool. Raises WorkspaceError on an escaping path (the caller turns that into
     a DENY); other failures come back as ``ok=False`` results. ``egress_preview``/``egress_auth``
     are host-side values the governance seam threads for net_post ONLY (the audit-preview flag and
@@ -590,10 +675,14 @@ def execute_tool(tool: Tool, workspace, args: dict, *, egress_preview: bool = Fa
     them through ``args``. ``require_isolation``/``require_code_protection`` are threaded to run_command
     ONLY: when True the shell REFUSES to run unless verified netns isolation (ADR 0003 #1a) resp. verified
     bwrap containment of the code roots (ADR 0003 revisit #1 / F-6) is achieved — so an autonomous shell
-    can never egress raw nor run with its own code writable (bound to the executor's REAL result)."""
+    can never egress raw nor run with its own code writable (bound to the executor's REAL result).
+    ``maint_max_bytes`` is the host artifact ceiling threaded to maint_fetch ONLY (ADR 0006); the model
+    cannot reach it through ``args``, so it can never widen its own fetch ceiling."""
     if tool.name == "net_post":
         return _exec_net_post(workspace, args, keep_preview=egress_preview, auth=egress_auth)
     if tool.name == "run_command":
         return _exec_command(workspace, args, require_isolation=require_isolation,
                              require_code_protection=require_code_protection)
+    if tool.name == "maint_fetch":  # ADR 0006: max_bytes is a HOST value (seam-threaded), never model-reachable
+        return _exec_maint_fetch(workspace, args, max_bytes=maint_max_bytes)
     return _EXECUTORS[tool.name](workspace, args)
