@@ -694,11 +694,24 @@ def execute_and_verify(session, tool: Tool, directive, action_id: str, args: dic
         egress_preview = False
         if getattr(tool, "egress", False) and tool.mutating:
             emit_host = egress.canonical_host(str(args.get("url") or ""))
+            # ADR 0003 residual sweep — per-DESTINATION emission quota. The caps bound WHERE + HOW BIG an
+            # emission is, but nothing bounded HOW MANY; this is the single dispatch point BOTH the
+            # autonomous and the human-approved path reach, so check + consume here. Fail closed: an
+            # emission over quota does NOT go out (the bytes never leave). getattr-guarded like
+            # egress_credentials so a lightweight/legacy session simply has no quota (unchanged behaviour).
+            _allowed = getattr(session, "emission_allowed", None)
+            if callable(_allowed) and not _allowed(emit_host):
+                return Decision(action_id, tool.name, DENIED,
+                                f"per-destination emission quota exhausted for {emit_host}", leash,
+                                directive=directive, args=args)
             creds = getattr(session, "egress_credentials", None) or {}
             egress_auth = creds.get(emit_host) if emit_host is not None else None
             # A HAND-approved emission keeps a bounded preview; an autonomous one is body-free. Keyed
             # on the FACT of human approval, not the leash string, so a cap can't drop it (F3).
             egress_preview = human_gated
+            _consume = getattr(session, "consume_emission", None)
+            if callable(_consume):
+                _consume(emit_host)   # count one attempt right before the bytes leave
         try:
             execution = execute_tool(tool, session.workspace, args,
                                      egress_preview=egress_preview, egress_auth=egress_auth)
