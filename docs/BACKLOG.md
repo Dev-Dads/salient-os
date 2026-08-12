@@ -7,9 +7,16 @@ build → external-panel → merge → heartbeat loop; they are not listed here.
 
 ---
 
-## 1. Tier-3 authorized-offense UNLOCK — needs a real second trust domain (or an explicit override)
+## 1. Tier-3 authorized-offense UNLOCK — ✅ RESOLVED 2026-08-12: offense is OUT OF SCOPE for the OS → stays LOCKED (option D)
 
-**Ask:** "go for the tier 3 offense artifact."
+> **Operator decision (2026-08-12):** *"offensive capabilities is not on my list for the OS."* → Option
+> **(D)**: authorized offense is out of scope; Tier 3 stays **locked permanently by design**. This is
+> already the shipped state — the `offense:` structural lock (ADR 0004) IS the answer; no build follows.
+> Not "deferred pending a second trust domain" anymore — **closed**. Re-open only if the operator ever
+> reverses this scope call. The `offense:` un-grantable namespace stays as the permanent structural
+> guarantee. (History below retained for the record.)
+
+**Ask (historical):** "go for the tier 3 offense artifact."
 
 **Why it's here, not built.** The Tier-3 *unlock* (ADR 0003 revisit #3 — an out-of-band `offense:<target>`
 scope artifact) was already **design-paneled 4/4 SERIOUS_FLAWS** and **formally deferred by ADR 0004**.
@@ -52,7 +59,8 @@ re-certified it internally tonight and it is **sound** — four independent laye
   third-party reach, governed by the isolation arc.
 
 I recommend **(A)** if authorized offense is a real goal, else **(D)**. Either way, no offense executor
-gets built until a real second domain exists.
+gets built until a real second domain exists. **→ Resolved: (D). Offense out of scope; no unlock, no
+offense executor, ever, absent a scope reversal.**
 
 ---
 
@@ -68,9 +76,12 @@ design pass + your direction; not an overnight best-judgement build.
 
 ## 3. "Third agent" — separate maintenance trust domain (ADR 0002) — architectural, needs your steer
 
-The out-of-process separate trust domain that would let governance survive a compromised tool process
-(and would be the enabling root for item 1(A)). Big ADR-0002-scale work; needs your direction on the
-process/isolation model before any build.
+The out-of-process separate trust domain that would let governance survive a compromised tool process.
+Big ADR-0002-scale work; needs your direction on the process/isolation model before any build. **Note
+(2026-08-12):** its former secondary justification as the enabler for a Tier-3 offense unlock is now
+**moot** (item 1 resolved to out-of-scope). Its remaining rationale is purely the ADR 0002
+single-trust-domain limit (governance surviving a compromised tool process) — still legitimate, no
+longer offense-related, and lower urgency without the offense driver.
 
 ---
 
