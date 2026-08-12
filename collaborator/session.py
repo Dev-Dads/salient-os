@@ -47,6 +47,7 @@ class Session:
         proposal_pool=None,
         egress_credentials=None,
         emission_quota=None,
+        provenance_store=None,
     ) -> None:
         self.workspace = Path(workspace)
         # F-6 Harm A: the workspace must be DISJOINT from the Collaborator's own code root
@@ -169,23 +170,101 @@ class Session:
         # tracking is DEGRADED. Sticky for the session: once tracking has a gap, later workspace files
         # are suspect. Never authority — an advisory honesty signal only.
         self._autonomous_tracking_incomplete = False
+        # F2 follow-up — OPTIONAL cross-session DURABLE provenance store (host config, never model-chosen).
+        # Default None = session-lived in-memory only (unchanged behaviour). A path opts in: the manifest
+        # persists across sessions, HMAC-integrity-tagged under policy_key + workspace-subject-bound
+        # (collaborator/provenancestore.py). It MUST live OUTSIDE the workspace — a store the AGENT could
+        # write would let an autonomous drop launder away its own taint (the contained run writes only the
+        # workspace; the human maintenance run is the trusted hand) — enforced LOUD below. An UNTRUSTED
+        # store (bad HMAC / wrong subject / corrupt) loads EMPTY and marks tracking degraded (fail-honest).
+        self._provenance_store = None
+        if provenance_store is not None:
+            # Use the RESOLVED path for ALL I/O (external panel): validate-then-store must be the SAME
+            # location, or a symlink at `ws/prov -> /outside` passes the check yet os.replace drops a
+            # real file back at the in-workspace lexical path the agent can tamper.
+            self._provenance_store = self._assert_store_outside_workspace(provenance_store)
+            from collaborator import provenancestore
+            from collaborator.policycaps import workspace_subject
+            authored, incomplete, ok = provenancestore.load(
+                self._provenance_store, workspace_subject(self.workspace), self.policy_key)
+            self._autonomous_authored = authored
+            # An untrusted store (existed but could not be verified) -> degraded tracking, never a silent
+            # fake-clean and never a crash.
+            self._autonomous_tracking_incomplete = bool(incomplete) or (not ok)
+
+    def _assert_store_outside_workspace(self, store_path):
+        """Validate the store is OUTSIDE the workspace and return the RESOLVED path to use for all I/O.
+
+        A store the AGENT could write would let an autonomous drop launder away its own taint (F2), so
+        refuse it LOUD (the workspace⟂code fail-loud stance). Reject a path inside the workspace by
+        EITHER resolved OR lexical containment (external panel): a symlink at ``ws/prov`` resolving
+        outside is still lexically in-workspace, and writing the lexical path (os.replace) would leave a
+        real, agent-tamperable file there. Require an ABSOLUTE path so there is no CWD-relative ambiguity
+        about which location was validated."""
+        import os as _os
+        raw = Path(store_path)
+        if not raw.is_absolute():
+            raise ValueError(f"provenance_store {store_path!r} must be an absolute path")
+        ws = self.workspace.resolve()
+        try:
+            resolved = raw.resolve()
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ValueError(f"provenance_store path {store_path!r} is unresolvable: {exc}") from exc
+        lexical = Path(_os.path.abspath(str(raw)))   # absolute + normalized, WITHOUT following symlinks
+        for candidate, how in ((resolved, "resolves"), (lexical, "is lexically")):
+            if candidate == ws or ws in candidate.parents:
+                raise ValueError(
+                    f"provenance_store {store_path!r} {how} inside the workspace — a store the agent "
+                    "could write would let an autonomous drop launder away its own taint (F2)")
+        return resolved
+
+    def _persist_provenance(self) -> None:
+        """Best-effort durable write (no-op when no store is configured). Total — a persistence failure
+        degrades durability, never correctness (the in-memory manifest stays authoritative). A FAILED
+        save is surfaced HONESTLY (external panel): mark tracking degraded for this session so a stale
+        durable record is never later trusted as complete without a signal."""
+        if self._provenance_store is None:
+            return
+        from collaborator import provenancestore
+        from collaborator.policycaps import workspace_subject
+        ok = provenancestore.save(self._provenance_store, workspace_subject(self.workspace),
+                                  self.policy_key, self._autonomous_authored,
+                                  self._autonomous_tracking_incomplete)
+        if not ok:
+            self._autonomous_tracking_incomplete = True
+
+    def mark_tracking_incomplete(self) -> None:
+        """Set the HONEST degraded-tracking flag AND persist it (so a future session also knows tracking
+        had a gap). Called by the seam when an autonomous run's write-set could not be observed."""
+        self._autonomous_tracking_incomplete = True
+        self._persist_provenance()
 
     def note_autonomous_authorship(self, rel_paths) -> None:
         """Record workspace files a NOT-human-approved (autonomous) action authored (F2). Paths are
         normalized to workspace-relative posix so they match snapshot_tree keys and the recognizer's
         candidates. Advisory provenance only — never authority. Total: a bad path is skipped, not raised."""
         from collaborator.provenance import norm_rel
+        changed = False
         for p in (rel_paths or ()):
             r = norm_rel(p)
-            if r:
+            if r and r not in self._autonomous_authored:
                 self._autonomous_authored.add(r)
+                changed = True
+        if changed:
+            self._persist_provenance()
 
     def clear_autonomous_authorship(self, rel_paths) -> None:
         """Drop the autonomy taint on paths a HUMAN-approved action just (re)authored — those bytes are
         now human-vetted, so a later run of them must not carry a stale ⚠ (the real failure this guards)."""
         from collaborator.provenance import norm_rel
+        changed = False
         for p in (rel_paths or ()):
-            self._autonomous_authored.discard(norm_rel(p))
+            r = norm_rel(p)
+            if r in self._autonomous_authored:
+                self._autonomous_authored.discard(r)
+                changed = True
+        if changed:
+            self._persist_provenance()
 
     @staticmethod
     def _validate_emission_quota(q):

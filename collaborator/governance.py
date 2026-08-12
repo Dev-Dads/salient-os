@@ -257,7 +257,16 @@ def _clear_autonomous_authorship(session, rel_paths) -> None:
 def _mark_tracking_incomplete(session) -> None:
     """HONEST fail-flag (external panel, F2): an autonomous run whose write-set we could NOT observe
     means we can't enumerate its drops — so surface DEGRADED tracking to the human rather than
-    fail-silent (under-record while implying full coverage). Best-effort + total."""
+    fail-silent (under-record while implying full coverage). Best-effort + total. Prefer the session
+    method (which also PERSISTS the flag to a durable store); fall back to a bare setattr for a
+    legacy/lightweight session."""
+    mark = getattr(session, "mark_tracking_incomplete", None)
+    if callable(mark):
+        try:
+            mark()
+            return
+        except Exception:  # noqa: BLE001
+            pass
     try:
         setattr(session, "_autonomous_tracking_incomplete", True)
     except Exception:  # noqa: BLE001
