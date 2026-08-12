@@ -48,6 +48,7 @@ class Session:
         egress_credentials=None,
         emission_quota=None,
         provenance_store=None,
+        emission_quota_store=None,
     ) -> None:
         self.workspace = Path(workspace)
         # F-6 Harm A: the workspace must be DISJOINT from the Collaborator's own code root
@@ -156,6 +157,23 @@ class Session:
         # count (a cross-session durable store is a documented follow-up, not needed to bound a runaway run).
         self.emission_quota = self._validate_emission_quota(emission_quota)
         self._emission_counts = {}
+        # OPTIONAL cross-session DURABLE emission-quota counter (host config, never model-chosen). Default
+        # None = session-lived (unchanged). A path opts in: the per-host emission count persists across
+        # sessions, so a restart cannot RESET the quota and refresh a drip channel's budget. Same
+        # out-of-workspace + HMAC-integrity model as the provenance store. FAIL-CLOSED direction: an
+        # UNTRUSTED store (bad MAC / wrong subject / corrupt) must NOT loosen a restrictive bound — a
+        # quota-limited host is then DENIED until the operator resolves it (a MISSING store is a fresh
+        # trusted start). See collaborator/emissionquotastore.py.
+        self._emission_store = None
+        self._emission_store_untrusted = False
+        if emission_quota_store is not None:
+            self._emission_store = self._assert_store_outside_workspace(emission_quota_store)
+            from collaborator import emissionquotastore
+            from collaborator.policycaps import workspace_subject
+            counts, ok = emissionquotastore.load(
+                self._emission_store, workspace_subject(self.workspace), self.policy_key)
+            self._emission_counts = counts
+            self._emission_store_untrusted = not ok
         # ADR 0003 residual sweep — F2 shared-workspace dropper. The workspace is SHARED rw between the
         # autonomy-earning CONTAINED run and the UNCONTAINED human maintenance run, so a NOT-human-approved
         # (autonomous) action can drop an executable file a human later approves and runs uncontained
@@ -317,10 +335,37 @@ class Session:
         limit = self._emission_limit(host)
         if limit is None:
             return True
+        # FAIL CLOSED (durable store): if a configured emission-quota store loaded UNTRUSTED, we cannot
+        # know the true accumulated count, so a quota-LIMITED host is DENIED rather than have a corrupt
+        # store silently refresh the budget. Recoverable — the operator resolves the store (a missing
+        # store is a fresh trusted start). Unlimited hosts are unaffected (handled above).
+        if self._emission_store_untrusted:
+            return False
         return self._emission_counts.get(host, 0) < limit
 
     def consume_emission(self, host) -> None:
         """Count one emission against `host`'s quota. Called at the dispatch point right before the bytes
-        leave, so it bounds ATTEMPTS (a retry of a failed emission still consumes quota)."""
+        leave, so it bounds ATTEMPTS (a retry of a failed emission still consumes quota). Persists the
+        counter when a durable emission-quota store is configured, so a restart cannot reset the budget."""
         if host is not None:
             self._emission_counts[host] = self._emission_counts.get(host, 0) + 1
+            self._persist_emission_counts()
+
+    def _persist_emission_counts(self) -> None:
+        """Durable write of the emission counter (no-op when no store is configured). Because this is a
+        RESTRICTIVE bound, persistence is FAIL-CLOSED, not merely best-effort (external panel):
+
+        - If the store is already UNTRUSTED, do NOT write — overwriting the corrupt store with a clean
+          low-count file would silently "self-heal" it to a near-fresh budget without operator action
+          (grok F2). The untrusted condition clears only when the operator resolves the store.
+        - If a save FAILS, trip the untrusted-deny (grok F1 / opus): a durable bound that cannot persist
+          must not silently degrade to session-lived (a restart would then reload a stale lower count and
+          refresh the budget). Denying limited hosts + signalling is the correct fail-closed direction."""
+        if self._emission_store is None or self._emission_store_untrusted:
+            return
+        from collaborator import emissionquotastore
+        from collaborator.policycaps import workspace_subject
+        ok = emissionquotastore.save(self._emission_store, workspace_subject(self.workspace),
+                                     self.policy_key, self._emission_counts)
+        if not ok:
+            self._emission_store_untrusted = True

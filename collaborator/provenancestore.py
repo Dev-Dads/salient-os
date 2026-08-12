@@ -32,13 +32,14 @@ file-lock for that mode is a documented follow-up. A save FAILURE is surfaced ho
 
 from __future__ import annotations
 
-import hashlib
 import hmac
 import json
-import os
 from pathlib import Path
 
+from collaborator import durablestate
+
 COLLABORATOR_PROVENANCESTORE_VERSION = 1
+_DOMAIN = b"salient-provenance-store-v1"   # store-kind domain separation (durablestate.mac)
 
 
 def _canonical(subject, authored, incomplete) -> bytes:
@@ -52,14 +53,7 @@ def _canonical(subject, authored, incomplete) -> bytes:
 
 
 def _mac(key, payload: bytes) -> str:
-    # KEY SEPARATION (external panel gpt): derive a DEDICATED store key from policy_key rather than
-    # HMAC'ing under policy_key directly, so a hypothetical signing oracle for policy_key elsewhere
-    # cannot produce a valid store MAC (and vice versa). Integrity STILL assumes policy_key is a host
-    # SECRET — with the shipped public DEFAULT key it degrades to corruption-detection, but the
-    # load-bearing property is the store's UNREACHABILITY by the agent (kept outside the workspace),
-    # not the MAC; the MAC is defense-in-depth + honest corruption/replay detection.
-    store_key = hmac.new(bytes(key), b"salient-provenance-store-v1", hashlib.sha256).digest()
-    return hmac.new(store_key, payload, hashlib.sha256).hexdigest()
+    return durablestate.mac(key, payload, _DOMAIN)
 
 
 def load(path, subject, key):
@@ -100,15 +94,11 @@ def save(path, subject, key, authored, incomplete) -> bool:
     for the running session, so a save failure degrades durability, not correctness)."""
     try:
         p = Path(path)
-        p.parent.mkdir(parents=True, exist_ok=True)
         authored_sorted = sorted(str(x) for x in (authored or ()))
         body = {"subject": str(subject), "authored": authored_sorted, "incomplete": bool(incomplete)}
         mac = _mac(key, _canonical(body["subject"], body["authored"], body["incomplete"]))
         doc = json.dumps({"v": COLLABORATOR_PROVENANCESTORE_VERSION, "body": body, "mac": mac},
                          separators=(",", ":"))
-        tmp = p.with_name(p.name + ".tmp")
-        tmp.write_text(doc, encoding="utf-8")
-        os.replace(str(tmp), str(p))                       # atomic-ish swap over the live store
-        return True
+        return durablestate.atomic_write(p, doc)           # atomic swap over the live store
     except Exception:  # noqa: BLE001
         return False
