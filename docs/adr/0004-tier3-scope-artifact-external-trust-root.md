@@ -1,8 +1,13 @@
 # ADR 0004 — Structural un-grantability of the prohibited capability namespace (Tier-3 stays locked)
 
-- **Status:** Proposed — 2026-08-11. Advances ADR 0003 revisit-trigger #4 (graduate structural
-  un-grantability into core). **Defers** revisit-trigger #3 (the Tier-3 authorized-offense unlock)
-  after a design panel showed it cannot be honestly delivered on a single node.
+- **Status:** Accepted (merged PR #41), 2026-08-11. Advances ADR 0003 revisit-trigger #4 (graduate
+  structural un-grantability into core). **Defers** revisit-trigger #3 (the Tier-3 authorized-offense
+  unlock) after a design panel showed it cannot be honestly delivered on a single node.
+- **UPDATE 2026-08-12 — the deferral is now a SCOPE decision, not a pending item.** The operator ruled
+  that *offensive capabilities are out of scope for the OS*. The Tier-3 unlock (revisit #3) is therefore
+  **not planned** — the structural lock below is the **permanent** posture, not a placeholder. The
+  scope-artifact design is retained for the record only; it does not get built absent an explicit scope
+  reversal. See `docs/BACKLOG.md` item 1 (resolved, option D).
 - **Scope:** Make the PROHIBITED CLASS of ADR 0003 — a capability naming a third party the operator
   cannot prove authority over ("offense") — **un-expressable by construction in `salienceos/`
   core**, so the prohibition is enforced by the core capability invariant (P-01's sibling), not by
@@ -118,7 +123,9 @@ now **by core construction**.
 
 ## Revisit triggers
 
-1. A real second trust domain becomes available (anchors the operator runtime cannot author) — build
-   the deferred scope-artifact unlock on that root, honoring the spec above.
+1. ~~A real second trust domain becomes available — build the deferred scope-artifact unlock.~~
+   **Superseded 2026-08-12:** offense is out of scope for the OS, so a second trust domain no longer
+   triggers an offense unlock. This trigger fires only if the operator first REVERSES that scope call;
+   until then the lock is permanent, not pending.
 2. The prohibited namespace needs to grow beyond `offense:` (a new class of un-grantable capability) —
    extend `RESERVED_UNGRANTABLE_PREFIXES`.
