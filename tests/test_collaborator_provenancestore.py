@@ -119,6 +119,7 @@ class SessionDurability(unittest.TestCase):
     def test_drop_persists_across_sessions(self):
         with tempfile.TemporaryDirectory() as root:
             ws, store = self._ws_and_store(root)
+            (Path(ws) / "build.sh").write_text("x")              # the dropped file exists (so not pruned)
             s1 = Session(workspace=ws, provenance_store=store)
             s1.note_autonomous_authorship(["build.sh"])
             # a brand-new session over the SAME workspace + store sees the prior drop
@@ -129,6 +130,7 @@ class SessionDurability(unittest.TestCase):
     def test_clear_persists_across_sessions(self):
         with tempfile.TemporaryDirectory() as root:
             ws, store = self._ws_and_store(root)
+            (Path(ws) / "build.sh").write_text("x")              # the dropped file exists (so not pruned)
             Session(workspace=ws, provenance_store=store).note_autonomous_authorship(["build.sh"])
             s2 = Session(workspace=ws, provenance_store=store)
             self.assertIn("build.sh", s2._autonomous_authored)
@@ -208,6 +210,62 @@ class SessionDurability(unittest.TestCase):
             with patch("collaborator.provenancestore.save", return_value=False):
                 s.note_autonomous_authorship(["build.sh"])
             self.assertTrue(s._autonomous_tracking_incomplete)
+
+
+class PruneStaleProvenance(unittest.TestCase):
+    """A durable manifest ACCUMULATES; a dropped-then-deleted file must be pruned at load so a human
+    creating a same-named file isn't FALSELY warned (noise-blinding) and the store doesn't grow forever.
+    Pruning only ever removes taints for ABSENT (un-runnable) files, so it never drops a live warning."""
+
+    def _ws_store(self, root):
+        ws = Path(root) / "ws"
+        ws.mkdir()
+        return ws, str(Path(root) / "prov.json")
+
+    def test_present_file_is_kept_across_sessions(self):
+        with tempfile.TemporaryDirectory() as root:
+            ws, store = self._ws_store(root)
+            (ws / "build.sh").write_text("#!/bin/sh\n")          # the dropped file EXISTS
+            Session(workspace=str(ws), provenance_store=store).note_autonomous_authorship(["build.sh"])
+            s = Session(workspace=str(ws), provenance_store=store)
+            self.assertIn("build.sh", s._autonomous_authored)     # present -> kept
+
+    def test_deleted_file_is_pruned_at_load_and_repersisted(self):
+        with tempfile.TemporaryDirectory() as root:
+            ws, store = self._ws_store(root)
+            (ws / "build.sh").write_text("#!/bin/sh\n")
+            Session(workspace=str(ws), provenance_store=store).note_autonomous_authorship(["build.sh"])
+            (ws / "build.sh").unlink()                            # the file is deleted
+            s = Session(workspace=str(ws), provenance_store=store)
+            self.assertNotIn("build.sh", s._autonomous_authored)  # absent -> pruned
+            # re-persisted, so a later session also doesn't carry the stale taint
+            self.assertNotIn("build.sh",
+                             Session(workspace=str(ws), provenance_store=store)._autonomous_authored)
+
+    def test_prune_never_drops_a_live_warning(self):
+        # a human about to run an autonomous-dropped file that STILL exists is still warned
+        from collaborator import provenance
+        with tempfile.TemporaryDirectory() as root:
+            ws, store = self._ws_store(root)
+            (ws / "evil.sh").write_text("payload\n")
+            Session(workspace=str(ws), provenance_store=store).note_autonomous_authorship(["evil.sh"])
+            s = Session(workspace=str(ws), provenance_store=store)
+            self.assertEqual(
+                provenance.references_autonomous_file("sh ./evil.sh", s._autonomous_authored, str(ws)),
+                "evil.sh")
+
+    def test_a_present_directory_entry_is_kept_even_if_broken_symlink(self):
+        # External panel (grok): prune must key on the DIRECTORY ENTRY (lstat), not exists() — a present
+        # entry (even a broken symlink) is NOT laundered away. Only a definitive absence prunes.
+        with tempfile.TemporaryDirectory() as root:
+            ws, store = self._ws_store(root)
+            try:
+                os.symlink(str(ws / "nonexistent-target"), str(ws / "link.sh"))  # a broken symlink ENTRY
+            except (OSError, NotImplementedError, AttributeError) as exc:
+                self.skipTest(f"symlinks unavailable here: {exc}")
+            Session(workspace=str(ws), provenance_store=store).note_autonomous_authorship(["link.sh"])
+            s = Session(workspace=str(ws), provenance_store=store)
+            self.assertIn("link.sh", s._autonomous_authored)     # entry present -> kept, not pruned
 
 
 if __name__ == "__main__":

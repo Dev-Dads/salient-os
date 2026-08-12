@@ -209,6 +209,36 @@ class Session:
             # An untrusted store (existed but could not be verified) -> degraded tracking, never a silent
             # fake-clean and never a crash.
             self._autonomous_tracking_incomplete = bool(incomplete) or (not ok)
+            # PRUNE stale entries: a durable manifest ACCUMULATES across sessions, so a file an autonomous
+            # run dropped and that was later DELETED lingers — and a human who later creates a same-named
+            # file would get a FALSE ⚠ (the noise-blinding the advisory control must avoid), plus unbounded
+            # growth. Drop any recorded path whose workspace file no longer exists; if it reappears via an
+            # autonomous action it is simply re-recorded. Only removes taints for un-runnable (absent)
+            # files, so it can never drop a live warning. Re-persist if anything was pruned.
+            self._prune_stale_provenance()
+
+    def _prune_stale_provenance(self) -> None:
+        """Drop recorded autonomy-authored paths whose workspace file no longer exists (see the call
+        site). Prune ONLY on a DEFINITIVE "no directory entry here" (`os.lstat` -> FileNotFoundError /
+        NotADirectoryError). KEEP on anything else — an existing entry (including a broken symlink), a
+        permission/other stat error (EACCES/ELOOP/…), or a pathological path string. External panel
+        (grok): `Path.exists()` conflates "absent" with "un-stattable", so an autonomous `chmod 000` of a
+        parent dir could make a STILL-PRESENT file look absent and get its taint pruned + re-persisted (a
+        laundering step). lstat + only-ENOENT/ENOTDIR-is-absent closes that and stays TOTAL (never raises
+        out of Session.__init__, never drops a live warning)."""
+        import os as _os
+        stale = []
+        for rel in tuple(self._autonomous_authored):
+            try:
+                _os.lstat(str(self.workspace / rel))
+            except (FileNotFoundError, NotADirectoryError):
+                stale.append(rel)          # a real "not there" -> absent, un-runnable -> prune
+            except Exception:  # noqa: BLE001 — EACCES / ELOOP / bad path / any error -> KEEP (never
+                continue                   # launder a present-but-unstattable file, never raise)
+        if stale:
+            for rel in stale:
+                self._autonomous_authored.discard(rel)
+            self._persist_provenance()
 
     def _assert_store_outside_workspace(self, store_path):
         """Validate the store is OUTSIDE the workspace and return the RESOLVED path to use for all I/O.
