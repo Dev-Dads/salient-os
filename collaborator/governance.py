@@ -32,9 +32,9 @@ from salienceos.consumers import consume
 from salienceos.control import govern, stakes_for
 from salienceos.interpreter import Facet, SalienceSignal, interpret, issue_policy
 from salienceos.verifier import issue_envelope, issue_receipt
-from salienceos.verifier.observers import observe_action, snapshot_tree
+from salienceos.verifier.observers import observe_action, observed_write_set, snapshot_tree
 
-from collaborator import egress
+from collaborator import egress, provenance
 from collaborator.codefence import code_protection_available, names_code_root
 from collaborator.sensitivepaths import names_sensitive_path
 from collaborator.contained import SHELL_CONTAINED_AUTONOMY_CAP
@@ -144,6 +144,11 @@ class Decision:
     # (SSH/cloud/OS creds) — POROUS, never a deny. Unlike code_touch there is NO structural boundary
     # here (the operator keeps full FS reach for an approved shell; see sensitivepaths).
     secret_touch: str = ""
+    # ADR 0003 residual sweep (F2 dropper) audit-only tag: the run_command's argv references a workspace
+    # file an AUTONOMOUS (not-human-approved) action authored — surfaced so the human holding the hand
+    # sees the provenance BEFORE approving an uncontained run of un-reviewed bytes. POROUS, never a deny
+    # (the human keeps full reach by design; see collaborator/provenance.py).
+    provenance_touch: str = ""
     # ADR 0003 Tier 2 (panel: approved != sent): a seal over a HELD EMISSION's consequential
     # payload (canonical dest + request target + content-type + body), captured at hold time. An
     # emission has no verifier, so approval re-checks this seal and REFUSES if the held args were
@@ -169,6 +174,8 @@ class Decision:
             tail += f"  ⚑ code-touch audit: {self.code_touch}"
         if self.secret_touch:  # PR 1a Harm B — audit-only tag (never a deny)
             tail += f"  ⚑ secret-touch audit: {self.secret_touch}"
+        if self.provenance_touch:  # F2 dropper — audit-only tag (never a deny)
+            tail += f"  ⚠ autonomy-authored file referenced (not reviewed by you): {self.provenance_touch}"
         if self.egress_reconciled is False:  # ADR 0003 #1b — an OBSERVED discrepancy (never a deny; evidence)
             tail += f"  ⚠ EGRESS DISCREPANCY (independently observed): {self.egress_discrepancy}"
         elif self.egress_reconciled is True:
@@ -210,6 +217,41 @@ def _subject(session) -> str:
         return workspace_subject(getattr(session, "workspace", ""))
     except Exception:  # noqa: BLE001 — can't establish subject -> no binding
         return ""
+
+
+def _references_autonomous(session, command) -> str:
+    """POROUS F2 recognizer: does ``command`` reference a workspace file an autonomous action authored?
+    getattr-guarded (a legacy/lightweight session with no manifest simply returns ""), total — a
+    provenance recognizer must never break govern_action/approve (mirrors names_code_root's stance)."""
+    authored = getattr(session, "_autonomous_authored", None)
+    if not authored:
+        return ""
+    try:
+        return provenance.references_autonomous_file(
+            command, authored, getattr(session, "workspace", None))
+    except Exception:  # noqa: BLE001 — advisory only; any failure fails closed to "no tag"
+        return ""
+
+
+def _record_autonomous_authorship(session, rel_paths) -> None:
+    """Best-effort: record the workspace files an autonomous run authored (F2). getattr-guarded +
+    total — recording is audit, never allowed to break the action that just ran."""
+    note = getattr(session, "note_autonomous_authorship", None)
+    if callable(note) and rel_paths:
+        try:
+            note(rel_paths)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _clear_autonomous_authorship(session, rel_paths) -> None:
+    """Best-effort: a HUMAN-approved (re-)write vets those bytes, so drop any stale autonomy taint."""
+    clear = getattr(session, "clear_autonomous_authorship", None)
+    if callable(clear) and rel_paths:
+        try:
+            clear(rel_paths)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def _leash_for(session, tool: Tool) -> str:
@@ -550,10 +592,17 @@ def govern_action(session, intent: ToolIntent, importance: "float | None" = None
         # the reach is raw either way; the opt-in only governs whether it may AUTO-run.
         if not netns_available():
             preview["raw_network"] = True
+        # ADR 0003 residual sweep (F2 dropper): if this command references a workspace file an
+        # AUTONOMOUS run authored, surface it to the human BEFORE they approve an UNCONTAINED run of
+        # bytes they never reviewed. POROUS/advisory (never a deny) — the human keeps full reach.
+        _authored = _references_autonomous(session, args.get("command"))
+        if _authored:
+            preview["autonomous_authored"] = _authored
     reason = ("propose-first leash: awaiting approval" if leash == PROPOSE_FIRST
               else f"unrecognised leash {leash!r} -> held (fail-closed)")
     return Decision(action_id=action_id, tool=tool.name, status=HELD, reason=reason, leash=leash,
                     directive=directive, args=args, offense_flag=offense_flag,
+                    provenance_touch=(_authored if intent.name == "run_command" else ""),
                     seal=seal, preview=preview, origin_subject=_subject(session))
 
 
@@ -740,13 +789,26 @@ def execute_and_verify(session, tool: Tool, directive, action_id: str, args: dic
         offense_flag = flag_offense_shape(tool.name, args)  # audit-only tag, never a deny
         code_touch = names_code_root(args.get("command"))   # F-6 audit-only tag (porous), never a deny
         secret_touch = names_sensitive_path(args.get("command"))  # PR 1a audit-only (porous), never a deny
+        # F2 dropper — does this command reference an ALREADY-recorded autonomy-authored file? Computed
+        # from the manifest BEFORE this run so the tag never reflects a file THIS run is about to write.
+        provenance_touch = _references_autonomous(session, args.get("command"))
+        # F2 recording — snapshot the workspace ONLY for an AUTONOMOUS contained run (the dropper path).
+        # A human maintenance run is trusted + its writes aren't tracked; this is the deferred post-exec
+        # write-set tripwire (contained.py:31-38), now built for provenance. Best-effort: a snapshot
+        # failure just skips recording, never blocks the run.
+        _pre = None
+        if require_code_protection:
+            try:
+                _pre = snapshot_tree(session.workspace)
+            except Exception:  # noqa: BLE001
+                _pre = None
         try:
             execution = execute_tool(tool, session.workspace, args, require_isolation=require_isolation,
                                      require_code_protection=require_code_protection)
         except WorkspaceError as exc:
             return Decision(action_id, tool.name, DENIED, str(exc), leash, directive=directive,
                             args=args, offense_flag=offense_flag, code_touch=code_touch,
-                            secret_touch=secret_touch)
+                            secret_touch=secret_touch, provenance_touch=provenance_touch)
         except Exception as exc:  # noqa: BLE001 — a shell that can't even START (missing binary,
             # unbalanced quotes -> shlex ValueError, NUL in argv) must FAIL honestly, never raise out
             # of approve()/govern_action (which promise never to raise) and never burn the held
@@ -754,7 +816,21 @@ def execute_and_verify(session, tool: Tool, directive, action_id: str, args: dic
             return Decision(action_id, tool.name, FAILED, f"command error: {type(exc).__name__}",
                             leash, cleared=False, directive=directive, args=args,
                             offense_flag=offense_flag, code_touch=code_touch,
-                            secret_touch=secret_touch)
+                            secret_touch=secret_touch, provenance_touch=provenance_touch)
+        # Record what the autonomous run authored (new/changed workspace files) so a later HUMAN run of
+        # them carries the ⚠. Diff pre/post; skip pure deletions and directories (a human runs a FILE).
+        if _pre is not None:
+            try:
+                _post = snapshot_tree(session.workspace)
+                # Record new/changed FILES (skip pure deletions + directories); exclude the contained
+                # run's own in-fence HOME (`.sandbox-home/`, created by the executor) — those are sandbox
+                # internals (git config, caches), not a deliberate drop a human would run.
+                _authored_now = [p for p in observed_write_set(_pre, _post)
+                                 if _post.get(p) not in (None, "dir")
+                                 and p != ".sandbox-home" and not p.startswith(".sandbox-home/")]
+                _record_autonomous_authorship(session, _authored_now)
+            except Exception:  # noqa: BLE001
+                pass
         cleared = bool(execution.result.ok)
         if cleared:
             reason = "supervised exit 0"
@@ -769,7 +845,7 @@ def execute_and_verify(session, tool: Tool, directive, action_id: str, args: dic
                         args=args, offense_flag=offense_flag,
                         network_isolated=execution.network_isolated,
                         code_protected=execution.code_protected, code_touch=code_touch,
-                        secret_touch=secret_touch)
+                        secret_touch=secret_touch, provenance_touch=provenance_touch)
 
     # verify_mode == "artifact": build envelope BEFORE running, snapshot, execute
     # receipt from the REAL result, observe world independently, govern.
@@ -799,6 +875,15 @@ def execute_and_verify(session, tool: Tool, directive, action_id: str, args: dic
                         directive=directive, args=args)
 
     cleared = bool(outcome.cleared)
+    # F2 dropper — track write_file authorship. An AUTONOMOUS (not human-approved) verified write ADDS
+    # the path to the autonomy manifest (an autonomous write_file is a workspace dropper too,
+    # contained.py:36); a HUMAN-approved verified write CLEARS it (those bytes are now human-vetted).
+    # Only on a CLEARED write, so the recorded path is verifiably present. Other artifact ops untouched.
+    if cleared and getattr(tool, "op", "") == "file.write":
+        if human_gated:
+            _clear_autonomous_authorship(session, execution.write_set)
+        else:
+            _record_autonomous_authorship(session, execution.write_set)
     # Stage-4-live: consume the outcome through BOTH learning channels. For an
     # over-cap-risk (RISK_EXCEEDED) action the weight gate refuses to learn it
     # while the memory governor retains it as a non-decaying inhibitor — the
