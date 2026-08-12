@@ -163,6 +163,12 @@ class Session:
         # audit tag. ADVISORY provenance only, never authority (see collaborator/provenance.py) — the human
         # keeps full reach by design. Session-lived; a human-approved (re-)write of a path CLEARS its taint.
         self._autonomous_authored: set = set()
+        # HONEST fail-flag (external panel, F2): if an autonomous run's write-set could not be fully
+        # observed (a snapshot failure), we CANNOT enumerate what it dropped — so instead of silently
+        # under-recording (fail-open), we set this and the human run_command preview says provenance
+        # tracking is DEGRADED. Sticky for the session: once tracking has a gap, later workspace files
+        # are suspect. Never authority — an advisory honesty signal only.
+        self._autonomous_tracking_incomplete = False
 
     def note_autonomous_authorship(self, rel_paths) -> None:
         """Record workspace files a NOT-human-approved (autonomous) action authored (F2). Paths are

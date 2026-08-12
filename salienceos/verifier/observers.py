@@ -74,8 +74,19 @@ def snapshot_tree(root) -> dict:
             p = Path(dirpath) / name
             if p.is_symlink():
                 snap[_rel(root, p)] = "symlink:" + os.readlink(p)
-            else:
-                snap[_rel(root, p)] = sha256_bytes(p.read_bytes())
+                continue
+            # TOTAL per-file: a NON-REGULAR file (FIFO/socket/device) must NEVER be read — a FIFO
+            # with no writer blocks read_bytes() forever, which would HANG the whole govern loop, and
+            # a rw workspace lets an (autonomous) run drop one (`mkfifo`). Record a stable marker
+            # instead, and guard the read so an unreadable / vanished-mid-walk file yields a marker
+            # rather than aborting the whole snapshot (which would fail-open the write-set observation).
+            try:
+                if not p.is_file():          # not a regular file: never open it
+                    snap[_rel(root, p)] = "special"
+                else:
+                    snap[_rel(root, p)] = sha256_bytes(p.read_bytes())
+            except OSError:
+                snap[_rel(root, p)] = "unreadable"
     return snap
 
 

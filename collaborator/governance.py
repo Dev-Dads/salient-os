@@ -245,13 +245,23 @@ def _record_autonomous_authorship(session, rel_paths) -> None:
 
 
 def _clear_autonomous_authorship(session, rel_paths) -> None:
-    """Best-effort: a HUMAN-approved (re-)write vets those bytes, so drop any stale autonomy taint."""
+    """Best-effort: a HUMAN-approved (re-)write / run vets those bytes, so drop any stale autonomy taint."""
     clear = getattr(session, "clear_autonomous_authorship", None)
     if callable(clear) and rel_paths:
         try:
             clear(rel_paths)
         except Exception:  # noqa: BLE001
             pass
+
+
+def _mark_tracking_incomplete(session) -> None:
+    """HONEST fail-flag (external panel, F2): an autonomous run whose write-set we could NOT observe
+    means we can't enumerate its drops — so surface DEGRADED tracking to the human rather than
+    fail-silent (under-record while implying full coverage). Best-effort + total."""
+    try:
+        setattr(session, "_autonomous_tracking_incomplete", True)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _leash_for(session, tool: Tool) -> str:
@@ -598,6 +608,11 @@ def govern_action(session, intent: ToolIntent, importance: "float | None" = None
         _authored = _references_autonomous(session, args.get("command"))
         if _authored:
             preview["autonomous_authored"] = _authored
+        # HONEST degraded-tracking signal (external panel, F2): if some autonomous run's writes could
+        # not be observed, a MISSING autonomous_authored tag is NOT proof the file is human-authored —
+        # say so, so the human isn't falsely assured by the absence of a ⚠.
+        if getattr(session, "_autonomous_tracking_incomplete", False):
+            preview["provenance_tracking_incomplete"] = True
     reason = ("propose-first leash: awaiting approval" if leash == PROPOSE_FIRST
               else f"unrecognised leash {leash!r} -> held (fail-closed)")
     return Decision(action_id=action_id, tool=tool.name, status=HELD, reason=reason, leash=leash,
@@ -795,13 +810,16 @@ def execute_and_verify(session, tool: Tool, directive, action_id: str, args: dic
         # F2 recording — snapshot the workspace ONLY for an AUTONOMOUS contained run (the dropper path).
         # A human maintenance run is trusted + its writes aren't tracked; this is the deferred post-exec
         # write-set tripwire (contained.py:31-38), now built for provenance. Best-effort: a snapshot
-        # failure just skips recording, never blocks the run.
+        # failure NEVER blocks the run (an advisory tag must not gate a legitimate autonomous action),
+        # but it is surfaced HONESTLY (below) rather than silently under-recording.
         _pre = None
+        _snap_failed = False
         if require_code_protection:
             try:
                 _pre = snapshot_tree(session.workspace)
             except Exception:  # noqa: BLE001
                 _pre = None
+                _snap_failed = True
         try:
             execution = execute_tool(tool, session.workspace, args, require_isolation=require_isolation,
                                      require_code_protection=require_code_protection)
@@ -819,18 +837,26 @@ def execute_and_verify(session, tool: Tool, directive, action_id: str, args: dic
                             secret_touch=secret_touch, provenance_touch=provenance_touch)
         # Record what the autonomous run authored (new/changed workspace files) so a later HUMAN run of
         # them carries the ⚠. Diff pre/post; skip pure deletions and directories (a human runs a FILE).
-        if _pre is not None:
-            try:
-                _post = snapshot_tree(session.workspace)
-                # Record new/changed FILES (skip pure deletions + directories); exclude the contained
-                # run's own in-fence HOME (`.sandbox-home/`, created by the executor) — those are sandbox
-                # internals (git config, caches), not a deliberate drop a human would run.
-                _authored_now = [p for p in observed_write_set(_pre, _post)
-                                 if _post.get(p) not in (None, "dir")
-                                 and p != ".sandbox-home" and not p.startswith(".sandbox-home/")]
-                _record_autonomous_authorship(session, _authored_now)
-            except Exception:  # noqa: BLE001
-                pass
+        if require_code_protection:
+            if _pre is not None:
+                try:
+                    _post = snapshot_tree(session.workspace)
+                    # Record new/changed FILES (skip pure deletions + directories); exclude the contained
+                    # run's own in-fence HOME (`.sandbox-home/`, created by the executor) — those are
+                    # sandbox internals (git config, caches), not a deliberate drop a human would run.
+                    _authored_now = [p for p in observed_write_set(_pre, _post)
+                                     if _post.get(p) not in (None, "dir")
+                                     and p != ".sandbox-home" and not p.startswith(".sandbox-home/")]
+                    _record_autonomous_authorship(session, _authored_now)
+                except Exception:  # noqa: BLE001
+                    _snap_failed = True
+            if _snap_failed:
+                _mark_tracking_incomplete(session)   # fail-HONEST, never fail-silent (external panel)
+        # F2 clear — a HUMAN-approved run of an autonomy-authored file is a conscious accept of those
+        # EXACT bytes; drop their taint so an unchanged file does not nag on every future approval (a
+        # later autonomous re-write re-taints via the diff above). Keyed on human_gated, never the leash.
+        if human_gated and provenance_touch:
+            _clear_autonomous_authorship(session, provenance_touch.split(","))
         cleared = bool(execution.result.ok)
         if cleared:
             reason = "supervised exit 0"
@@ -875,14 +901,17 @@ def execute_and_verify(session, tool: Tool, directive, action_id: str, args: dic
                         directive=directive, args=args)
 
     cleared = bool(outcome.cleared)
-    # F2 dropper — track write_file authorship. An AUTONOMOUS (not human-approved) verified write ADDS
-    # the path to the autonomy manifest (an autonomous write_file is a workspace dropper too,
-    # contained.py:36); a HUMAN-approved verified write CLEARS it (those bytes are now human-vetted).
-    # Only on a CLEARED write, so the recorded path is verifiably present. Other artifact ops untouched.
-    if cleared and getattr(tool, "op", "") == "file.write":
+    # F2 dropper — track write_file authorship (an autonomous write_file is a workspace dropper too,
+    # contained.py:36). RECORD an AUTONOMOUS write whose child reached DISK (execution.result.ok) —
+    # NOT gated on full verification, since a partial / hash-divergent write still leaves runnable bytes
+    # on disk (external panel: gating record on `cleared` let a written-but-unverified drop slip). CLEAR
+    # only on a HUMAN-approved VERIFIED (cleared) write — the strict gate for "these bytes are now
+    # human-vetted". Other artifact ops untouched.
+    if getattr(tool, "op", "") == "file.write":
         if human_gated:
-            _clear_autonomous_authorship(session, execution.write_set)
-        else:
+            if cleared:
+                _clear_autonomous_authorship(session, execution.write_set)
+        elif execution.result.ok:
             _record_autonomous_authorship(session, execution.write_set)
     # Stage-4-live: consume the outcome through BOTH learning channels. For an
     # over-cap-risk (RISK_EXCEEDED) action the weight gate refuses to learn it

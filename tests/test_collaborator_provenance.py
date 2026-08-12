@@ -14,11 +14,15 @@ contained run_command recording; the human-approval clear; the HELD-preview surf
 denied); the human maintenance run is deliberately NOT tracked.
 """
 
+import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+
+from salienceos.verifier.observers import observed_write_set, snapshot_tree
 
 from collaborator import provenance
 from collaborator.contained import SHELL_CONTAINED_AUTONOMY_CAP
@@ -204,6 +208,88 @@ class ContainedRunTracking(unittest.TestCase):
             govern_action(s, ToolIntent("run_command", {"command": ["true"]}, "structured"))
             self.assertNotIn(".sandbox-home", s._autonomous_authored)
             self.assertEqual(s._autonomous_authored, {"dropped.sh"})
+
+
+class SnapshotRobustness(unittest.TestCase):
+    """External panel (5/5): snapshot_tree must not HANG or ABORT on a special / unreadable file — a
+    rw workspace lets an autonomous run drop a FIFO, and a blocking read would hang the govern loop."""
+
+    def test_regular_file_still_hashes(self):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "a.txt").write_text("hi")
+            snap = snapshot_tree(d)
+            self.assertNotIn(snap["a.txt"], ("special", "unreadable", "dir"))
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO requires os.mkfifo (POSIX)")
+    def test_fifo_is_marked_special_and_does_not_hang(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.mkfifo(str(Path(d) / "pipe"))       # a reader with no writer would block forever
+            t0 = time.time()
+            snap = snapshot_tree(d)                 # must return promptly, never read the FIFO
+            self.assertLess(time.time() - t0, 5.0)
+            self.assertEqual(snap["pipe"], "special")
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO requires os.mkfifo (POSIX)")
+    def test_dropped_fifo_is_recorded_via_diff_without_hanging(self):
+        with tempfile.TemporaryDirectory() as d:
+            pre = snapshot_tree(d)
+            os.mkfifo(str(Path(d) / "pipe"))
+            post = snapshot_tree(d)
+            self.assertIn("pipe", observed_write_set(pre, post))   # visible as a change, not a hang
+
+
+class _FakeOutcome:
+    def __init__(self, cleared):
+        self.cleared = cleared
+
+
+class RecordingHonesty(unittest.TestCase):
+    def test_autonomous_write_recorded_even_when_verification_does_not_clear(self):
+        # External panel (opus CRITICAL): a written-but-unverified drop still leaves runnable bytes on
+        # disk, so record on execution.result.ok (child reached disk), not only on full verification.
+        with tempfile.TemporaryDirectory() as tmp:
+            s = Session(workspace=tmp, capabilities=_CAPS)
+            with patch("collaborator.governance.govern", return_value=_FakeOutcome(False)):
+                d = govern_action(s, ToolIntent("write_file", {"path": "drop.sh", "content": "x"},
+                                                "structured"))
+            self.assertNotEqual(d.status, RAN)            # verification did NOT clear...
+            self.assertIn("drop.sh", s._autonomous_authored)   # ...but the on-disk drop is still tracked
+
+    def test_snapshot_failure_marks_tracking_incomplete_and_surfaces_it(self):
+        # External panel (5/5): a snapshot failure must NOT silently under-record — surface DEGRADED
+        # tracking so a missing ⚠ isn't read as "human-authored".
+        with tempfile.TemporaryDirectory() as tmp, _CODE_UP, \
+                patch("collaborator.governance.netns_available", return_value=True), \
+                patch("collaborator.tools.wrap_contained", side_effect=_contained_dropper("dropped.sh")), \
+                patch("collaborator.governance.snapshot_tree", side_effect=OSError("boom")):
+            s = _signed_autonomy(tmp)
+            d = govern_action(s, ToolIntent("run_command", {"command": ["true"]}, "structured"))
+            self.assertEqual(d.status, RAN)                        # the run is NEVER blocked by a snapshot fail
+            self.assertTrue(s._autonomous_tracking_incomplete)     # ...but the gap is recorded honestly
+        # and a later human run preview surfaces the degraded posture
+        held = govern_action(s, ToolIntent("run_command", {"command": "sh whatever.sh"}, "structured"))
+        self.assertTrue(held.preview.get("provenance_tracking_incomplete"))
+
+
+class ClearOnHumanRun(unittest.TestCase):
+    def test_human_approved_run_of_autonomous_file_clears_its_taint(self):
+        # External panel (3 vendors): a conscious human accept of the EXACT bytes (approving `sh f`)
+        # should drop the taint so an unchanged file does not nag on every future approval.
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch("collaborator.maintain.maintenance_available", return_value=False), \
+                patch("collaborator.tools.wrap_no_network", side_effect=_uncontained_dropper("noop.sh")):
+            s = Session(workspace=tmp, capabilities=_CAPS,
+                        leash_overrides={"run_command": PROPOSE_FIRST})
+            s.note_autonomous_authorship(["build.sh"])
+            held = govern_action(s, ToolIntent("run_command", {"command": "sh build.sh"}, "structured"))
+            self.assertEqual(held.status, HELD)
+            self.assertEqual(held.provenance_touch, "build.sh")     # flagged at the hand
+            ran = approve(s, held)                                  # the human consciously accepts it
+            self.assertEqual(ran.status, RAN)
+            self.assertNotIn("build.sh", s._autonomous_authored)    # taint cleared -> no future nag
+            # ...and a later reference is no longer flagged (until an autonomous re-write re-taints)
+            held2 = govern_action(s, ToolIntent("run_command", {"command": "sh build.sh"}, "structured"))
+            self.assertEqual(held2.provenance_touch, "")
 
 
 class HumanMaintenanceNotTracked(unittest.TestCase):
