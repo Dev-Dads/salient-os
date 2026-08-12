@@ -587,6 +587,8 @@ def govern_action(session, intent: ToolIntent, importance: "float | None" = None
                "verification_depth": directive.verification_depth}
     if getattr(tool, "egress", False):
         preview["canonical_dest"] = egress.canonical_host(str(args.get("url") or ""))
+        if tool.name == "maint_fetch":  # ADR 0006: the human also sees WHERE the artifact will be staged
+            preview["dest"] = str(args.get("dest") or "")
     if intent.name == "run_command":
         # Surface the honest posture to the human holding the hand (F-6). A HELD run_command, once
         # APPROVED, runs on the HUMAN path (human_gated) which is UNCONTAINED BY DESIGN — full filesystem
@@ -785,9 +787,14 @@ def execute_and_verify(session, tool: Tool, directive, action_id: str, args: dic
             _consume = getattr(session, "consume_emission", None)
             if callable(_consume):
                 _consume(emit_host)   # count one attempt right before the bytes leave
+        # ADR 0006: the maintenance artifact ceiling is a HOST value (session config), threaded here so a
+        # maint_fetch cannot widen its own cap through model args. getattr-guarded so a lightweight/legacy
+        # session (no such field) simply gets the module default (unchanged behaviour for other tools).
+        maint_max = getattr(session, "maint_fetch_max_bytes", None) or egress.DEFAULT_MAINT_MAX_BYTES
         try:
             execution = execute_tool(tool, session.workspace, args,
-                                     egress_preview=egress_preview, egress_auth=egress_auth)
+                                     egress_preview=egress_preview, egress_auth=egress_auth,
+                                     maint_max_bytes=maint_max)
         except Exception as exc:  # noqa: BLE001 — egress must degrade to FAILED, never raise out of
             # govern_action/approve (transport red-team S1 backstop: the mediated client's own input
             # guards are belt; this is suspenders around the whole egress execute, like the artifact branch).

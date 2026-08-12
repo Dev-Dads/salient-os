@@ -1,0 +1,344 @@
+diff --git a/collaborator/egress.py b/collaborator/egress.py
+index 924abd3..2450466 100644
+--- a/collaborator/egress.py
++++ b/collaborator/egress.py
+@@ -61,6 +61,15 @@ EGRESS_POST_CAP_PREFIX = "net.post:"
+ EGRESS_AUTO_PREFIX = "net.post.auto:"
+ MAX_POST_BODY = 65536           # 64 KiB — the outbound PAYLOAD ceiling (the real exfil surface)
+ DEFAULT_POST_CONTENT_TYPE = "application/json"
++# ADR 0006 — the MAINTENANCE artifact-fetch path. A human-gated GET that STREAMS a non-vendorable
++# artifact (proprietary driver, licensed binary) to a caller-owned sink under a large host-set ceiling,
++# authorized on its OWN capability namespace net.maint:<host> — a read grant (net.get:H) does NOT confer
++# a maintenance fetch, and an emit grant (net.post:H) does not either. Reuses this module's whole
++# transport contract; differs only in that the body is STREAMED (an artifact is MB-scale) and never
++# returned to the model.
++EGRESS_MAINT_CAP_PREFIX = "net.maint:"
++DEFAULT_MAINT_MAX_BYTES = 100 * 1024 * 1024   # 100 MiB artifact ceiling (host-configurable)
++_MAINT_CHUNK = 65536            # streaming read granularity
+ _BODY_PREVIEW_BYTES = 512       # bounded body preview recorded ONLY for human-gated emissions
+ _USER_AGENT = "SalienceOS-Collaborator/0.1 (+egress-mediated)"
+ _HTTPS_PORT = 443
+@@ -143,6 +152,11 @@ def required_capability(url: str, method: str = "GET") -> "str | None":
+         return EGRESS_CAP_PREFIX + host
+     if m == "POST":                 # emission (separate namespace)
+         return EGRESS_POST_CAP_PREFIX + host
++    if m == "MAINT":                # ADR 0006 maintenance artifact fetch — its OWN namespace (a read or
++        return EGRESS_MAINT_CAP_PREFIX + host   # emit grant never confers it). The transport verb is a
++                                    # GET; "MAINT" here is the capability-KIND, not an HTTP method, and it
++                                    # is the SAME single derivation site as GET/POST so the hold-time and
++                                    # approve-time capability for a maint fetch cannot diverge.
+     return None                     # any other verb is not authorized here -> DENY (never the read cap)
+ 
+ 
+@@ -402,6 +416,96 @@ def fetch(url: str, *, timeout: int = DEFAULT_TIMEOUT, max_response: int = DEFAU
+             pass
+ 
+ 
++def fetch_to_file(url: str, sink, *, max_bytes: int = DEFAULT_MAINT_MAX_BYTES,
++                  timeout: int = DEFAULT_TIMEOUT, resolver=_resolve,
++                  connection_factory=None) -> EgressResult:
++    """Stream ONE mediated, safety-contracted GET to ``sink`` (a file-like with ``.write(bytes)``) — the
++    ADR 0006 MAINTENANCE artifact path. Reuses the WHOLE Tier-1 transport contract verbatim (canonical
++    host == connect host, no-redirect fail-closed, IP-pin + private/metadata block, HTTPS, request-target
++    bounds). Unlike ``fetch``, the body is NOT returned (an artifact is MB-scale and never enters model
++    context) — it is streamed to ``sink`` under a HARD ``max_bytes`` ceiling, and OVER-CAP is a
++    fail-CLOSED refusal (a non-ok record; the caller deletes the partial file) so an oversized/truncated
++    artifact can never masquerade as complete. Never raises; a refusal is a non-ok EgressRecord. The
++    capability check (net.maint:<host>) is the CALLER's job (the gate); this enforces transport only.
++    ``sink`` is owned by the caller (open/close/unlink) so this module stays filesystem-agnostic."""
++    host = canonical_host(url)
++    if host is None:
++        return _refused("", "", 0, "ineligible url: not https / bad host / userinfo / non-443 port")
++
++    parts = urlsplit(url.strip())
++    target = parts.path or "/"
++    if parts.query:
++        target = target + "?" + parts.query
++    if len(target) > MAX_URL_TARGET:  # cap the WHOLE target — path and query exfil identically
++        return _refused(host, "", len(target), "request target exceeds cap (exfil guard)")
++    if not _is_clean_request_target(target):  # CRLF/control/non-ascii would split or crash the request
++        return _refused(host, "", len(target), "illegal request target (control/non-ascii chars)")
++    target_hash = hashlib.sha256(target.encode("utf-8", "replace")).hexdigest()
++    request_bytes = len(target)
++
++    try:
++        ips = resolver(host)
++    except Exception as exc:  # noqa: BLE001 — resolution failure fails closed
++        return _refused(host, target_hash, request_bytes, f"resolve failed: {type(exc).__name__}")
++    pinned = next((ip for ip in (ips or []) if is_safe_public_ip(ip)), None)
++    if pinned is None:
++        return _refused(host, target_hash, request_bytes,
++                        "no safe public IP (loopback/private/link-local/metadata blocked)")
++
++    if connection_factory is None:
++        ctx = ssl.create_default_context()
++        conn = _PinnedHTTPSConnection(host, pinned, context=ctx, timeout=timeout)
++    else:
++        conn = connection_factory(host, pinned)
++
++    try:
++        conn.putrequest("GET", target, skip_host=True)   # we set the canonical Host ONCE ourselves
++        conn.putheader("Host", host)
++        conn.putheader("User-Agent", _USER_AGENT)
++        conn.putheader("Accept", "*/*")
++        conn.putheader("Connection", "close")
++        conn.endheaders()                        # no model-supplied Authorization/Cookie, ever
++        resp = conn.getresponse()
++        status = int(resp.status)
++        if 300 <= status < 400:                  # FAIL CLOSED on redirect — do not follow
++            loc = _sanitize_location(resp.getheader("Location"))
++            return _refused(host, target_hash, request_bytes,
++                            f"redirect not followed ({status}); re-gate the target as a new intent",
++                            status=status, redirect=loc, ip=pinned)
++        if not (200 <= status < 300):            # a non-2xx body is an error page, not the artifact
++            resp.read(DEFAULT_MAX_RESPONSE + 1)  # drain a bounded amount, then refuse (never stage it)
++            return _refused(host, target_hash, request_bytes, f"status {status}",
++                            status=status, ip=pinned)
++        h = hashlib.sha256()
++        total = 0
++        while True:
++            chunk = resp.read(_MAINT_CHUNK)
++            if not chunk:
++                break
++            if total + len(chunk) > max_bytes:   # STOP before exceeding — fail closed, no truncated write
++                return _refused(host, target_hash, request_bytes,
++                                f"artifact exceeds cap ({max_bytes} bytes; fail closed)",
++                                status=status, ip=pinned)
++            total += len(chunk)
++            h.update(chunk)
++            sink.write(chunk)                    # caller owns the sink (a workspace-fenced file)
++        return EgressResult(
++            EgressRecord(canonical_dest=host, method="GET", request_target_hash=target_hash,
++                         request_bytes=request_bytes, status=status,
++                         response_hash=h.hexdigest(), response_len=total,
++                         redirect_location=None, resolved_ip=pinned, ok=True, error=""),
++            body=b"")                            # body streamed to sink, never returned to the model
++    except (ssl.SSLError, OSError, http.client.HTTPException) as exc:
++        # Includes a sink.write OSError (disk full / closed file): fail closed, partial deleted by caller.
++        return _refused(host, target_hash, request_bytes,
++                        f"egress failed: {type(exc).__name__}: {exc}", ip=pinned)
++    finally:
++        try:
++            conn.close()
++        except Exception:  # noqa: BLE001
++            pass
++
++
+ def post(url: str, body, *, content_type: str = DEFAULT_POST_CONTENT_TYPE, auth: "str | None" = None,
+          keep_preview: bool = False, timeout: int = DEFAULT_TIMEOUT,
+          max_response: int = DEFAULT_MAX_RESPONSE, resolver=_resolve,
+diff --git a/collaborator/governance.py b/collaborator/governance.py
+index 0b70099..d179cb1 100644
+--- a/collaborator/governance.py
++++ b/collaborator/governance.py
+@@ -587,6 +587,8 @@ def govern_action(session, intent: ToolIntent, importance: "float | None" = None
+                "verification_depth": directive.verification_depth}
+     if getattr(tool, "egress", False):
+         preview["canonical_dest"] = egress.canonical_host(str(args.get("url") or ""))
++        if tool.name == "maint_fetch":  # ADR 0006: the human also sees WHERE the artifact will be staged
++            preview["dest"] = str(args.get("dest") or "")
+     if intent.name == "run_command":
+         # Surface the honest posture to the human holding the hand (F-6). A HELD run_command, once
+         # APPROVED, runs on the HUMAN path (human_gated) which is UNCONTAINED BY DESIGN — full filesystem
+@@ -785,9 +787,14 @@ def execute_and_verify(session, tool: Tool, directive, action_id: str, args: dic
+             _consume = getattr(session, "consume_emission", None)
+             if callable(_consume):
+                 _consume(emit_host)   # count one attempt right before the bytes leave
++        # ADR 0006: the maintenance artifact ceiling is a HOST value (session config), threaded here so a
++        # maint_fetch cannot widen its own cap through model args. getattr-guarded so a lightweight/legacy
++        # session (no such field) simply gets the module default (unchanged behaviour for other tools).
++        maint_max = getattr(session, "maint_fetch_max_bytes", None) or egress.DEFAULT_MAINT_MAX_BYTES
+         try:
+             execution = execute_tool(tool, session.workspace, args,
+-                                     egress_preview=egress_preview, egress_auth=egress_auth)
++                                     egress_preview=egress_preview, egress_auth=egress_auth,
++                                     maint_max_bytes=maint_max)
+         except Exception as exc:  # noqa: BLE001 — egress must degrade to FAILED, never raise out of
+             # govern_action/approve (transport red-team S1 backstop: the mediated client's own input
+             # guards are belt; this is suspenders around the whole egress execute, like the artifact branch).
+diff --git a/collaborator/session.py b/collaborator/session.py
+index c8a36bc..50dad4e 100644
+--- a/collaborator/session.py
++++ b/collaborator/session.py
+@@ -49,6 +49,7 @@ class Session:
+         emission_quota=None,
+         provenance_store=None,
+         emission_quota_store=None,
++        maint_fetch_max_bytes=None,
+     ) -> None:
+         self.workspace = Path(workspace)
+         # F-6 Harm A: the workspace must be DISJOINT from the Collaborator's own code root
+@@ -144,6 +145,20 @@ class Session:
+         # (which hosts may be emitted-to) lives in the SIGNED caps — this map only supplies the
+         # secret for a host already authorized. Default empty = no credential injected.
+         self.egress_credentials = dict(egress_credentials or {})
++        # ADR 0006 — the MAINTENANCE artifact ceiling (host config, never model-chosen). Bounds how many
++        # bytes a single maint_fetch may stream into the workspace. None -> the module default (100 MiB).
++        # Fail LOUD at construction on a malformed value (like proactivity / emission_quota), so a typo
++        # can't silently disable the cap; a maint_fetch can never widen it (the seam threads this value,
++        # the model's args never carry it).
++        if maint_fetch_max_bytes is None:
++            from collaborator.egress import DEFAULT_MAINT_MAX_BYTES
++            self.maint_fetch_max_bytes = DEFAULT_MAINT_MAX_BYTES
++        elif isinstance(maint_fetch_max_bytes, bool) or not isinstance(maint_fetch_max_bytes, int):
++            raise ValueError("maint_fetch_max_bytes must be None or a positive int")
++        elif maint_fetch_max_bytes <= 0:
++            raise ValueError("maint_fetch_max_bytes must be a positive int (bytes)")
++        else:
++            self.maint_fetch_max_bytes = maint_fetch_max_bytes
+         # ADR 0003 residual sweep — per-DESTINATION emission quota (host config, never model-chosen). The
+         # egress caps + byte/time caps bound WHICH host + HOW BIG each emission is, but nothing bounded HOW
+         # MANY: once a `net.post:<host>` (or an autonomous net.post.auto:<host>) grant is in hand, a session
+diff --git a/collaborator/tools.py b/collaborator/tools.py
+index 0871953..de30fad 100644
+--- a/collaborator/tools.py
++++ b/collaborator/tools.py
+@@ -136,6 +136,17 @@ _TOOLS: dict[str, Tool] = {
+     "net_post": Tool("net_post", "net.post:__derived__", True, "net.post",
+                      Stakes.NORMAL, PROPOSE_FIRST, verify_mode="egress_log", egress=True,
+                      egress_method="POST"),
++    # ADR 0006: mediated MAINTENANCE artifact fetch — a human-gated GET that STREAMS a non-vendorable
++    # artifact (proprietary driver, licensed binary) to a workspace-fenced file. Authority is the DERIVED
++    # capability net.maint:<canonical-host>, a SEPARATE namespace from net.get/net.post (a read or emit
++    # grant never confers a maintenance fetch). NOT mutating in the emission sense — it does not act on the
++    # world beyond a bounded GET and the local write is workspace-fenced — so it never rides the
++    # net.post.auto autonomous-emission path. verify_mode "egress_log" (a channel-integrity record). Default
++    # leash PROPOSE_FIRST with NO auto-lift: every maintenance fetch takes a human hand. Same un-grantable
++    # sentinel static capability as web_fetch/net_post (a dropped egress=True fails closed, never a wildcard).
++    "maint_fetch": Tool("maint_fetch", "net.maint:__derived__", False, "net.maint",
++                        Stakes.NORMAL, PROPOSE_FIRST, verify_mode="egress_log", egress=True,
++                        egress_method="MAINT"),
+ }
+ 
+ 
+@@ -174,7 +185,7 @@ def flag_offense_shape(name: str, args: dict) -> str:
+ # from one frozenset removes the two-hand-maintained-list drift that would otherwise be a silent
+ # fail-open (a tool that gains a seal branch but is missing from the approve-time check would have a
+ # seal MINTED but NEVER verified). Same lesson as codefence's `_code_slots()` single source (PR #35).
+-SEALED_TOOLS = frozenset({"run_command", "write_file"})
++SEALED_TOOLS = frozenset({"run_command", "write_file", "maint_fetch"})
+ 
+ 
+ def held_action_seal(tool_name: str, args: dict) -> str:
+@@ -185,7 +196,9 @@ def held_action_seal(tool_name: str, args: dict) -> str:
+     write_file's artifact verifier do NOT catch arg substitution (both re-derive from the SAME
+     mutated args), so this seal — over a FROZEN payload (see ``freeze_args``) — is the actual
+     approved==executed binding for these tools, not mere DiD. Returns "" for any tool not in
+-    ``SEALED_TOOLS`` (read_file; the egress tools, which seal via ``emission_seal`` instead).
++    ``SEALED_TOOLS`` (read_file; net_post, which seals its url+body via ``emission_seal`` instead).
++    ``maint_fetch`` IS sealed here (over url+dest): it is an egress tool but has no emission BODY, so the
++    ``emission_seal`` path does not apply — its consequential identity is (url, dest).
+ 
+     Framing mirrors ``emission_seal``: every field is LENGTH-PREFIXED (8-byte big-endian) so the
+     encoding is injective — no boundary shift can move bytes between fields and collide two distinct
+@@ -204,10 +217,14 @@ def held_action_seal(tool_name: str, args: dict) -> str:
+             parts = [b"S", cmd.encode("utf-8", "surrogatepass")]
+         else:
+             parts = [b"N"]  # None / other -> the executor refuses; seal a stable non-empty marker
+-    else:  # write_file — the only other member of SEALED_TOOLS
++    elif tool_name == "write_file":
+         parts = [b"W",
+                  str(args.get("path") or "").encode("utf-8", "surrogatepass"),
+                  str(args.get("content") or "").encode("utf-8", "surrogatepass")]
++    else:  # maint_fetch — the held approval is bound to the EXACT (url, dest); a post-approval swap of
++        parts = [b"M",  # either is refused, exactly as run_command's command / write_file's path+content.
++                 str(args.get("url") or "").encode("utf-8", "surrogatepass"),
++                 str(args.get("dest") or "").encode("utf-8", "surrogatepass")]
+     h = hashlib.sha256()
+     # Bind the TOOL IDENTITY into the seal as its first field (external panel / grok), so a
+     # Decision.tool rebind cannot replay one tool's sealed args as a different tool's action.
+@@ -240,7 +257,10 @@ def freeze_args(args: dict) -> dict:
+     # UNCONDITIONALLY (str() on an exact str returns the same object, so it's free), EXACTLY as
+     # _exec_write will (str(x or "")), so the frozen value both seals and writes identically and no
+     # in-window mutation (including a subclass __str__ re-evaluated later) can reach the disk.
+-    for key in ("path", "content"):
++    # Also coerce maint_fetch's url/dest (ADR 0006) — both str, sealed and executed as str(x or "") —
++    # so a str-subclass with a drifting __str__ cannot seal one value and stage another. Harmless for
++    # tools without these keys (str() on an absent key is skipped).
++    for key in ("path", "content", "url", "dest"):
+         if key in frozen:
+             frozen[key] = str(frozen[key] or "")
+     return frozen
+@@ -523,6 +543,50 @@ def _exec_web_fetch(workspace, args: dict) -> Execution:
+     )
+ 
+ 
++def _unlink_quiet(path) -> None:
++    """Best-effort delete of a partial/oversized artifact — fail closed never leaves staged bytes."""
++    try:
++        os.unlink(path)
++    except OSError:
++        pass
++
++
++def _exec_maint_fetch(workspace, args: dict, *, max_bytes: int = egress.DEFAULT_MAINT_MAX_BYTES) -> Execution:
++    """ADR 0006: a mediated, safety-contracted MAINTENANCE fetch — STREAM a non-vendorable artifact to a
++    workspace-fenced file. Authority (net.maint:<host>) is checked in the governance gate; here we perform
++    the GET through the single mediated client's streaming path and stage the bytes on disk. Fail closed:
++    an ineligible URL / unsafe IP / redirect / non-2xx / OVER-CAP is a non-ok record AND the partial file
++    is DELETED, so an oversized or truncated artifact never masquerades as a complete one. The bytes are
++    NOT surfaced to the model (only host, size, sha256 — in the record). ``max_bytes`` is a HOST value the
++    seam threads; the model can never reach it through ``args``.
++
++    ADR 0003 #1b: the fetch runs inside an INDEPENDENT egress-observation window, like the other egress
++    executors — the kernel's own account reconciled against the record (no-op where no vantage exists)."""
++    url = str(args.get("url") or "")
++    rel = str(args.get("dest") or "")
++    target = resolve_in_workspace(workspace, rel)  # raises WorkspaceError -> denied upstream (fenced dest)
++    _before = _observe_begin()
++    try:
++        os.makedirs(os.path.dirname(str(target)) or str(workspace), exist_ok=True)  # parent within fence
++        with open(target, "wb") as sink:
++            result = egress.fetch_to_file(url, sink, max_bytes=max_bytes)
++    except OSError as exc:  # mkdir/open/write failure -> fail closed, never raise out of the executor
++        _unlink_quiet(target)
++        rec = egress._refused(egress.canonical_host(url) or "", "", 0,
++                              f"stage failed: {type(exc).__name__}")
++        return Execution(result=ToolResult(ok=False, error=rec.error), egress=rec,
++                         egress_obs=_observe_end(_before, _egress_claimed(rec)))
++    rec = result.record
++    obs = _observe_end(_before, _egress_claimed(rec))
++    if not rec.ok:
++        _unlink_quiet(target)   # ineligible/unsafe/redirect/non-2xx/over-cap -> no staged artifact
++        return Execution(result=ToolResult(ok=False, error=rec.error), egress=rec, egress_obs=obs)
++    output = (f"[{rec.status}] fetched {rec.canonical_dest} -> {rel} "
++              f"({rec.response_len}b, sha256={(rec.response_hash or '')[:16]}…)")
++    return Execution(result=ToolResult(ok=True, output=output), egress=rec, egress_obs=obs,
++                     write_set=(rel,), artifact_hashes={rel: rec.response_hash})
++
++
+ def _redact_credential(text: str, auth: "str | None") -> str:
+     """Scrub a host-injected credential — and its bare, scheme-stripped token — out of emission
+     OUTPUT. The outbound side never logs the credential, but a granted-but-hostile or debug endpoint
+@@ -577,12 +641,13 @@ def _exec_net_post(workspace, args: dict, *, keep_preview: bool = False,
+ 
+ _EXECUTORS = {"write_file": _exec_write, "read_file": _exec_read,
+               "run_command": _exec_command, "web_fetch": _exec_web_fetch,
+-              "net_post": _exec_net_post}
++              "net_post": _exec_net_post, "maint_fetch": _exec_maint_fetch}
+ 
+ 
+ def execute_tool(tool: Tool, workspace, args: dict, *, egress_preview: bool = False,
+                  egress_auth: "str | None" = None, require_isolation: bool = False,
+-                 require_code_protection: bool = False) -> Execution:
++                 require_code_protection: bool = False,
++                 maint_max_bytes: int = egress.DEFAULT_MAINT_MAX_BYTES) -> Execution:
+     """Run a resolved tool. Raises WorkspaceError on an escaping path (the caller turns that into
+     a DENY); other failures come back as ``ok=False`` results. ``egress_preview``/``egress_auth``
+     are host-side values the governance seam threads for net_post ONLY (the audit-preview flag and
+@@ -590,10 +655,14 @@ def execute_tool(tool: Tool, workspace, args: dict, *, egress_preview: bool = Fa
+     them through ``args``. ``require_isolation``/``require_code_protection`` are threaded to run_command
+     ONLY: when True the shell REFUSES to run unless verified netns isolation (ADR 0003 #1a) resp. verified
+     bwrap containment of the code roots (ADR 0003 revisit #1 / F-6) is achieved — so an autonomous shell
+-    can never egress raw nor run with its own code writable (bound to the executor's REAL result)."""
++    can never egress raw nor run with its own code writable (bound to the executor's REAL result).
++    ``maint_max_bytes`` is the host artifact ceiling threaded to maint_fetch ONLY (ADR 0006); the model
++    cannot reach it through ``args``, so it can never widen its own fetch ceiling."""
+     if tool.name == "net_post":
+         return _exec_net_post(workspace, args, keep_preview=egress_preview, auth=egress_auth)
+     if tool.name == "run_command":
+         return _exec_command(workspace, args, require_isolation=require_isolation,
+                              require_code_protection=require_code_protection)
++    if tool.name == "maint_fetch":  # ADR 0006: max_bytes is a HOST value (seam-threaded), never model-reachable
++        return _exec_maint_fetch(workspace, args, max_bytes=maint_max_bytes)
+     return _EXECUTORS[tool.name](workspace, args)

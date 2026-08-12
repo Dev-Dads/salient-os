@@ -64,13 +64,23 @@ offense executor, ever, absent a scope reversal.**
 
 ---
 
-## 2. DNS-aware content-mediating egress proxy (ADR 0005 follow-on) — needs a design pass + your steer
+## 2. Maintenance network for non-vendorable artifacts — ✅ RESOLVED 2026-08-12: build `maint_fetch`; proxy DEFERRED
 
-ADR 0005 rejected the dest-only observed route and named the coherent evolution: an SNI/allowlist,
-DNS-aware, **content-mediating** proxy (drifting toward a userspace TLS-terminating proxy) if
-network-for-maintenance ever becomes a hard requirement. This is a large privileged build with real
-design forks (where the proxy runs, TLS interception posture, allowlist authority). Backlogged for a
-design pass + your direction; not an overnight best-judgement build.
+> **Operator decision (2026-08-12):** after the DESIGN panel (5/5 SERIOUS_FLAWS on the CONNECT proxy;
+> 4/5 recommended the mediated-fetch alternative), chose **`maint_fetch`** — a human-gated mediated
+> artifact fetch through egress.py that stages non-vendorable artifacts (proprietary drivers, licensed
+> binaries) into the workspace; the shell stays routeless. Shipped as ADR 0006 (`net.maint:<host>` signed
+> cap, streaming fail-closed ceiling, sealed url+dest). Keeps egress.py's content guarantees; NO
+> privileged helper.
+
+**Deferred (follow-on, only if a hard requirement appears):** the destination-allowlist **CONNECT
+forward proxy** for *interactive* networked maintenance (live apt/git/pip in the shell). The panel
+confirmed it is buildable (the netns-ownership crux was reproduced live on Sparky — a real-root-created
+netns is un-editable by the sandbox), NOT theater — but it costs a new privileged root-helper TCB and
+demotes egress.py's content guarantee to a raw pipe, a poor trade for artifact-fetch. If built, the
+panel's redesign is normative (host-side veth filter primary + asserted init-userns ownership + hardened
+helper); see ADR 0006 "Deferred". Not an overnight best-judgement build — needs the interactive-
+maintenance requirement + your steer.
 
 ---
 

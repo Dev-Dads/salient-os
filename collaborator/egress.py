@@ -61,6 +61,15 @@ EGRESS_POST_CAP_PREFIX = "net.post:"
 EGRESS_AUTO_PREFIX = "net.post.auto:"
 MAX_POST_BODY = 65536           # 64 KiB — the outbound PAYLOAD ceiling (the real exfil surface)
 DEFAULT_POST_CONTENT_TYPE = "application/json"
+# ADR 0006 — the MAINTENANCE artifact-fetch path. A human-gated GET that STREAMS a non-vendorable
+# artifact (proprietary driver, licensed binary) to a caller-owned sink under a large host-set ceiling,
+# authorized on its OWN capability namespace net.maint:<host> — a read grant (net.get:H) does NOT confer
+# a maintenance fetch, and an emit grant (net.post:H) does not either. Reuses this module's whole
+# transport contract; differs only in that the body is STREAMED (an artifact is MB-scale) and never
+# returned to the model.
+EGRESS_MAINT_CAP_PREFIX = "net.maint:"
+DEFAULT_MAINT_MAX_BYTES = 100 * 1024 * 1024   # 100 MiB artifact ceiling (host-configurable)
+_MAINT_CHUNK = 65536            # streaming read granularity
 _BODY_PREVIEW_BYTES = 512       # bounded body preview recorded ONLY for human-gated emissions
 _USER_AGENT = "SalienceOS-Collaborator/0.1 (+egress-mediated)"
 _HTTPS_PORT = 443
@@ -143,6 +152,11 @@ def required_capability(url: str, method: str = "GET") -> "str | None":
         return EGRESS_CAP_PREFIX + host
     if m == "POST":                 # emission (separate namespace)
         return EGRESS_POST_CAP_PREFIX + host
+    if m == "MAINT":                # ADR 0006 maintenance artifact fetch — its OWN namespace (a read or
+        return EGRESS_MAINT_CAP_PREFIX + host   # emit grant never confers it). The transport verb is a
+                                    # GET; "MAINT" here is the capability-KIND, not an HTTP method, and it
+                                    # is the SAME single derivation site as GET/POST so the hold-time and
+                                    # approve-time capability for a maint fetch cannot diverge.
     return None                     # any other verb is not authorized here -> DENY (never the read cap)
 
 
@@ -393,6 +407,96 @@ def fetch(url: str, *, timeout: int = DEFAULT_TIMEOUT, max_response: int = DEFAU
                          error=("" if ok else f"status {status}"), truncated=truncated),
             body=body)
     except (ssl.SSLError, OSError, http.client.HTTPException) as exc:
+        return _refused(host, target_hash, request_bytes,
+                        f"egress failed: {type(exc).__name__}: {exc}", ip=pinned)
+    finally:
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def fetch_to_file(url: str, sink, *, max_bytes: int = DEFAULT_MAINT_MAX_BYTES,
+                  timeout: int = DEFAULT_TIMEOUT, resolver=_resolve,
+                  connection_factory=None) -> EgressResult:
+    """Stream ONE mediated, safety-contracted GET to ``sink`` (a file-like with ``.write(bytes)``) — the
+    ADR 0006 MAINTENANCE artifact path. Reuses the WHOLE Tier-1 transport contract verbatim (canonical
+    host == connect host, no-redirect fail-closed, IP-pin + private/metadata block, HTTPS, request-target
+    bounds). Unlike ``fetch``, the body is NOT returned (an artifact is MB-scale and never enters model
+    context) — it is streamed to ``sink`` under a HARD ``max_bytes`` ceiling, and OVER-CAP is a
+    fail-CLOSED refusal (a non-ok record; the caller deletes the partial file) so an oversized/truncated
+    artifact can never masquerade as complete. Never raises; a refusal is a non-ok EgressRecord. The
+    capability check (net.maint:<host>) is the CALLER's job (the gate); this enforces transport only.
+    ``sink`` is owned by the caller (open/close/unlink) so this module stays filesystem-agnostic."""
+    host = canonical_host(url)
+    if host is None:
+        return _refused("", "", 0, "ineligible url: not https / bad host / userinfo / non-443 port")
+
+    parts = urlsplit(url.strip())
+    target = parts.path or "/"
+    if parts.query:
+        target = target + "?" + parts.query
+    if len(target) > MAX_URL_TARGET:  # cap the WHOLE target — path and query exfil identically
+        return _refused(host, "", len(target), "request target exceeds cap (exfil guard)")
+    if not _is_clean_request_target(target):  # CRLF/control/non-ascii would split or crash the request
+        return _refused(host, "", len(target), "illegal request target (control/non-ascii chars)")
+    target_hash = hashlib.sha256(target.encode("utf-8", "replace")).hexdigest()
+    request_bytes = len(target)
+
+    try:
+        ips = resolver(host)
+    except Exception as exc:  # noqa: BLE001 — resolution failure fails closed
+        return _refused(host, target_hash, request_bytes, f"resolve failed: {type(exc).__name__}")
+    pinned = next((ip for ip in (ips or []) if is_safe_public_ip(ip)), None)
+    if pinned is None:
+        return _refused(host, target_hash, request_bytes,
+                        "no safe public IP (loopback/private/link-local/metadata blocked)")
+
+    if connection_factory is None:
+        ctx = ssl.create_default_context()
+        conn = _PinnedHTTPSConnection(host, pinned, context=ctx, timeout=timeout)
+    else:
+        conn = connection_factory(host, pinned)
+
+    try:
+        conn.putrequest("GET", target, skip_host=True)   # we set the canonical Host ONCE ourselves
+        conn.putheader("Host", host)
+        conn.putheader("User-Agent", _USER_AGENT)
+        conn.putheader("Accept", "*/*")
+        conn.putheader("Connection", "close")
+        conn.endheaders()                        # no model-supplied Authorization/Cookie, ever
+        resp = conn.getresponse()
+        status = int(resp.status)
+        if 300 <= status < 400:                  # FAIL CLOSED on redirect — do not follow
+            loc = _sanitize_location(resp.getheader("Location"))
+            return _refused(host, target_hash, request_bytes,
+                            f"redirect not followed ({status}); re-gate the target as a new intent",
+                            status=status, redirect=loc, ip=pinned)
+        if not (200 <= status < 300):            # a non-2xx body is an error page, not the artifact
+            resp.read(DEFAULT_MAX_RESPONSE + 1)  # drain a bounded amount, then refuse (never stage it)
+            return _refused(host, target_hash, request_bytes, f"status {status}",
+                            status=status, ip=pinned)
+        h = hashlib.sha256()
+        total = 0
+        while True:
+            chunk = resp.read(_MAINT_CHUNK)
+            if not chunk:
+                break
+            if total + len(chunk) > max_bytes:   # STOP before exceeding — fail closed, no truncated write
+                return _refused(host, target_hash, request_bytes,
+                                f"artifact exceeds cap ({max_bytes} bytes; fail closed)",
+                                status=status, ip=pinned)
+            total += len(chunk)
+            h.update(chunk)
+            sink.write(chunk)                    # caller owns the sink (a workspace-fenced file)
+        return EgressResult(
+            EgressRecord(canonical_dest=host, method="GET", request_target_hash=target_hash,
+                         request_bytes=request_bytes, status=status,
+                         response_hash=h.hexdigest(), response_len=total,
+                         redirect_location=None, resolved_ip=pinned, ok=True, error=""),
+            body=b"")                            # body streamed to sink, never returned to the model
+    except (ssl.SSLError, OSError, http.client.HTTPException) as exc:
+        # Includes a sink.write OSError (disk full / closed file): fail closed, partial deleted by caller.
         return _refused(host, target_hash, request_bytes,
                         f"egress failed: {type(exc).__name__}: {exc}", ip=pinned)
     finally:
