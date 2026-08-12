@@ -450,8 +450,10 @@ def _exec_command(workspace, args: dict, *, require_isolation: bool = False,
         result=ToolResult(ok=ok, output=out, error=err),
         supervised=res, exit_code=res.returncode,
         write_set=(),  # run_command is verify_mode="exit": govern's exit-branch returns BEFORE the
-        # artifact branch, so observe_action/snapshot_tree never run — there is NO write-set observation
-        # for a shell (honest: a post-exec workspace tripwire was deferred by the Harm A panel, not built)
+        # artifact branch, so the EXECUTOR reports no write_set (a shell has no declared outputs). The
+        # exit-branch itself does snapshot the workspace pre/post — but ONLY on the AUTONOMOUS contained
+        # path, and ONLY for F2 authorship PROVENANCE (an advisory tag, not a verification write-set); a
+        # full post-exec verification tripwire for the human path is still deferred (see governance.py).
         artifact_hashes={}, network_isolated=isolated,
         # The REAL, per-run VERIFIED containment result (NOT a govern-time belief): True only on the
         # autonomy path where the in-child guard proved the code roots read-only; False on the

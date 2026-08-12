@@ -155,6 +155,37 @@ class Session:
         # count (a cross-session durable store is a documented follow-up, not needed to bound a runaway run).
         self.emission_quota = self._validate_emission_quota(emission_quota)
         self._emission_counts = {}
+        # ADR 0003 residual sweep — F2 shared-workspace dropper. The workspace is SHARED rw between the
+        # autonomy-earning CONTAINED run and the UNCONTAINED human maintenance run, so a NOT-human-approved
+        # (autonomous) action can drop an executable file a human later approves and runs uncontained
+        # (`sh ./build.sh`). This set records the workspace-relative posix paths an autonomous action
+        # AUTHORED; the seam surfaces "authored by an autonomous run" in the human approval preview + an
+        # audit tag. ADVISORY provenance only, never authority (see collaborator/provenance.py) — the human
+        # keeps full reach by design. Session-lived; a human-approved (re-)write of a path CLEARS its taint.
+        self._autonomous_authored: set = set()
+        # HONEST fail-flag (external panel, F2): if an autonomous run's write-set could not be fully
+        # observed (a snapshot failure), we CANNOT enumerate what it dropped — so instead of silently
+        # under-recording (fail-open), we set this and the human run_command preview says provenance
+        # tracking is DEGRADED. Sticky for the session: once tracking has a gap, later workspace files
+        # are suspect. Never authority — an advisory honesty signal only.
+        self._autonomous_tracking_incomplete = False
+
+    def note_autonomous_authorship(self, rel_paths) -> None:
+        """Record workspace files a NOT-human-approved (autonomous) action authored (F2). Paths are
+        normalized to workspace-relative posix so they match snapshot_tree keys and the recognizer's
+        candidates. Advisory provenance only — never authority. Total: a bad path is skipped, not raised."""
+        from collaborator.provenance import norm_rel
+        for p in (rel_paths or ()):
+            r = norm_rel(p)
+            if r:
+                self._autonomous_authored.add(r)
+
+    def clear_autonomous_authorship(self, rel_paths) -> None:
+        """Drop the autonomy taint on paths a HUMAN-approved action just (re)authored — those bytes are
+        now human-vetted, so a later run of them must not carry a stale ⚠ (the real failure this guards)."""
+        from collaborator.provenance import norm_rel
+        for p in (rel_paths or ()):
+            self._autonomous_authored.discard(norm_rel(p))
 
     @staticmethod
     def _validate_emission_quota(q):
