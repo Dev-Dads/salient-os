@@ -193,8 +193,12 @@ class ContainedRunTracking(unittest.TestCase):
                 s = _signed_autonomy(tmp)
                 self.assertEqual(govern_action(
                     s, ToolIntent("run_command", {"command": ["true"]}, "structured")).status, RAN)
-            # a LATER human run_command referencing the autonomously-dropped file is flagged (not denied)
-            held = govern_action(s, ToolIntent("run_command", {"command": "sh ./build.sh"}, "structured"))
+            # a LATER human run_command referencing the autonomously-dropped file is flagged (not denied).
+            # leash=PROPOSE_FIRST is HOST authority forcing the HELD (human-hand) path deterministically —
+            # without it, this autonomy-capable session AUTO-RUNS the shell on a bwrap-capable host (CI) but
+            # HELDs on a host without code protection (Windows dev): a host-divergent test otherwise.
+            held = govern_action(s, ToolIntent("run_command", {"command": "sh ./build.sh"}, "structured"),
+                                 leash=PROPOSE_FIRST)
             self.assertEqual(held.status, HELD)
             self.assertEqual(held.provenance_touch, "build.sh")
 
@@ -266,8 +270,12 @@ class RecordingHonesty(unittest.TestCase):
             d = govern_action(s, ToolIntent("run_command", {"command": ["true"]}, "structured"))
             self.assertEqual(d.status, RAN)                        # the run is NEVER blocked by a snapshot fail
             self.assertTrue(s._autonomous_tracking_incomplete)     # ...but the gap is recorded honestly
-        # and a later human run preview surfaces the degraded posture
-        held = govern_action(s, ToolIntent("run_command", {"command": "sh whatever.sh"}, "structured"))
+        # and a later human (HELD) run preview surfaces the degraded posture. leash=PROPOSE_FIRST forces
+        # the human-hand path deterministically (this autonomy-capable session would AUTO-RUN on a
+        # bwrap-capable host / CI, leaving preview=None — a host-divergent test otherwise).
+        held = govern_action(s, ToolIntent("run_command", {"command": "sh whatever.sh"}, "structured"),
+                             leash=PROPOSE_FIRST)
+        self.assertEqual(held.status, HELD)
         self.assertTrue(held.preview.get("provenance_tracking_incomplete"))
 
 
