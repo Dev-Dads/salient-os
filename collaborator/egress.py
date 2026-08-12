@@ -128,15 +128,22 @@ def egress_capability(host: str) -> str:
 
 
 def required_capability(url: str, method: str = "GET") -> "str | None":
-    """The per-destination egress capability ``url`` requires, or None if the URL is ineligible
-    (the governance gate turns None into a DENY). Method-aware (ADR 0003): a GET needs
-    ``net.get:<host>``, a POST needs ``net.post:<host>`` — a SEPARATE namespace, so read access
-    to a host never confers emit access. Anything other than POST maps to the read capability."""
+    """The per-destination egress capability ``url`` requires, or None if the URL is ineligible OR the
+    method is not one this system authorizes (the governance gate turns None into a DENY). Method-aware
+    (ADR 0003): a read (GET/HEAD) needs ``net.get:<host>``, an emission (POST) needs ``net.post:<host>`` —
+    a SEPARATE namespace, so read access to a host never confers emit access. FAIL CLOSED on any OTHER
+    method (PUT/DELETE/PATCH/...): map to None -> DENY rather than silently fall through to the READ cap.
+    No tool issues those verbs today, so this is a latent gap closed by construction — a future write verb
+    must be wired to its OWN capability, never inherit read authority."""
     host = canonical_host(url)
     if host is None:
         return None
-    prefix = EGRESS_POST_CAP_PREFIX if str(method or "GET").upper() == "POST" else EGRESS_CAP_PREFIX
-    return prefix + host
+    m = str(method or "GET").upper()
+    if m in ("GET", "HEAD"):        # reads
+        return EGRESS_CAP_PREFIX + host
+    if m == "POST":                 # emission (separate namespace)
+        return EGRESS_POST_CAP_PREFIX + host
+    return None                     # any other verb is not authorized here -> DENY (never the read cap)
 
 
 # --- IP safety (the rebind / SSRF-to-metadata guard) --------------------------------------

@@ -46,6 +46,7 @@ class Session:
         controlled_paths=(".github",),
         proposal_pool=None,
         egress_credentials=None,
+        emission_quota=None,
     ) -> None:
         self.workspace = Path(workspace)
         # F-6 Harm A: the workspace must be DISJOINT from the Collaborator's own code root
@@ -141,3 +142,75 @@ class Session:
         # (which hosts may be emitted-to) lives in the SIGNED caps — this map only supplies the
         # secret for a host already authorized. Default empty = no credential injected.
         self.egress_credentials = dict(egress_credentials or {})
+        # ADR 0003 residual sweep — per-DESTINATION emission quota (host config, never model-chosen). The
+        # egress caps + byte/time caps bound WHICH host + HOW BIG each emission is, but nothing bounded HOW
+        # MANY: once a `net.post:<host>` (or an autonomous net.post.auto:<host>) grant is in hand, a session
+        # could emit to that host unbounded — a drip exfil / spam channel, worst on the autonomous path.
+        # This caps the emission COUNT per canonical host for the session's life. Shape:
+        #   None          -> unlimited (default; unchanged behaviour)
+        #   int (>=0)     -> the same cap for EVERY host
+        #   {host: int}   -> a per-host cap; a host not listed is unlimited
+        # Consumed at the actual dispatch point in execute_and_verify (covers BOTH the autonomous and the
+        # human-approved path), fail-closed: an emission over quota does NOT go out. Session-lived in-memory
+        # count (a cross-session durable store is a documented follow-up, not needed to bound a runaway run).
+        self.emission_quota = self._validate_emission_quota(emission_quota)
+        self._emission_counts = {}
+
+    @staticmethod
+    def _validate_emission_quota(q):
+        """Fail LOUD at construction on a malformed quota (like proactivity/leash_overrides), so a typo
+        can't silently disable the bound. Accepts None, a non-negative int, or a {str: non-negative int}."""
+        if q is None:
+            return None
+        if isinstance(q, bool):  # a bool is an int subclass but never a meaningful count
+            raise ValueError("emission_quota must be None, a non-negative int, or a {host: int} dict")
+        if isinstance(q, int):
+            if q < 0:
+                raise ValueError("emission_quota int must be >= 0")
+            return q
+        if isinstance(q, dict):
+            from collaborator import egress   # lazy: avoid any import cycle at module load
+            out = {}
+            for host, cap in q.items():
+                if (not isinstance(host, str) or isinstance(cap, bool)
+                        or not isinstance(cap, int) or cap < 0):
+                    raise ValueError("emission_quota dict must map host:str -> non-negative int")
+                # Key on the SAME canonical host the runtime lookup uses (egress.canonical_host), so a
+                # natural mixed-case / IDN key still applies instead of SILENTLY disabling the bound
+                # (external-panel: the rest of the surface fails LOUD on a typo — this must too). A key
+                # that is not a valid bare host, or two keys colliding to the same canonical host, is an
+                # operator error -> ValueError, never a quiet no-op.
+                canon = egress.canonical_host("https://" + host)
+                if canon is None:
+                    raise ValueError(f"emission_quota host key {host!r} is not a valid canonical host")
+                if canon in out:
+                    raise ValueError(f"emission_quota has two keys canonicalizing to {canon!r}")
+                out[canon] = cap
+            return out
+        raise ValueError("emission_quota must be None, a non-negative int, or a {host: int} dict")
+
+    def _emission_limit(self, host):
+        """The emission cap for `host`, or None (unlimited)."""
+        q = self.emission_quota
+        if isinstance(q, int):
+            return q
+        if isinstance(q, dict):
+            return q.get(host)
+        return None
+
+    def emission_allowed(self, host) -> bool:
+        """True iff another emission to canonical `host` is within the per-destination quota. An
+        ineligible host (None) is allowed here — the egress gate already denies it upstream — so this
+        method only ever ADDS a bound, never a new allow path."""
+        if host is None:
+            return True
+        limit = self._emission_limit(host)
+        if limit is None:
+            return True
+        return self._emission_counts.get(host, 0) < limit
+
+    def consume_emission(self, host) -> None:
+        """Count one emission against `host`'s quota. Called at the dispatch point right before the bytes
+        leave, so it bounds ATTEMPTS (a retry of a failed emission still consumes quota)."""
+        if host is not None:
+            self._emission_counts[host] = self._emission_counts.get(host, 0) + 1
