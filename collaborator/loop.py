@@ -124,7 +124,7 @@ class TurnResult:
     decisions: list = field(default_factory=list)
     history: list = field(default_factory=list)
     ambiguous: list = field(default_factory=list)
-    stopped: str = "final"  # "final" | "held" | "paused" | "max_iterations"
+    stopped: str = "final"  # "final" | "held" | "paused" | "max_iterations" | "empty"
 
 
 def _content(msg) -> str:
@@ -144,8 +144,60 @@ def _render_intent(intent) -> str:
     return f"{intent.name}({str(prim)[:60]})"
 
 
+# Empty-completion recovery (live-found on gpt-oss:120b, 2026-08-13). A reasoning model
+# sometimes ends a turn after ONLY its private reasoning channel: empty content, no tool
+# call, finish_reason=stop (not truncation). At a greedy temperature this is DETERMINISTIC
+# and streaks — so a plain retry on the identical history reproduces the empty (measured
+# 0/6 escaped), and a prompt "you returned nothing, act now" nudge also fails (0/6). What
+# reliably escapes it is PERTURBING the sampling: raising the temperature (temp 0.7 → 5/6
+# recovered). So retries escalate the temperature. This affects only WHETHER a response is
+# obtained; every response still flows through govern_action unchanged — the seam is untouched.
+_RETRY_BASE_TEMP = 0.7    # first retry temperature (validated escape point)
+_RETRY_TEMP_STEP = 0.15   # escalate each further retry...
+_RETRY_TEMP_MAX = 1.0     # ...up to this cap
+
+
+def _retry_temperature(attempt: int) -> float:
+    """Temperature for retry ``attempt`` (1-based; attempt 0 is the initial call, which uses
+    the client's own temperature). Escalates from ``_RETRY_BASE_TEMP`` to break a deterministic
+    empty streak that a same-temperature retry cannot."""
+    return min(_RETRY_TEMP_MAX, _RETRY_BASE_TEMP + _RETRY_TEMP_STEP * (attempt - 1))
+
+
+def _is_actionable(msg, parsed) -> bool:
+    """A completion is actionable if it DID something (a tool intent), TRIED something (an
+    ambiguous call we surface for you), or SAID something (non-empty text). An EMPTY
+    completion — a reasoning model that ended its turn after only its private reasoning
+    channel: no content, no tool call (finish_reason=stop, not truncation) — is none of
+    these. It is silence, not a finished turn, and must never be read as a clean 'final'."""
+    if parsed.intents or parsed.ambiguous:
+        return True
+    return bool((parsed.text or _content(msg)).strip())
+
+
+def _complete_actionable(client, history, empty_retries: int):
+    """Get an ACTIONABLE completion, retrying past empty (reasoning-only) responses up to
+    ``empty_retries`` extra times, escalating the temperature on each retry to escape a
+    deterministic empty streak (see the module note above). The first attempt uses the
+    client's configured temperature; only retries perturb it. Returns
+    ``(msg, parsed, actionable)`` — ``actionable`` is False only if STILL empty after the
+    whole budget, which the caller must surface honestly, never as a finished turn."""
+    tools = openai_tools()
+    msg: dict = {}
+    parsed = parse_message(msg)
+    for attempt in range(max(1, empty_retries + 1)):
+        if attempt == 0:
+            msg = client.complete(history, tools=tools)  # the model's preferred (low-temp) shot
+        else:
+            msg = client.complete(history, tools=tools, temperature=_retry_temperature(attempt))
+        parsed = parse_message(msg)
+        if _is_actionable(msg, parsed):
+            return msg, parsed, True
+    return msg, parsed, False
+
+
 def run_turn(session, client, user_message: str, history=None, max_iterations: int = 6,
-             importance=None, risk=None) -> TurnResult:
+             importance=None, risk=None, empty_retries: int = 3) -> TurnResult:
     """Run one user turn to completion (or until max_iterations)."""
     history = list(history or [])
     # Ground the model with Sal's system prompt (make-it-move), AUTHORITATIVELY (grounding panel
@@ -168,8 +220,17 @@ def run_turn(session, client, user_message: str, history=None, max_iterations: i
     for _ in range(max_iterations):
         # Pass the tool schema too, so a backend with native function-calling emits structured
         # calls; the in-prompt manifest is the floor for backends that emit calls as content.
-        msg = client.complete(history, tools=openai_tools())
-        parsed = parse_message(msg)
+        # Retry past an EMPTY (reasoning-only) completion rather than let the empty-intents check
+        # below read it as a clean "final" — a silent no-op narrated as a finished task is the
+        # exact dishonesty this loop exists to prevent (live-found on gpt-oss:120b, 2026-08-13).
+        msg, parsed, actionable = _complete_actionable(client, history, empty_retries)
+        if not actionable:
+            # Still nothing after the retry budget: surface it HONESTLY. Never a success-looking
+            # "final" with an empty reply — a step that produced nothing cannot read as done.
+            return TurnResult(
+                reply=f"(no action taken — the model returned an empty response "
+                      f"{empty_retries + 1} times)",
+                decisions=decisions, history=history, ambiguous=ambiguous, stopped="empty")
         # Record the assistant turn. When a reasoning model returns tool_calls with EMPTY content
         # (gpt-oss:120b does — its plan lives in a separate reasoning channel), synthesize a compact
         # record of what it REQUESTED, so a blank assistant turn doesn't erase the thread across a
