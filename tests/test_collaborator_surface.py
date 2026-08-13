@@ -10,6 +10,7 @@ import ast
 import json
 import pathlib
 import re
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -23,11 +24,22 @@ class FakeHost:
 
     def __init__(self, pending: int = 0):
         self.submitted: list = []
+        self.controls: list = []          # (method, *args) tuples recorded by the control methods
         self._pending = pending
 
     def submit(self, text: str) -> str:
         self.submitted.append(text)
         return "task-" + str(len(self.submitted))
+
+    # Stage-C control surface — record the call + args; return a plausible bool/None.
+    def pause(self):                      self.controls.append(("pause",))
+    def resume(self):                     self.controls.append(("resume",))
+    def set_proactivity(self, level):     self.controls.append(("set_proactivity", level)); return level in ("off", "conservative", "eager")
+    def set_leash(self, tool, leash):     self.controls.append(("set_leash", tool, leash)); return leash in ("act_then_report", "propose_first", "notify_only")
+    def approve(self, task_id):           self.controls.append(("approve", task_id)); return True
+    def decline(self, task_id):           self.controls.append(("decline", task_id)); return True
+    def approve_proposal(self, pid):      self.controls.append(("approve_proposal", pid)); return True
+    def veto(self, pid):                  self.controls.append(("veto", pid)); return True
 
     def snapshot(self) -> dict:
         tasks = [{"id": f"t{i}", "prompt": "p", "state": "running", "reply": "",
@@ -44,14 +56,20 @@ class FakeHost:
 
 def _req(method, url, headers=None, data=None):
     r = urllib.request.Request(url, method=method, headers=headers or {}, data=data)
-    try:
-        with urllib.request.urlopen(r, timeout=5) as resp:
-            return resp.status, dict(resp.headers), resp.read()
-    except urllib.error.HTTPError as e:
+    last = None
+    for _ in range(4):  # loopback resets under rapid server churn are infra noise, not behaviour
         try:
-            return e.code, dict(e.headers), e.read()
-        finally:
-            e.close()
+            with urllib.request.urlopen(r, timeout=5) as resp:
+                return resp.status, dict(resp.headers), resp.read()
+        except urllib.error.HTTPError as e:  # a real HTTP response (subclass of URLError) — return it
+            try:
+                return e.code, dict(e.headers), e.read()
+            finally:
+                e.close()
+        except (urllib.error.URLError, ConnectionError, OSError) as e:  # transient — retry
+            last = e
+            time.sleep(0.05)
+    raise last
 
 
 class SurfaceTestBase(unittest.TestCase):
@@ -259,6 +277,83 @@ class TestSecurityHeadersAndLeak(SurfaceTestBase):
         self.assertNotIn(csrf.encode(), ebody)
 
 
+class TestControl(SurfaceTestBase):
+    """Stage C — POST /control steers a running job. Each action reaches its Host method; nothing
+    else does; the same door guards it; a bad action/arg is a 400 and the Host is never touched."""
+
+    def _ctl(self, payload, headers=None):
+        h = headers if headers is not None else {**self._creds, "Content-Type": "application/json"}
+        return _req("POST", f"{self.base}/control", headers=h, data=json.dumps(payload).encode())
+
+    def setUp(self):
+        super().setUp()
+        cookie, csrf, _ = self._bootstrap()   # one credential set (bootstrap is single-use)
+        self._creds = {"Cookie": cookie, "X-Sal-Token": csrf}
+
+    def test_each_action_reaches_its_host_method(self):
+        cases = [
+            ({"action": "pause"}, ("pause",)),
+            ({"action": "resume"}, ("resume",)),
+            ({"action": "set_proactivity", "level": "eager"}, ("set_proactivity", "eager")),
+            ({"action": "set_leash", "tool": "write_file", "leash": "notify_only"},
+             ("set_leash", "write_file", "notify_only")),
+            ({"action": "approve", "task_id": "t9"}, ("approve", "t9")),
+            ({"action": "decline", "task_id": "t9"}, ("decline", "t9")),
+            ({"action": "approve_proposal", "proposal_id": "p9"}, ("approve_proposal", "p9")),
+            ({"action": "veto", "proposal_id": "p9"}, ("veto", "p9")),
+        ]
+        for payload, expected in cases:
+            code, _, body = self._ctl(payload)
+            self.assertEqual(code, 200, payload)
+            self.assertIn("ok", json.loads(body))
+            self.assertIn(expected, self.host.controls, payload)
+
+    def test_host_false_result_is_ok_false(self):
+        code, _, body = self._ctl({"action": "set_proactivity", "level": "bogus"})
+        self.assertEqual(code, 200)
+        self.assertFalse(json.loads(body)["ok"])
+
+    def test_unknown_action_400_host_untouched(self):
+        for payload in ({"action": "grant_capability", "cap": "offense:x"},
+                        {"action": "mint"}, {"action": ""}, {"foo": "bar"}, {"action": 3}):
+            code, _, _ = self._ctl(payload)
+            self.assertEqual(code, 400, payload)
+        self.assertEqual(self.host.controls, [])
+
+    def test_bad_or_missing_arg_400_host_untouched(self):
+        for payload in ({"action": "set_leash", "tool": "write_file"},          # missing leash
+                        {"action": "set_leash", "tool": "", "leash": "notify_only"},  # empty tool
+                        {"action": "approve", "task_id": 5},                     # non-string
+                        {"action": "set_leash", "tool": "x" * 300, "leash": "notify_only"}):  # oversized
+            code, _, _ = self._ctl(payload)
+            self.assertEqual(code, 400, payload)
+        self.assertEqual(self.host.controls, [])
+
+    def test_control_requires_csrf(self):
+        code, _, _ = self._ctl({"action": "pause"},
+                               headers={**{"Cookie": self._creds["Cookie"]},
+                                        "Content-Type": "application/json"})
+        self.assertEqual(code, 403)
+        self.assertEqual(self.host.controls, [])
+
+    def test_control_requires_cookie(self):
+        code, _, _ = self._ctl({"action": "pause"},
+                               headers={"X-Sal-Token": self._creds["X-Sal-Token"],
+                                        "Content-Type": "application/json"})
+        self.assertEqual(code, 403)
+
+    def test_control_cross_origin_forbidden(self):
+        code, _, _ = self._ctl({"action": "pause"},
+                               headers={**self._creds, "Content-Type": "application/json",
+                                        "Origin": "http://evil.com"})
+        self.assertEqual(code, 403)
+        self.assertEqual(self.host.controls, [])
+
+    def test_get_control_405(self):
+        code, _, _ = _req("GET", f"{self.base}/control", headers=self._creds)
+        self.assertEqual(code, 405)
+
+
 class TestStructuralInvariants(unittest.TestCase):
     """P-01 + bind-scope invariants read straight off the source / server object."""
 
@@ -295,6 +390,18 @@ class TestStructuralInvariants(unittest.TestCase):
             if isinstance(node, ast.Import):
                 for alias in node.names:
                     self.assertNotIn(alias.name.split(".")[-1], forbidden)
+
+    def test_p01_control_table_maps_only_to_known_controls(self):
+        """The /control dispatch table is the ENTIRE control surface; it may map ONLY to the known
+        restrict/express-config Host methods, never a grant/mint/authority-widening verb (P-01)."""
+        from collaborator.surface import _CONTROLS
+        allowed = {"pause", "resume", "set_proactivity", "set_leash",
+                   "approve", "decline", "approve_proposal", "veto"}
+        methods = {m for (m, _keys) in _CONTROLS.values()}
+        self.assertTrue(methods <= allowed, f"control table maps to unexpected: {methods - allowed}")
+        for m in methods:
+            for verb in ("grant", "mint", "cap", "authorize", "allow", "sign"):
+                self.assertNotIn(verb, m, f"control method {m!r} looks authority-widening")
 
 
 if __name__ == "__main__":

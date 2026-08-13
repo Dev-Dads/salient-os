@@ -57,6 +57,24 @@ _LOOPBACK = frozenset({"127.0.0.1", "localhost", "::1"})
 _COOKIE_NAME = "sal_session"
 _CSRF_HEADER = "X-Sal-Token"
 
+# POST /control (Stage C) — the ENTIRE control surface, a fixed allowlist mapping an action name
+# to a Host control method and the ORDERED string args it takes. Every method here only RESTRICTS
+# (pause/resume/decline/veto) or EXPRESSES host config (set_leash — cap-bounded at govern_action;
+# set_proactivity — surfacing only) or runs an already-permitted, re-gated action (approve/
+# approve_proposal). There is NO grant/mint method on the Host, so no control can widen authority
+# (P-01). The surface calls NOTHING on the Host outside this table + submit()/snapshot().
+_CONTROLS = {
+    "pause":            ("pause", ()),
+    "resume":           ("resume", ()),
+    "set_proactivity":  ("set_proactivity", ("level",)),
+    "set_leash":        ("set_leash", ("tool", "leash")),
+    "approve":          ("approve", ("task_id",)),
+    "decline":          ("decline", ("task_id",)),
+    "approve_proposal": ("approve_proposal", ("proposal_id",)),
+    "veto":             ("veto", ("proposal_id",)),
+}
+_CONTROL_ARG_MAX = 256  # a task/proposal id, tool name, leash, or level is short; cap hostile args
+
 
 # --- the bounded, loopback threading server ---------------------------------------------------
 
@@ -304,6 +322,8 @@ def _make_handler(surface: SalSurface, request_timeout: float):
                 self._route_state()
             elif path == "/favicon.ico":
                 self._send(204, b"")
+            elif path in ("/submit", "/control"):
+                self._deny(405, "method not allowed")
             else:
                 self._deny(404, "not found")
 
@@ -311,6 +331,8 @@ def _make_handler(surface: SalSurface, request_timeout: float):
             path = urlparse(self.path).path
             if path == "/submit":
                 self._route_submit()
+            elif path == "/control":
+                self._route_control()
             elif path in ("/", "/state"):
                 self._deny(405, "method not allowed")
             else:
@@ -319,8 +341,8 @@ def _make_handler(surface: SalSurface, request_timeout: float):
         # any other verb -> 405 on a known path, 404 otherwise
         def _bad_method(self) -> None:
             path = urlparse(self.path).path
-            self._deny(405 if path in ("/", "/state", "/submit") else 404,
-                       "method not allowed" if path in ("/", "/state", "/submit") else "not found")
+            known = path in ("/", "/state", "/submit", "/control")
+            self._deny(405 if known else 404, "method not allowed" if known else "not found")
 
         do_PUT = do_DELETE = do_PATCH = do_HEAD = do_OPTIONS = _bad_method
 
@@ -355,6 +377,44 @@ def _make_handler(surface: SalSurface, request_timeout: float):
                 return
             self._send(200, body, "application/json; charset=utf-8")
 
+        def _read_json_body(self) -> "dict | None":
+            """Read + parse a JSON object body under the caps shared by /submit and /control:
+            Content-Length required and capped BEFORE reading, then a TIGHT body-read deadline (a
+            legit body is already in the socket buffer; a stalled/lying Content-Length gets 408
+            fast rather than pinning a slot for the whole request timeout — D4 slowloris). On any
+            problem it sends the right error and returns None."""
+            s = self._sfc()
+            raw_len = self.headers.get("Content-Length")
+            if raw_len is None:
+                self._deny(411, "length required")
+                return None
+            try:
+                length = int(raw_len)
+            except ValueError:
+                self._deny(400, "bad request")
+                return None
+            if length < 0 or length > s.body_cap:
+                self._deny(413, "payload too large")
+                return None
+            try:
+                self.connection.settimeout(BODY_READ_TIMEOUT)
+                body = self.rfile.read(length)
+            except (TimeoutError, OSError):
+                self._deny(408, "request timeout")
+                return None
+            if len(body) != length:  # short read — client lied / closed early
+                self._deny(400, "bad request")
+                return None
+            try:
+                payload = json.loads(body.decode("utf-8"))
+            except Exception:  # noqa: BLE001
+                self._deny(400, "bad request")
+                return None
+            if not isinstance(payload, dict):
+                self._deny(400, "bad request")
+                return None
+            return payload
+
         def _route_submit(self) -> None:
             if not self._guard_authed(check_origin=True):
                 return
@@ -367,42 +427,47 @@ def _make_handler(surface: SalSurface, request_timeout: float):
             except Exception:  # noqa: BLE001
                 self._deny(500, "error")
                 return
-            # Body: Content-Length required and capped BEFORE reading.
-            raw_len = self.headers.get("Content-Length")
-            if raw_len is None:
-                self._deny(411, "length required")
+            payload = self._read_json_body()
+            if payload is None:
                 return
-            try:
-                length = int(raw_len)
-            except ValueError:
-                self._deny(400, "bad request")
-                return
-            if length < 0 or length > s.body_cap:
-                self._deny(413, "payload too large")
-                return
-            # Read the (small, local) body under a TIGHT deadline: a legit body is already in the
-            # socket buffer; a stalled or lying Content-Length gets 408 fast rather than pinning a
-            # handler thread + concurrency slot for the whole 15 s request timeout (D4 slowloris).
-            try:
-                self.connection.settimeout(BODY_READ_TIMEOUT)
-                body = self.rfile.read(length)
-            except (TimeoutError, OSError):
-                self._deny(408, "request timeout")
-                return
-            if len(body) != length:  # short read — client lied / closed early
-                self._deny(400, "bad request")
-                return
-            try:
-                payload = json.loads(body.decode("utf-8"))
-                text = payload["text"]
-            except Exception:  # noqa: BLE001
-                self._deny(400, "bad request")
-                return
+            text = payload.get("text")
             if not isinstance(text, str) or not text.strip():
                 self._deny(400, "bad request")
                 return
             task_id = s.host.submit(text)
             self._send(200, json.dumps({"task_id": task_id}).encode("utf-8"),
+                       "application/json; charset=utf-8")
+
+        def _route_control(self) -> None:
+            """Stage C — steer a running job. Dispatch through the FIXED `_CONTROLS` allowlist ONLY;
+            an unknown action or a bad arg is a 400 and the Host is never touched. A control that the
+            Host rejects (unknown tool/leash/level, task not awaiting, proposal gone) comes back
+            {"ok": false} — the page just shows nothing changed. No action can grant a capability."""
+            if not self._guard_authed(check_origin=True):
+                return
+            payload = self._read_json_body()
+            if payload is None:
+                return
+            action = payload.get("action")
+            spec = _CONTROLS.get(action) if isinstance(action, str) else None
+            if spec is None:
+                self._deny(400, "bad request")
+                return
+            method_name, keys = spec
+            args = []
+            for k in keys:
+                v = payload.get(k)
+                if not isinstance(v, str) or not v or len(v) > _CONTROL_ARG_MAX:
+                    self._deny(400, "bad request")
+                    return
+                args.append(v)
+            try:
+                result = getattr(self._sfc().host, method_name)(*args)
+            except Exception:  # noqa: BLE001
+                self._deny(500, "error")
+                return
+            ok = True if result is None else bool(result)
+            self._send(200, json.dumps({"ok": ok}).encode("utf-8"),
                        "application/json; charset=utf-8")
 
     return _Handler
@@ -461,12 +526,26 @@ _PAGE_HTML = """<!doctype html>
   .counts b {{ display:block; font-size:18px; color:var(--ink); }}
   footer {{ color:var(--muted); font-size:12px; margin-top:20px; }}
   .err {{ color:var(--bad); font-size:12px; }}
+  .ctl {{ border:1px solid var(--line); background:var(--bg); color:var(--ink); border-radius:7px;
+    padding:2px 10px; font-size:12px; font-weight:600; cursor:pointer; }}
+  .ctl:hover {{ border-color:var(--accent); }}
+  .ctl.approve {{ color:var(--ok); }} .ctl.danger {{ color:var(--bad); }}
+  select.dial, select.leashsel {{ border:1px solid var(--line); background:var(--bg);
+    color:var(--ink); border-radius:6px; padding:1px 5px; font:inherit; font-size:12px;
+    font-weight:600; cursor:pointer; }}
+  .rowbtns {{ display:inline-flex; gap:6px; margin-top:5px; }}
 </style></head>
 <body>
 <div class="wrap">
-  <h1>Sal <span id="status" class="status active">…</span></h1>
+  <h1>Sal <span id="status" class="status active">…</span>
+    <button id="pauseBtn" class="ctl">Pause</button></h1>
   <div class="sub">One presence you talk to and watch. Every step is governed — importance can
-    buy it more scrutiny, never more permission. Proactivity: <b id="proactivity">…</b></div>
+    buy it more scrutiny, never more permission. Proactivity:
+    <select id="proactivity" class="dial">
+      <option value="off">off</option>
+      <option value="conservative">conservative</option>
+      <option value="eager">eager</option>
+    </select></div>
 
   <div class="card">
     <h2>Give Sal a job</h2>
@@ -491,8 +570,10 @@ _PAGE_HTML = """<!doctype html>
 
   <div class="card"><h2>Tasks</h2><ul id="tasks"></ul></div>
 
-  <footer>The leashes above are live. Pausing, approving/vetoing a held step, and tightening a
-    leash become buttons in Stage C — this page is watch + one input for now.</footer>
+  <footer>Your hand is on the wheel: pause after the current step, approve or wave off a held step,
+    approve or veto a proposal, tighten a leash, set how forward Sal is. A control can only restrict
+    or express your setting — never grant Sal a capability. Pause takes effect after the current
+    step finishes.</footer>
 </div>
 
 <script nonce="{nonce}">
@@ -529,7 +610,13 @@ function proposalLi(p) {{
   li.appendChild(document.createTextNode(" "));
   li.appendChild(el("code", null, p.tool)); li.appendChild(document.createTextNode(" — "));
   li.appendChild(document.createTextNode(p.rationale || ""));
-  li.appendChild(el("div", "sum", "approve / veto arrive in Stage C"));
+  const row = el("div", "rowbtns");
+  const ap = el("button", "ctl approve", "Approve");
+  ap.addEventListener("click", () => control("approve_proposal", {{ proposal_id: p.id }}));
+  const vt = el("button", "ctl danger", "Veto");
+  vt.addEventListener("click", () => control("veto", {{ proposal_id: p.id }}));
+  row.appendChild(ap); row.appendChild(vt);
+  li.appendChild(row);
   return li;
 }}
 
@@ -543,8 +630,16 @@ function taskLi(t) {{
   li.appendChild(el("code", null, t.id));
   li.appendChild(el("div", "sum", t.prompt || ""));
   if (t.reply) li.appendChild(el("div", "sum", t.reply));
-  if (t.state === "awaiting_approval")
-    li.appendChild(el("div", "leash", "awaiting your approval — Stage C adds the button"));
+  if (t.state === "awaiting_approval") {{
+    li.appendChild(el("div", "leash", "holding a step for your approval"));
+    const row = el("div", "rowbtns");
+    const ap = el("button", "ctl approve", "Approve");
+    ap.addEventListener("click", () => control("approve", {{ task_id: t.id }}));
+    const dc = el("button", "ctl danger", "Decline");
+    dc.addEventListener("click", () => control("decline", {{ task_id: t.id }}));
+    row.appendChild(ap); row.appendChild(dc);
+    li.appendChild(row);
+  }}
   if (t.error) li.appendChild(el("div", "err", t.error));
   return li;
 }}
@@ -568,7 +663,8 @@ function render(s) {{
   const st = $("status");
   st.textContent = s.paused ? "PAUSED" : "ACTIVE";
   st.className = "status " + (s.paused ? "paused" : "active");
-  $("proactivity").textContent = s.proactivity || "";
+  $("pauseBtn").textContent = s.paused ? "Resume" : "Pause";
+  if (document.activeElement !== $("proactivity")) $("proactivity").value = s.proactivity || "conservative";
 
   const lb = $("leashes"); lb.textContent = "";
   const leashes = s.leashes || {{}};
@@ -577,7 +673,14 @@ function render(s) {{
   names.forEach((name) => {{
     const chip = el("span", "chip");
     chip.appendChild(el("b", null, name));
-    chip.appendChild(el("span", null, leashes[name]));
+    const sel = el("select", "leashsel");
+    ["act_then_report", "propose_first", "notify_only"].forEach((lv) => {{
+      const o = el("option", null, lv); o.value = lv;
+      if (lv === leashes[name]) o.selected = true;
+      sel.appendChild(o);
+    }});
+    sel.addEventListener("change", () => control("set_leash", {{ tool: name, leash: sel.value }}));
+    chip.appendChild(sel);
     lb.appendChild(chip);
   }});
 
@@ -624,10 +727,27 @@ async function send() {{
 function poll_now() {{ fetch("/state", {{ headers: {{ "X-Sal-Token": CSRF }} }})
   .then((r) => r.ok ? r.json() : null).then((s) => s && render(s)).catch(() => {{}}); }}
 
+// A control only restricts or expresses your setting — the server re-validates every one and can
+// never grant Sal a capability. POST, then re-poll to show the new governed state.
+async function control(action, extra) {{
+  try {{
+    await fetch("/control", {{
+      method: "POST",
+      headers: {{ "Content-Type": "application/json", "X-Sal-Token": CSRF }},
+      body: JSON.stringify(Object.assign({{ action }}, extra || {{}})),
+    }});
+  }} catch (e) {{}}
+  poll_now();
+}}
+
 $("send").addEventListener("click", send);
 $("prompt").addEventListener("keydown", (e) => {{
   if (e.key === "Enter" && !e.shiftKey) {{ e.preventDefault(); send(); }}
 }});
+$("pauseBtn").addEventListener("click", () =>
+  control($("status").textContent === "PAUSED" ? "resume" : "pause"));
+$("proactivity").addEventListener("change", () =>
+  control("set_proactivity", {{ level: $("proactivity").value }}));
 poll();
 </script>
 </body></html>"""
