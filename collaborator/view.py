@@ -115,7 +115,7 @@ class JudgmentView:
                 "origin": getattr(d, "origin", "direct"), "summary": d.summary()}
 
     def _proposal(self, p: Proposal) -> dict:
-        return {"tool": p.decision.tool, "confidence": p.confidence,
+        return {"id": p.proposal_id, "tool": p.decision.tool, "confidence": p.confidence,
                 "rationale": p.rationale, "leash": p.decision.leash, "summary": p.summary()}
 
     def snapshot(self) -> dict:

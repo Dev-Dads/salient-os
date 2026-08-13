@@ -118,6 +118,65 @@ def main() -> int:
         phase("P3 governed steps visible in /state", governed > 0 and ran > 0,
               f"attending={governed} ran={ran} file_written={wrote}")
 
+        # ---- Stage C: steer a running job entirely via POST /control ----
+        def ctl(action, **extra):
+            body = json.dumps(dict(action=action, **extra)).encode()
+            st, _, b = _req("POST", f"{base}/control",
+                            headers={**creds, "Content-Type": "application/json"}, data=body)
+            return st, (json.loads(b).get("ok") if st == 200 else None)
+
+        def state():
+            _, _, b = _req("GET", f"{base}/state", headers=creds)
+            return json.loads(b)
+
+        # C1 — pause / resume flips snapshot.paused live.
+        st1, ok1 = ctl("pause"); paused = state()["paused"]
+        st2, ok2 = ctl("resume"); unpaused = state()["paused"]
+        phase("C1 pause/resume via /control", st1 == 200 and ok1 and paused and st2 == 200 and not unpaused,
+              f"paused={paused}->{unpaused}")
+
+        # C2 — tighten a leash via /control so a write HOLDS, then APPROVE it to DONE via /control.
+        # gpt-oss intermittently no-ops a short write prompt (returns empty completions -> the task
+        # honestly FAILS) even at temp 0; that is a known model-reliability quirk, not a surface
+        # issue, so we RETRY the submit until the write actually holds (or give up after N).
+        stl, okl = ctl("set_leash", tool="write_file", leash="propose_first")
+        tid, held = None, None
+        for attempt in range(5):
+            _, _, body = _req("POST", f"{base}/submit",
+                              headers={**creds, "Content-Type": "application/json"},
+                              data=json.dumps({"text":
+                                  "Create a file control_proof.txt containing just the word: steered."}).encode())
+            tid = json.loads(body)["task_id"]
+            deadline = time.monotonic() + 120
+            while time.monotonic() < deadline:
+                t = next((t for t in state().get("tasks", []) if t["id"] == tid), None)
+                if t and t["state"] in ("awaiting_approval", "done", "failed"):
+                    held = t
+                    break
+                time.sleep(1.0)
+            if held and held["state"] == "awaiting_approval":
+                break  # got a real hold to steer
+        did_hold = bool(held) and held["state"] == "awaiting_approval"
+        phase("C2a set_leash held a write via /control", okl and did_hold,
+              f"leash_ok={okl} state={held['state'] if held else 'timeout'} "
+              f"reply={held.get('reply','')[:120]!r} held_n={len(held.get('held',[]))}" if held else "timeout")
+
+        approved_done = None
+        if did_hold:
+            sta, oka = ctl("approve", task_id=tid)
+            deadline = time.monotonic() + 180
+            while time.monotonic() < deadline:
+                t = next((t for t in state().get("tasks", []) if t["id"] == tid), None)
+                if t and t["state"] in ("done", "failed", "cancelled"):
+                    approved_done = t
+                    break
+                time.sleep(1.0)
+        wrote = (ws / "control_proof.txt").exists()
+        phase("C2b approve via /control → DONE",
+              bool(approved_done) and approved_done["state"] == "done" and wrote,
+              f"state={approved_done['state'] if approved_done else 'n/a'} file_written={wrote}")
+
+        snap = state()
         print("\n--- final /state snapshot (trimmed) ---", flush=True)
         print(json.dumps({"paused": snap.get("paused"), "counts": snap.get("counts"),
                           "leashes": snap.get("leashes"),
