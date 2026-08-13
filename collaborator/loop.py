@@ -118,13 +118,29 @@ def sal_system_prompt() -> str:
     return _SAL_SYSTEM_TEMPLATE.replace(_TOOL_MANIFEST_SENTINEL, manifest)
 
 
+# TurnResult.stopped terminal states. Named so a host has an UNAMBIGUOUS contract: a host
+# MUST switch on this explicitly and MUST NOT treat "anything not held/paused" as success —
+# both EMPTY and MAX_ITERATIONS are failures-to-complete, surfaced honestly (external panel
+# gpt-5.1 + gemini: a caller that if/elifs the old, smaller enum without an else could turn a
+# new EMPTY back into a silent no-op at the UI layer). Only FINAL is a normal completion;
+# HELD/PAUSED are awaiting-you; EMPTY/MAX_ITERATIONS did not finish.
+STOPPED_FINAL = "final"                     # ran to a normal end
+STOPPED_HELD = "held"                       # a propose_first action is awaiting your approval
+STOPPED_PAUSED = "paused"                   # the host paused the session
+STOPPED_MAX_ITERATIONS = "max_iterations"   # gave up after max_iterations — did NOT finish
+STOPPED_EMPTY = "empty"                     # the model returned nothing actionable — did NOT finish
+STOPPED_SUCCESS = frozenset({STOPPED_FINAL})            # a host may treat only these as "completed"
+STOPPED_AWAITING = frozenset({STOPPED_HELD, STOPPED_PAUSED})  # ...these as "your move"
+STOPPED_FAILED = frozenset({STOPPED_MAX_ITERATIONS, STOPPED_EMPTY})  # ...these as "did not finish"
+
+
 @dataclass
 class TurnResult:
     reply: str
     decisions: list = field(default_factory=list)
     history: list = field(default_factory=list)
     ambiguous: list = field(default_factory=list)
-    stopped: str = "final"  # "final" | "held" | "paused" | "max_iterations"
+    stopped: str = STOPPED_FINAL  # one of STOPPED_* above
 
 
 def _content(msg) -> str:
@@ -144,8 +160,60 @@ def _render_intent(intent) -> str:
     return f"{intent.name}({str(prim)[:60]})"
 
 
+# Empty-completion recovery (live-found on gpt-oss:120b, 2026-08-13). A reasoning model
+# sometimes ends a turn after ONLY its private reasoning channel: empty content, no tool
+# call, finish_reason=stop (not truncation). At a greedy temperature this is DETERMINISTIC
+# and streaks — so a plain retry on the identical history reproduces the empty (measured
+# 0/6 escaped), and a prompt "you returned nothing, act now" nudge also fails (0/6). What
+# reliably escapes it is PERTURBING the sampling: raising the temperature (temp 0.7 → 5/6
+# recovered). So retries escalate the temperature. This affects only WHETHER a response is
+# obtained; every response still flows through govern_action unchanged — the seam is untouched.
+_RETRY_BASE_TEMP = 0.7    # first retry temperature (validated escape point)
+_RETRY_TEMP_STEP = 0.15   # escalate each further retry...
+_RETRY_TEMP_MAX = 1.0     # ...up to this cap
+
+
+def _retry_temperature(attempt: int) -> float:
+    """Temperature for retry ``attempt`` (1-based; attempt 0 is the initial call, which uses
+    the client's own temperature). Escalates from ``_RETRY_BASE_TEMP`` to break a deterministic
+    empty streak that a same-temperature retry cannot."""
+    return min(_RETRY_TEMP_MAX, _RETRY_BASE_TEMP + _RETRY_TEMP_STEP * (attempt - 1))
+
+
+def _is_actionable(msg, parsed) -> bool:
+    """A completion is actionable if it DID something (a tool intent), TRIED something (an
+    ambiguous call we surface for you), or SAID something (non-empty text). An EMPTY
+    completion — a reasoning model that ended its turn after only its private reasoning
+    channel: no content, no tool call (finish_reason=stop, not truncation) — is none of
+    these. It is silence, not a finished turn, and must never be read as a clean 'final'."""
+    if parsed.intents or parsed.ambiguous:
+        return True
+    return bool((parsed.text or _content(msg)).strip())
+
+
+def _complete_actionable(client, history, empty_retries: int):
+    """Get an ACTIONABLE completion, retrying past empty (reasoning-only) responses up to
+    ``empty_retries`` extra times, escalating the temperature on each retry to escape a
+    deterministic empty streak (see the module note above). The first attempt uses the
+    client's configured temperature; only retries perturb it. Returns
+    ``(msg, parsed, actionable)`` — ``actionable`` is False only if STILL empty after the
+    whole budget, which the caller must surface honestly, never as a finished turn."""
+    tools = openai_tools()
+    msg: dict = {}
+    parsed = parse_message(msg)
+    for attempt in range(max(1, empty_retries + 1)):
+        if attempt == 0:
+            msg = client.complete(history, tools=tools)  # the model's preferred (low-temp) shot
+        else:
+            msg = client.complete(history, tools=tools, temperature=_retry_temperature(attempt))
+        parsed = parse_message(msg)
+        if _is_actionable(msg, parsed):
+            return msg, parsed, True
+    return msg, parsed, False
+
+
 def run_turn(session, client, user_message: str, history=None, max_iterations: int = 6,
-             importance=None, risk=None) -> TurnResult:
+             importance=None, risk=None, empty_retries: int = 3) -> TurnResult:
     """Run one user turn to completion (or until max_iterations)."""
     history = list(history or [])
     # Ground the model with Sal's system prompt (make-it-move), AUTHORITATIVELY (grounding panel
@@ -168,8 +236,17 @@ def run_turn(session, client, user_message: str, history=None, max_iterations: i
     for _ in range(max_iterations):
         # Pass the tool schema too, so a backend with native function-calling emits structured
         # calls; the in-prompt manifest is the floor for backends that emit calls as content.
-        msg = client.complete(history, tools=openai_tools())
-        parsed = parse_message(msg)
+        # Retry past an EMPTY (reasoning-only) completion rather than let the empty-intents check
+        # below read it as a clean "final" — a silent no-op narrated as a finished task is the
+        # exact dishonesty this loop exists to prevent (live-found on gpt-oss:120b, 2026-08-13).
+        msg, parsed, actionable = _complete_actionable(client, history, empty_retries)
+        if not actionable:
+            # Still nothing after the retry budget: surface it HONESTLY. Never a success-looking
+            # "final" with an empty reply — a step that produced nothing cannot read as done.
+            return TurnResult(
+                reply=f"(no action taken — the model returned an empty response "
+                      f"{empty_retries + 1} times)",
+                decisions=decisions, history=history, ambiguous=ambiguous, stopped=STOPPED_EMPTY)
         # Record the assistant turn. When a reasoning model returns tool_calls with EMPTY content
         # (gpt-oss:120b does — its plan lives in a separate reasoning channel), synthesize a compact
         # record of what it REQUESTED, so a blank assistant turn doesn't erase the thread across a
@@ -183,7 +260,7 @@ def run_turn(session, client, user_message: str, history=None, max_iterations: i
 
         if not parsed.intents:
             return TurnResult(reply=parsed.text or _content(msg), decisions=decisions,
-                              history=history, ambiguous=ambiguous, stopped="final")
+                              history=history, ambiguous=ambiguous, stopped=STOPPED_FINAL)
 
         # Each tool call is its own governed action; feed authoritative results back.
         lines = []
@@ -210,14 +287,14 @@ def run_turn(session, client, user_message: str, history=None, max_iterations: i
         if any(d.status == PAUSED for d in iter_decisions):
             return TurnResult(reply="(stopped: the host paused the session)",
                               decisions=decisions, history=history, ambiguous=ambiguous,
-                              stopped="paused")
+                              stopped=STOPPED_PAUSED)
         if any(d.status == HELD for d in iter_decisions):
             return TurnResult(reply="(paused: awaiting your approval of the held action(s) above)",
                               decisions=decisions, history=history, ambiguous=ambiguous,
-                              stopped="held")
+                              stopped=STOPPED_HELD)
 
     return TurnResult(reply="(stopped: max iterations reached)", decisions=decisions,
-                      history=history, ambiguous=ambiguous, stopped="max_iterations")
+                      history=history, ambiguous=ambiguous, stopped=STOPPED_MAX_ITERATIONS)
 
 
 def approve(session, decision: Decision) -> Decision:

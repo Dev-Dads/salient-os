@@ -116,5 +116,98 @@ class NetPostF1ModelCannotSelfOriginate(unittest.TestCase):
             self.assertEqual(r.stopped, "held")
 
 
+EMPTY = {"content": "", "tool_calls": None}  # a reasoning-only completion: no content, no call
+
+
+class _EmptyAtLowTempClient:
+    """Emulates the live failure mode: a DETERMINISTIC empty streak at greedy temperature
+    (a same-temp retry never escapes it), which breaks only when the temperature is raised.
+    Acts once called at temperature >= 0.5, then answers plainly."""
+
+    def __init__(self, act_msg) -> None:
+        self._act = act_msg
+        self._acted = False
+        self.temps: list = []
+
+    def complete(self, messages, tools=None, temperature=None) -> dict:
+        self.temps.append(temperature)
+        if self._acted:
+            return {"content": "done"}
+        if temperature is not None and temperature >= 0.5:
+            self._acted = True
+            return self._act
+        return {"content": "", "tool_calls": None}  # empty at greedy / default temp
+
+
+class EmptyCompletionIsNotDone(unittest.TestCase):
+    """Live-found (gpt-oss:120b, 2026-08-13): the model intermittently ends a turn after
+    only its private reasoning channel — empty content, no tool call, finish_reason=stop —
+    DETERMINISTICALLY at greedy temperature. The loop must treat that as SILENCE (retry with
+    an escalating temperature to escape the streak), never as a finished 'final' turn."""
+
+    def test_retries_past_empty_then_acts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = Session(workspace=tmp)
+            client = ScriptedClient([
+                EMPTY, EMPTY,                                   # two reasoning-only no-ops
+                _call("write_file", {"path": "out.txt", "content": "hi"}),  # then it acts
+                {"content": "done"},
+            ])
+            r = run_turn(s, client, "write out.txt")
+            self.assertEqual(len(r.decisions), 1)
+            self.assertEqual(r.decisions[0].status, RAN)
+            self.assertEqual((Path(tmp) / "out.txt").read_text(), "hi")
+            self.assertEqual(r.stopped, "final")
+            # loop hygiene: the discarded empties are NEVER appended as blank assistant turns
+            blanks = [m for m in r.history
+                      if m.get("role") == "assistant" and not (m.get("content") or "").strip()]
+            self.assertEqual(blanks, [])
+            # the first attempt uses the client's own temperature; retries escalate it
+            self.assertIsNone(client.temps[0])
+            self.assertGreaterEqual(client.temps[1], 0.5)
+
+    def test_retry_escalates_temperature_to_escape_a_deterministic_empty_streak(self):
+        # A plain same-temperature retry would loop forever here; only the raised temperature
+        # gets an action out of the model.
+        with tempfile.TemporaryDirectory() as tmp:
+            s = Session(workspace=tmp)
+            client = _EmptyAtLowTempClient(_call("write_file", {"path": "o.txt", "content": "x"}))
+            r = run_turn(s, client, "write o.txt")
+            self.assertEqual(r.stopped, "final")
+            self.assertEqual((Path(tmp) / "o.txt").read_text(), "x")
+            self.assertIsNone(client.temps[0])                 # first shot: model's own temp
+            self.assertTrue(any(t is not None and t >= 0.5 for t in client.temps))  # escalated
+
+    def test_all_empty_surfaces_error_never_silent_success(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = Session(workspace=tmp)
+            client = ScriptedClient([EMPTY, EMPTY, EMPTY])     # empty through the whole budget
+            r = run_turn(s, client, "do something", empty_retries=2)   # 3 attempts
+            self.assertEqual(r.stopped, "empty")               # NOT "final"
+            self.assertEqual(r.decisions, [])
+            self.assertFalse((Path(tmp) / "out.txt").exists())
+            self.assertIn("empty response", r.reply)           # honest, not a fake success
+            self.assertEqual(len(client.seen), 3)              # exactly the retry budget, no more
+
+    def test_legit_final_answer_is_not_retried(self):
+        # A real answer with no tool call is a valid, immediate 'final' — never re-rolled.
+        with tempfile.TemporaryDirectory() as tmp:
+            s = Session(workspace=tmp)
+            client = ScriptedClient([{"content": "The answer is 42."}])
+            r = run_turn(s, client, "what is the answer?")
+            self.assertEqual(r.stopped, "final")
+            self.assertEqual(r.reply, "The answer is 42.")
+            self.assertEqual(len(client.seen), 1)              # one call, no wasted retries
+            self.assertEqual(client.temps, [None])             # used the client's own temperature
+
+    def test_empty_retries_zero_is_single_attempt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = Session(workspace=tmp)
+            client = ScriptedClient([EMPTY])
+            r = run_turn(s, client, "do something", empty_retries=0)
+            self.assertEqual(r.stopped, "empty")
+            self.assertEqual(len(client.seen), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
