@@ -17,8 +17,15 @@ COLLABORATOR_MODEL_CLIENT_VERSION = "0.1.0"
 
 
 class OllamaClient:
+    # max_tokens caps the model's OUTPUT per reply — NOT the context window (gpt-oss:120b's is
+    # 131072, prompt + output shared). A directive turn typically emits only a few hundred tokens
+    # (short reasoning + a compact tool-call JSON), so this is generous for the common case; the
+    # reason to keep real headroom is a single turn that legitimately generates a LOT — chiefly a
+    # large write_file, whose file content is produced as tool-call-argument tokens (a ~400-line
+    # file exceeds 4096 and would clip the JSON mid-call). 16384 fits ~1000-line writes and long
+    # reasoning while staying ~8x below the context window and bounding a runaway generation.
     def __init__(self, base_url: str, model: str, api_key: str = "ollama",
-                 timeout: int = 120, max_tokens: int = 4096, temperature: float = 0.2) -> None:
+                 timeout: int = 120, max_tokens: int = 16384, temperature: float = 0.2) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.api_key = api_key
