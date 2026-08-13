@@ -1,123 +1,168 @@
 # Host panel: openai/gpt-5.1
 
-_cost=$0.0950 finish=stop_
+_cost=$0.1053 finish=stop_
 
-ID: H1 / TITLE: Possible stale task resume after DECLINE or stop() / SEVERITY: LOW  
-LOCATION: collaborator/host.py:140-145, 213-234  
-
+ID: F1 / TITLE: Approving a task can enqueue multiple resume jobs and cause surprising re-entry / SEVERITY: LOW  
+LOCATION: collaborator/host.py:176-187 (approve), 237-278 (_handle_resume)  
 CONCRETE INTERLEAVING OR INPUT:  
-1. User submits a task; worker runs `_handle_turn`, enters `run_turn`, and eventually returns `STOPPED_HELD`, populating `task.held`.  
-2. Before the user inspects and declines the task, the host process calls `stop()` (e.g., application shutdown) while `_run_worker` is blocked inside a model call. `_stopping` is set and `_STOP` is queued, but `_handle_turn` will still complete later (if the worker isn’t joined in time or join_timeout is short).  
-3. After restart, an external controller that has persisted task IDs re-attaches to a new Collaborator instance with the same `Session` and could (buggy) call `approve(task_id)` based on old state. The new host instance, having no task with that ID in `_tasks`, will simply ignore it; however, the old worker thread (if still alive due to a race on process teardown or embedding environment) might still complete the prior `_handle_turn` and call `_absorb_result`, changing the state of the now-orphaned task.  
+- Task T has a held decision and is in `AWAITING_APPROVAL`.  
+- User A calls `approve(T)` twice in quick succession on different threads (or via a buggy UI double-click).  
+- First call under the lock sees `state == AWAITING_APPROVAL`, sets `state = RUNNING`, enqueues `_ResumeJob(T)`.  
+- Second call, still under the lock, also sees `state == AWAITING_APPROVAL` is now false (since first set it to RUNNING), so it returns False and does not enqueue.  
+- On the worker: `_handle_resume` copies `held`, runs `approve_held_decision` on the held list once, records decisions, empties `held`, and resumes the task via `run_turn`.  
 
 WHY IT BREAKS A GUARANTEE:  
-This is a lifecycle nit rather than a correctness break: the design does not persist or transfer task ownership across host instances, and the API makes no promise about task IDs surviving restart. There is, however, a small discrepancy between the narrative (“one presence that owns the loop”) and the fact that stop() does not strictly guarantee that no more `_absorb_result` calls will ever run if the embedding application fails to join or terminates oddly. It does not let any control race an append or cause off‑thread execution; it just leaves a theoretical window where an old worker instance could still mutate an in‑memory task structure that callers no longer consider live.  
+This interleaving actually demonstrates that `approve` is idempotent and *does not* double-run the action: the second call is rejected. The important point is that the host relies both on the `state` check and on the lower-layer `Decision.consumed` guard in `loop.approve()`. The guarantee under C3 is that "loop.approve's `consumed` flag + the single worker prevent a held decision running twice." In this scenario, even if there were a bug in the host's `state` handling, the decision-layer `consumed` flag would still stop double execution. I could not construct an input where the same held decision is run twice.  
 
 WHETHER ANOTHER LAYER CATCHES IT:  
-Yes; in practice the Python process teardown and the fact that `_tasks` is private to a single Collaborator instance confine any such mutation to memory that no longer has live references from the embedding surface. There is no cross‑Session or cross‑process sharing, and no path for that stale write to affect authority or egress.  
+Yes: `collaborator.loop.approve` marks a held decision `consumed = True` just before calling `execute_and_verify`, and any subsequent approval path that touches the same decision returns it without executing it again. The single worker thread ensures there is no concurrent double-call into `approve` for the same decision.  
 
 FIX:  
-Clarify in documentation that `Collaborator.stop()` is a best‑effort in‑process shutdown and that tasks are not durable across process boundaries; if you want a hard guarantee that no more state changes will occur, ensure the embedding process joins the worker thread successfully before reusing the `Session` object elsewhere. Optionally, strengthen `stop()` by (a) looping to drain any remaining work items created before `_stopping` was set, or (b) storing an internal generation token and having `_absorb_result` bail out if it’s called after a stop generation change. This would make the “one presence” ownership model more obviously true even under unusual teardown.
+No fix required for correctness; at most, you could tighten the host-side guard by also checking that `task.held` is non-empty at `approve` time and maybe storing a monotonic "resume_generation" counter to ignore stale resume jobs, but these are defensive nits, not necessary to uphold the guarantee.
+
 
 ---
 
-ID: H2 / TITLE: Private attributes exposed to tests (`h._tasks`, `_proposals`) / SEVERITY: LOW  
-LOCATION: tests/test_collaborator_host.py:74, 129; collaborator/host.py:63, 89  
-
+ID: F2 / TITLE: Snapshot of tasks and ledger is atomic and thread-safe / SEVERITY: LOW  
+LOCATION: collaborator/host.py:112-121 (snapshot), 212-234 (_run_worker and _dispatch), collaborator/view.py:74-96 (JudgmentView.snapshot)  
 CONCRETE INTERLEAVING OR INPUT:  
-The tests directly access `h._tasks[tid].decisions` and `h._proposals` to inspect internal state. A naive future maintainer might mirror this pattern in production integration code, accessing private structures without the lock and risking races (e.g., iterating `h._tasks` while the worker thread updates it).  
+- Worker thread is in `_absorb_result` updating `ledger.decisions` and a `Task`’s state under `self._lock`.  
+- Concurrently, a UI thread calls `snapshot()`, enters `with self._lock` after the worker releases it, then calls `self.view.snapshot()` which iterates `ledger.decisions` and `ledger.proposals` and computes counts, then enumerates `self._tasks.values()` to build `tasks`.  
+- The ticker thread may also be running `_run_ticker`, but `_should_propose` and any modification of `_propose_pending` or `_tasks` is under `self._lock`.  
 
 WHY IT BREAKS A GUARANTEE:  
-As written, the shipped module plus tests do not break the C1–C4 guarantees. The risk is social/maintenance: external callers might incorrectly treat these private structures as part of the supported concurrency contract and read them without taking `_lock`, leading to snapshots that are not necessarily atomic with respect to ledger appends. That would violate the “snapshot is atomic” guarantee, but only because caller code stepped outside the provided API.  
+It does not. I attempted to construct an interleaving where:  
+- `JudgmentView.snapshot` iterates `ledger.proposals` while `_handle_propose` appends to it; or  
+- `tasks` dict is mutated while iterating it for `t.view()`.  
+In all cases, those sequences are guarded by the *same* `self._lock` in `Collaborator`. The worker holds the lock for the minimum time it updates state and never across any `run_turn` or `client.complete` call (which are explicitly labeled `# UNLOCKED`). I could not create a `RuntimeError` from dict/list mutation during iteration nor an inconsistent snapshot of counts vs decisions.  
 
 WHETHER ANOTHER LAYER CATCHES IT:  
-Yes; the host’s public API (`snapshot()`, `get_task()`) enforces locking, and nothing in the module’s exported surface requires or encourages use of the private attributes. This is therefore a non‑bug from the host’s perspective, but worth flagging as a potential future foot‑gun.  
+The JudgmentLedger itself is not internally locked, but in this host the only mutating access paths are under `Collaborator._lock`, and all snapshot reads are also taken under that lock. There is no second writer thread.  
 
 FIX:  
-Document clearly in `Collaborator`’s docstring that `_tasks`, `_proposals`, and `_jobs` are internal implementation details not safe to use concurrently and that callers must use `snapshot()` / `get_task()`. Optionally, rename them to `__tasks` / `__proposals` to make accidental external use even less likely, or add a thin locked accessor for introspection tests.
+No change required. As a minor hardening, you could document that the ledger is single-threaded and only to be mutated under the host’s lock, but that is already how this module uses it.
+
 
 ---
 
-ID: H3 / TITLE: `approve()` sets task state to RUNNING before enqueue, but state is re‑set in worker / SEVERITY: LOW  
-LOCATION: collaborator/host.py:197‑206, 229‑246  
-
+ID: F3 / TITLE: ProposeJob cannot interleave with a TurnJob to drive two governance paths concurrently / SEVERITY: LOW  
+LOCATION: collaborator/host.py:286-309 (_run_ticker, _should_propose), 214-234 (_run_worker)  
 CONCRETE INTERLEAVING OR INPUT:  
-1. Task T is in `AWAITING_APPROVAL` with one HELD decision.  
-2. User calls `approve(T)`. Under `_lock`, host checks state, sets `t.state = RUNNING`, and calls `_touch()`, then enqueues `_ResumeJob(T)`.  
-3. A concurrent UI thread calls `snapshot()` between `approve()` returning and the worker picking up the job. It sees the task in state `RUNNING`, but no additional decisions yet.  
-4. The worker processes `_ResumeJob`: under the lock it again sets `task.state = RUNNING` and then, if all approvals DENY, sets `task.state = AWAITING_APPROVAL` later.  
+- Session `proactivity="eager"`, `idle_seconds=0`, `propose_cooldown=0`.  
+- No tasks yet; `_worker_busy=False`, `jobs.empty() is True`, no `RUNNING/QUEUED` tasks, no pending proposals → `_should_propose()` returns True; ticker sets `_propose_pending = True` under the lock and enqueues `_ProposeJob`.  
+- User submits a task concurrently: `submit()` enqueues `_TurnJob` then returns; `_worker` thread processes queue serially (either `_TurnJob` then `_ProposeJob`, or vice versa).  
+- Suppose `_TurnJob` is handled first: worker sets `_worker_busy=True` under `_lock`, releases it, runs `run_turn` (long blocking), then `_absorb_result` and clears `_worker_busy=False`. During this window, `_should_propose` will always see `_worker_busy` as True and refuse to enqueue *new* proposals even if the ticker fires. The existing `_ProposeJob` is just in the queue, to be processed after the turn.  
 
 WHY IT BREAKS A GUARANTEE:  
-This is a tiny semantic quirk, not a correctness break: for a brief period after `approve()` returns but before the worker actually runs the approval(s), a dashboard may optimistically show state `RUNNING` even if, after re‑gating, no action can run and the state snaps back to `AWAITING_APPROVAL`. The C3 contract (“DENIED leaves the task AWAITING and retryable”) is still met; there is just a short optimistic window.  
+It does not. An idle-triggered `_ProposeJob` can be queued just before or after a `_TurnJob`, but only one job executes at a time on the worker thread. `propose()` runs only from `_handle_propose` on the worker, and `run_turn()` is also only called from `_handle_turn` or `_handle_resume`. There is never a concurrent call to `govern_action` or `execute_and_verify` across these; the "two govern_action drivers" condition cannot arise.  
 
 WHETHER ANOTHER LAYER CATCHES IT:  
-Yes. `_handle_resume` re‑gates, records decisions, and explicitly repairs the state to `AWAITING_APPROVAL` if all approvals come back DENIED, so the durable state is correct. The single worker thread plus locking ensure there is no double approval or off‑thread execution.  
+Yes: beyond the host’s checks, the single worker thread is the structural enforcement. Even if `_should_propose` were buggy and enqueued multiple `_ProposeJob`s while a turn is running, they'd still execute serially, not concurrently.  
 
 FIX:  
-If you want stricter semantics, change `approve()` so it does not mutate `task.state` to `RUNNING` on the caller thread. Instead, leave it `AWAITING_APPROVAL` and let `_handle_resume` own the state transition entirely based on the result of `approve_held_decision`. This makes the UI always reflect “awaiting” until actual execution begins, but requires no change to the worker’s logic.
+No fix required. The existing test `test_should_not_propose_while_busy_or_running` already pins the `_should_propose` gating at the host level.
+
 
 ---
 
-ID: H4 / TITLE: `pause()` and `resume()` use a single scalar flag for an entire Session / SEVERITY: LOW  
-LOCATION: collaborator/host.py:159‑177; collaborator/governance.py:227‑237  
-
+ID: F4 / TITLE: Task lifecycle correctly distinguishes FAILED from DONE and keeps AWAITING on denied approvals / SEVERITY: LOW  
+LOCATION: collaborator/host.py:319-346 (_absorb_result), 248-281 (_handle_resume), tests/test_collaborator_host.py:118-128, 141-173  
 CONCRETE INTERLEAVING OR INPUT:  
-1. Multiple tasks are queued or running concurrently over the same `Session` (which is a documented pattern: `Collaborator` is per‑session, so this is equivalent to sequential tasks, not true concurrency).  
-2. The host calls `pause()`, which sets `session.paused = True`. The next governed action in any future `run_turn` call will be given status `PAUSED` and the TurnResult will have `stopped=STOPPED_PAUSED`. `_absorb_result` then sets the corresponding task state to `PAUSED`.  
-3. Host `resume()` always scans all tasks and treats any with state `PAUSED` as resumable, enqueuing them. If a caller had conceptually intended to pause a single task rather than the entire Session, this is a mis‑match.  
+- Model returns a `TurnResult` with `stopped == STOPPED_EMPTY` or `STOPPED_MAX_ITERATIONS`: `_absorb_result` takes the `else` branch, setting `task.state = FAILED`.  
+- For a held turn: `stopped == STOPPED_HELD`, host extracts `HELD` decisions into `task.held` and sets `state = AWAITING_APPROVAL`.  
+- Between hold and approve, capabilities are revoked so `approve_held_decision` returns a `DENIED` decision. `_handle_resume` records the `RAN`/`DENIED` decisions, computes `remaining` (held items for which `d.status != RAN`), and if `remaining`, sets `task.state = AWAITING_APPROVAL` and returns *without* resuming the loop.  
 
 WHY IT BREAKS A GUARANTEE:  
-It doesn’t break any of the stated C1–C4 guarantees; it is a design choice. The contract text is clear that the pause is at the Session/view level (“the session was paused mid‑turn”; “the judgment view’s pause control”), not per‑task. The only risk is a caller misunderstanding and assuming per‑task granularity.  
+It does not. Tests explicitly cover:  
+- `test_empty_completion_task_is_FAILED_not_done`: EMPTY goes to FAILED, not DONE.  
+- `test_approve_denied_stays_awaiting`: revoking `shell.exec` after HOLD and then approving leaves the task in `AWAITING_APPROVAL` with a `DENIED` decision recorded.  
+- `test_partial_deny_keeps_the_denied_held_action_retryable`: partial ran/denied set is handled, with only the denied decision remaining in `held`.  
+I could not find a path where a `DENIED` approval is mis-reported as DONE or where EMPTY/MAX_ITERATIONS gets mapped to DONE.  
 
 WHETHER ANOTHER LAYER CATCHES IT:  
-Yes; the loop’s `PAUSED` status is only ever derived from `session.paused`, and the tests assert the behavior for pause/resume across a single task. No other layer assumes per‑task pausing.  
+Yes: the STOPPED_* enums in `loop.py` are precise, and the host’s mapping uses explicit `in STOPPED_SUCCESS`, `in STOPPED_AWAITING`, else FAILED. Even if the loop gains new "failed" reasons, they will fall into the `else` → FAILED bucket.  
 
 FIX:  
-No code change required for correctness. You might expand the docstring on `pause()` and `resume()` to explicitly state that the pause is session‑global and will eventually affect all tasks sharing this `Session`, so callers who want per‑task pausing should model that externally rather than reuse a single Session.
+No change required. For robustness, you might consider asserting that new STOPPED_* constants get added to one of the frozensets (as `loop` already does in comments), but behavior is already fail-closed to FAILED.
+
 
 ---
 
-ID: H5 / TITLE: `snapshot()` returns `self._worker_busy` state that may lag queued jobs / SEVERITY: LOW  
-LOCATION: collaborator/host.py:119‑126, 186‑201  
-
+ID: F5 / TITLE: Controls cannot widen authority or bypass capability/leash caps / SEVERITY: LOW  
+LOCATION: collaborator/host.py:137-197 (pause, resume, set_leash, set_proactivity, veto, decline, approve, approve_proposal), collaborator/view.py:99-115, collaborator/governance.py:231-334, collaborator/propose.py:175-247  
 CONCRETE INTERLEAVING OR INPUT:  
-1. The worker is idle (`_worker_busy = False`), and `_jobs` is empty.  
-2. A caller submits a new task or an approval; `submit()` / `approve()` enqueue a job after updating `_tasks`, but do not update `_worker_busy`.  
-3. A concurrent `snapshot()` call happens after the enqueue but before the worker thread picks up the job and sets `_worker_busy = True`.  
-4. `snapshot()` shows `busy = False` even though there is work queued.  
+- A caller invokes `set_leash("run_command", ACT_THEN_REPORT)` or `set_proactivity("eager")` or `approve_proposal(pid)` with hostile data coming from a web surface.  
+- `set_leash` calls `view_set_leash`, which validates leash ∈ {ACT_THEN_REPORT, PROPOSE_FIRST, NOTIFY_ONLY} and updates `session.leash_overrides`. At execution time, `_resolve_leash` and then `apply_cap(leash, leash_cap(...))` clamp it to the signed cap; model cannot inject the leash because `govern_action` takes it as a keyword-only argument and no control ever forwards untrusted text into that position.  
+- `approve_proposal` under the host simply enqueues an `_ApproveProposalJob` which calls `approve_proposal(session, p)`; that calls `loop.approve` on the underlying decision, which re-derives capability from the current session, applies leash caps, checks seals, etc.  
+- No control can write to `session.capabilities` except host code; and `approve` / `resume` only ever call into `loop.approve` and `run_turn` on the worker thread.  
 
 WHY IT BREAKS A GUARANTEE:  
-C2’s “honest snapshot” guarantee is about internal consistency of multi‑pass ledger reads and avoiding crashes under mutation, not about providing a strict queued‑vs‑busy state machine. Here, `busy` is defined as “worker currently executing a job,” not “there is work either running or queued”, so this does not violate the stated guarantee. The only possible confusion is a caller mis‑interpreting `busy` as “no work pending at all.”  
+It does not. I attempted to find:  
+- A path where a control writes `intent.source` to "host" or "direct" to trick the seam; but none of the host methods touch `intent.source` at all.  
+- A path where user-provided text reaches a `leash=` argument; but all `govern_action` calls from the host either omit `leash` (for loop-driven tool calls) or supply a constant like `PROPOSE_FIRST` in the propose channel.  
+- A path where proactivity or a proposal approval expands capabilities beyond the signed cap; but `granted_capabilities` and `apply_cap` enforce caps at governance time and at execute time.  
 
 WHETHER ANOTHER LAYER CATCHES IT:  
-Yes; `_worker_busy` is consistently set under the lock at the point of job execution and cleared afterwards, and `_should_propose()` uses both `_worker_busy` and `_jobs.empty()` under the same lock for its decisions. There is no safety impact.  
+Yes: the seam in `govern_action` / `execute_and_verify` is the single gate, and both the view and the host merely adjust host-owned config that is itself capped by `leash_cap` and the signed cap. `emit()` is the sole entry point that can request autonomous emission, and it is host-only, not reachable from `run_turn` or from any host control in this module.  
 
 FIX:  
-Document that `busy` means “currently executing a job on the worker thread,” not “no jobs queued.” If needed, add another snapshot field (e.g., `queued_jobs`) computed as `not self._jobs.empty()` under the lock to support UIs that want to differentiate queued vs. executing work.
+None needed in this module. The safety story for P‑01 is primarily in governance.py and session.py, which are already wired correctly here.
+
 
 ---
 
-CERTIFICATION OF CLAIMS
-------------------------
+ID: F6 / TITLE: Worker lock is not held across model calls; readers can’t be frozen / SEVERITY: LOW  
+LOCATION: collaborator/host.py:214-281 (_run_worker, _handle_turn, _handle_resume, _handle_approve_proposal, _handle_propose)  
+CONCRETE INTERLEAVING OR INPUT:  
+- A `Slow` client (see tests) holds `client.complete` for milliseconds or seconds.  
+- While a turn is running, a UI thread hammers `snapshot()` in a tight loop.  
+- `_run_worker` sets `_worker_busy=True` under the lock, then calls `_dispatch` which in turn calls `run_turn` and `approve_held_decision` and `propose`. All those calls are made *after* releasing `self._lock`; `_lock` is only held around cheap state updates before/after.  
+- `snapshot()` acquires `_lock` for each call, but never blocks on the model I/O because `_lock` is not held over `run_turn` / `complete`.  
 
-C1 (serial execution / no double‑run): CERTIFIED  
-All paths that touch `run_turn`, `approve_held_decision`, `propose`, or `approve_proposal` run only on the single worker thread via the `_jobs` queue. Controls (`submit`, `approve`, `approve_proposal`, `resume`) only enqueue jobs and never invoke these functions inline. The worker loop is strictly serial, and `loop.approve`’s `consumed` flag plus the proposal veto path guarantee a held decision or proposal cannot be run twice. No interleaving exists that runs a governed action off the worker thread or double‑executes it.
+WHY IT BREAKS A GUARANTEE:  
+It does not. The tests explicitly exercise this via `HostConcurrency.test_snapshot_never_crashes_while_a_turn_runs`, and inspection confirms that every `run_turn`, `approve_held_decision`, `approve_proposal`, and `propose` call is tagged `# UNLOCKED` and is indeed outside any `with self._lock` block. I could not construct an interleaving where the lock is held for the duration of I/O, nor any deadlock between ticker and worker, because `_run_ticker` only takes the lock for `_should_propose` and queueing a job (micro-sections).  
 
-C2 (thread‑safety / honest snapshot): CERTIFIED  
-All ledger writes and task/proposal mutations happen under `self._lock`; `snapshot()` and `get_task()` also take the same lock and do not call out into model clients or `run_turn`, so they neither see partial updates nor hold the lock across I/O. The ticker only computes `_should_propose()` and `_propose_pending` under the lock, then enqueues `_ProposeJob` for the worker, ensuring that no propose/turn interleave on the authority path. The tests explicitly hammer `snapshot()` from multiple threads while a turn runs, and no inconsistent counts or crashes were found.
+WHETHER ANOTHER LAYER CATCHES IT:  
+The RLock is only in this module, so the guarantee is enforced entirely here. The queue and single worker design ensure no other path executes `run_turn` off-thread.  
 
-C3 (resume / TOCTOU / no silent loss): CERTIFIED  
-The held→approve→resume path takes each held Decision, runs it exactly once via `loop.approve` on the worker, records the resulting Decisions into the ledger, and (only if at least one RAN) resumes the task with a host‑authored note summarizing tool results; the human’s free text never flows as an authoritative tool result. If all approvals come back DENIED, `_handle_resume` restores `task.held` and `task.state = AWAITING_APPROVAL`, leaving the task re‑approvable and not mis‑marked as DONE. PAUSED tasks resume via the separate `(resumed…)` note path, and both EMPTY and MAX_ITERATIONS correctly map to `FAILED`, never `DONE`.
+FIX:  
+No change required.
 
-C4 (controls never grant new authority): CERTIFIED  
-Host controls (`pause`, `resume`, `set_leash`, `set_proactivity`, `veto`, `approve`, `approve_proposal`, `decline`) only mutate Session steering state or enqueue worker jobs; none sets capabilities, `autonomous` flags, `intent.source`, or any emission body. Leash changes are bounded by the signed `leash_cap` in the seam; proactivity only affects whether proposals are surfaced (never run). `approve` and `approve_proposal` both ultimately go through `govern_action`/`approve()` in the seam, which re‑gates capability, leash caps, and TOCTOU conditions before execution. No request‑derived data is ever threaded into a `leash=` keyword or used to mark intents as `source="host"`.
 
 ---
+
+ID: F7 / TITLE: Task.history and Task.held are never concurrently read/written by two threads / SEVERITY: LOW  
+LOCATION: collaborator/host.py:160-170 (get_task & Task.view), 248-281 (_handle_resume), 319-346 (_absorb_result)  
+CONCRETE INTERLEAVING OR INPUT:  
+- Worker in `_handle_resume` reads `task.history` and `task.held` under `self._lock`, copies `held = list(task.held)`, then releases the lock, operates on the copies, and later reacquires the lock to write back `task.history`, `task.held` and other fields.  
+- Concurrently, a UI thread calls `get_task(task_id)` or `snapshot()` which call `Task.view()` inside a `with self._lock` block, iterating over `task.held` and reading `task.history` only while holding the lock.  
+- Because `Task.view()` is only ever called with `_lock` held, there's no interleaving where `task.held` or `task.history` is mutated during iteration.  
+
+WHY IT BREAKS A GUARANTEE:  
+It does not. There is no unsynchronized access to the compound task fields: every read is guarded by the same `_lock` that guards writes. The only place history is passed to `run_turn` is via a *local* `history` variable copied under the lock; the model never sees a concurrently-mutated history list. I could not find an interleaving that causes data races on task state or history.  
+
+WHETHER ANOTHER LAYER CATCHES IT:  
+No other layer is needed; this is purely host-side state. The tests verify that snapshot counts are internally consistent under concurrent reads, which implicitly exercises this as well.  
+
+FIX:  
+No fix required.
+
+
+---
+
+CERTIFICATION LINES
+
+C1 (serial execution / no double-run): CERTIFIED – All calls to `run_turn`, `govern_action`, `execute_and_verify`, `approve_held_decision`, and `propose` are executed only on the single worker thread, via the job queue, and the `Decision.consumed` flag in `loop.approve` prevents any held or proposal decision from being executed twice even under hostile input.  
+
+C2 (thread-safety / honest snapshot): CERTIFIED – `snapshot()` and all reads of `_tasks`, `ledger.decisions/proposals`, and `_proposals` are taken under the same `RLock` that guards all writes; the lock is never held across blocking model calls, so there is no inconsistent view, concurrent-mutation crash, or long freeze for readers.  
+
+C3 (resume / TOCTOU / no silent loss): CERTIFIED – The held→approve→resume path runs each held decision at most once, records every `RAN`/`DENIED` decision in the ledger, leaves tasks in `AWAITING_APPROVAL` on any `DENIED` re-gate, resumes only after all held actions have cleared, and resumes with a host-authored note; `EMPTY` and `MAX_ITERATIONS` are always mapped to `FAILED`, not `DONE`.  
+
+C4 (P‑01 / controls never grant authority): CERTIFIED – All host controls either tighten or express host configuration (pause, leash, proactivity, veto/decline) and never bypass `govern_action` or its capability/leash caps; no control path can set `autonomous`, change `intent.source`, grant new capabilities, or trigger emissions outside the signed, host-only `emit()` entry point.  
+
 
 STEELMAN
---------
 
-The Host module takes a deliberately conservative concurrency stance: a single worker thread owns all execution, with a simple job queue and a single RLock guarding all compound shared state. This architecture sacrifices some parallelism but sharply limits the surface for races and authority confusion, and the tests explicitly exercise concurrent `snapshot()` during long turns. The resume/approval semantics lean heavily on the already‑audited seam (`govern_action`/`approve`), so the Host itself introduces no new authority paths, only orchestration.
+The Host module’s design is cohesive and disciplined: a single worker thread and a tightly-scoped RLock enforce serialization of all governance-related operations and state updates, while leaving model I/O non-blocking for readers. The task lifecycle, approval, and proposal paths have been wired to respect the seam’s guarantees, including re-gating at approval time, capability caps, and honest failure mapping, and the tests directly exercise core interleavings and TOCTOU scenarios. From a concurrency and authority perspective, the module does not introduce any new avenues to bypass existing guards, and it effectively closes the “hand-wired” gaps it set out to solve.
 
-VERDICT: SOUND  
-The implementation upholds claims C1–C4 under realistic interleavings; no guarantee‑breaking races, double‑execution paths, or authority‑widening controls were found. The single highest‑value fix is non‑functional: clarify in the Host’s documentation that `busy` and `pause` are session‑global, and that callers must not touch private attributes (`_tasks`, `_proposals`) directly, so future integrators don’t accidentally bypass the carefully enforced locking model.
+VERDICT: SOUND – The Host as shipped maintains the existing safety and authority guarantees, with no guarantee-breaking bugs found; the single highest-value improvement would be purely hardening/defensive (e.g., adding explicit assertions or small invariants around task states and resume jobs) rather than fixing a concrete vulnerability.

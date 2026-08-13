@@ -1,392 +1,313 @@
 # Host panel: x-ai/grok-4.5
 
-_cost=$0.1408 finish=stop_
+_cost=$0.1397 finish=stop_
 
 # Adversarial Review: `collaborator/host.py`
 
 ## Findings
 
-### F1 / Double-approve races a second `_ResumeJob` that can re-enter `run_turn` with a stale history / empty held set
-**SEVERITY:** MEDIUM  
-**LOCATION:** `collaborator/host.py:274-284` (`approve`), `collaborator/host.py:218-230` (`resume`), `collaborator/host.py:336-377` (`_handle_resume`)
+### F1 / DOUBLE-APPROVE RACE ENQUEUES TWO RESUME JOBS / MEDIUM  
+**Location:** `host.py:268-277` (`approve`), `host.py:218-230` (`resume`), `host.py:323-370` (`_handle_resume`)
 
-**CONCRETE INTERLEAVING:**
-1. Task T is `AWAITING_APPROVAL` with `held=[D]`.
-2. Thread A: `approve(T)` → under lock sets `state=RUNNING`, enqueues `_ResumeJob(T)`.
-3. Worker starts `_handle_resume`: copies `held=[D]`, clears path, runs `approve_held_decision(D)` → `RAN`, records, then blocks in `run_turn(..., history=H1)`.
-4. Meanwhile T is mid-resume (`RUNNING`). A second caller cannot `approve` (state≠AWAITING) — OK.
-5. **Worse path:** T is `AWAITING`. Thread A `approve(T)` → RUNNING + job1. Before worker runs, something fails? Actually the double-approve on AWAITING is blocked after first approve flips state.
+**Concrete interleaving:**
+1. Task T is `AWAITING_APPROVAL` with held decision D.
+2. Thread A: `approve(T)` — under lock sees AWAITING, sets `RUNNING`, releases lock, about to `put(_ResumeJob)`.
+3. Thread B: `approve(T)` — under lock sees `RUNNING` → returns False. **OK for double-approve.**
+4. Alternate path: Thread A `approve(T)` sets RUNNING and enqueues ResumeJob-1. Worker starts `_handle_resume`, copies `held`, runs `approve_held_decision` → RAN, clears held, calls `run_turn(...)`. Mid-turn the model hits another HELD → `_absorb_result` sets AWAITING again.
+5. More interesting race with **decline + approve**:
+   - T is AWAITING.
+   - Thread A: `approve(T)` sets RUNNING, releases lock, not yet enqueued.
+   - Thread B: `decline(T)` — state is RUNNING, not AWAITING → decline returns False. **OK.**
+6. **Real bug — approve then worker-partial-deny path is fine; the actual issue is concurrent `resume()` + `approve()` is N/A for same state.**
 
-**Real double-enqueue path via `resume` + `approve` confusion is weaker.** Stronger bug:
+**Actual double-resume via approve:**
+- `approve` only succeeds when `state == AWAITING_APPROVAL`, and **eagerly** sets `RUNNING` before enqueue. Second `approve` fails. Single worker drains jobs serially. `loop.approve`'s `consumed` flag blocks double-exec of the same Decision.
+- **When held is empty** (PAUSED path): `resume()` collects PAUSED tasks, sets QUEUED, enqueues ResumeJobs. Two rapid `resume()` calls:
+  1. First resume: finds PAUSED, sets QUEUED, enqueues Job1.
+  2. Second resume: no PAUSED tasks → nothing. **OK.**
+- **Race:** Task is PAUSED. Resume sets QUEUED and will enqueue. Before enqueue, could something else happen? Worker won't pick it until enqueued. When Job runs, held is empty → "(resumed)" note. Only one job. **OK.**
 
-**CONCRETE (decline vs approve race):**
-1. T is `AWAITING_APPROVAL`.
-2. Thread A: `approve(T)` passes check, sets `RUNNING`, **releases lock**, not yet `put`.
-3. Thread B: `decline(T)` — state is already `RUNNING`, so decline returns False. OK.
+**Re-checked double-approve after DENIED stays AWAITING:**
+1. approve → RUNNING → ResumeJob.
+2. Worker: approve_held → DENIED, remaining non-empty → state = AWAITING.
+3. Second approve → RUNNING → another ResumeJob. `consumed` is False on DENIED → retries. **By design, not double-run.**
 
-**CONCRETE (double approve before state flip visible):** Both need the lock for the state check; second loses. Single-worker + state gate holds for double approve.
+**Verdict on F1:** Double-execution of a held action is **blocked** by (a) eager state flip to RUNNING, (b) single worker, (c) `decision.consumed`. **NON-finding for C1 double-run.**
 
-**Revised real issue — concurrent `resume()` while task is `PAUSED`, plus duplicate `_ResumeJob`:**
-1. T is `PAUSED` (no held).
-2. `resume()` collects T, sets `QUEUED`, enqueues `_ResumeJob`.
-3. Worker runs resume with `held=[]`, note="(resumed…)", enters `run_turn`.
-4. If pause happens again mid-turn → PAUSED; resume again — fine serially.
+---
 
-**Actual MEDIUM — `approve` does not claim/clear `held` under the same critical section that enqueues, and `_handle_resume` always re-runs `run_turn` even when approvals partially apply:**
+### F2 / DECLINE DURING IN-FLIGHT APPROVE LOSES THE RACE CLEANLY — NON-FINDING  
+**Location:** `host.py:256-265`, `host.py:323-350`
 
-If `held = [D1, D2]` and D1→RAN, D2→DENIED:
-- `ran_ok = [D1]` (non-empty) → does **not** restore held
-- `task.held = []` (D2 dropped from held!)
-- resumes with only D1's summary
-- D2 is recorded as DENIED in ledger/decisions but **silently dropped from `task.held`** and never retryable via the task approval UX
+If decline runs while state is still AWAITING (before approve flips to RUNNING):
+1. decline sets CANCELLED.
+2. approve sees CANCELLED ≠ AWAITING → False.
 
-**WHY IT BREAKS:** C3 claims DENIED stays retryable / AWAITING. That is only true when **all** approvals DENY. Partial deny loses the denied held decision from `task.held` while still continuing the turn — outcome mis-statement + silent loss of a held action.
+If approve flips to RUNNING first, decline fails. Worker still runs held actions. **No cancel-during-approve** — stated non-goal / acceptable. Decline does not dequeue. **Nit at most** (no way to cancel an in-flight approve job).
 
-**OTHER LAYER:** `loop.approve` correctly doesn't consume on DENIED; the Host drops the reference. Seam does not restore Host task.held.
+---
 
-**FIX:** Keep per-decision accounting:
+### F3 / HISTORY SHARING BY REFERENCE ACROSS RESUME / LOW (nit)  
+**Location:** `host.py:328-329`, `host.py:368`
+
 ```python
-still_held = [d for d in held if corresponding result is DENIED/still HELD]
-task.held = still_held
-if still_held and not ran_ok:
-    task.state = AWAITING_APPROVAL; return
-if still_held and ran_ok:
-    # either stay AWAITING after recording ran_ok, or resume only after all clear — policy choice
+history = task.history  # reference, not copy
+...
+result = run_turn(..., history=history)
 ```
-Prefer: if any still held/denied-retryable, stay AWAITING after recording RAN ones; only resume when `held` is fully cleared.
+
+`run_turn` does `history = list(history or [])` (loop.py) — **copies on entry**. So the worker's mutation is on a private list; `_absorb_result` writes `task.history = result.history` under lock. **No cross-thread history mutation.** Snapshot/`view()` does not expose raw history. **NON-finding.**
 
 ---
 
-### F2 / `approve()` / `resume()` can enqueue work for a task that `decline` cannot cancel once RUNNING; more importantly **double `_ResumeJob` via approve while already queued**
-**SEVERITY:** LOW (nit / residual)  
-**LOCATION:** `host.py:274-284`
+### F4 / PROPOSEJOB CAN BE ENQUEUED WHILE QUEUE BECOMES NON-EMPTY — NON-FINDING FOR DOUBLE GOVERN  
+**Location:** `host.py:419-428`, `host.py:430-448`
 
-After `approve` sets RUNNING and enqueues, a second `approve` fails. Good.
+Ticker under lock: `_should_propose` checks `_worker_busy`, `_jobs.empty()`, no RUNNING/QUEUED, not `_propose_pending`, no PROPOSED proposals.
 
-But **`submit` does not prevent overlapping tasks on the same session**: two `submit()`s enqueue two `_TurnJob`s. Worker runs them **serially**, not concurrently — C1 serial execution holds. However both share `self.session` (paused, leashes, capabilities). That is by design (one session). **NON-finding for double-exec of one action.** Two turns can still both run shell commands one after another — not a Host invariant break.
+Race:
+1. Ticker: `_should_propose` True → `_propose_pending=True`, enqueue=True, releases lock.
+2. Client: `submit()` → adds QUEUED task, `put(TurnJob)`.
+3. Ticker: `put(ProposeJob)`.
+4. Worker runs ProposeJob first (if ordered that way) **or** TurnJob first.
 
-**Blocked attack (C1):** Controls never call `loop.approve` / `run_turn` inline. Verified: `approve` → queue; `approve_proposal` → queue; ticker → queue only.
+If ProposeJob runs first: `propose()` → `govern_action` on worker alone; then TurnJob runs. **Still serial on one worker.** Two `govern_action` drivers do **not** run concurrently. Claim C1 is about concurrent execution — **held**.
 
----
+If TurnJob runs first: during turn `_worker_busy` True; ProposeJob runs after turn completes. `_handle_propose` clears `_propose_pending` at start. Fine.
 
-### F3 / `_should_propose` uses `not self._jobs.empty()` — unreliable; ProposeJob can be enqueued while a TurnJob is mid-flight? 
-**SEVERITY:** LOW (mitigated)  
-**LOCATION:** `host.py:419-424`, `host.py:428-447`
+Stacking: `_propose_pending` + ledger PROPOSED check prevents stacking. **C4 propose trigger fail-closed: holds.**
 
-**Analysis:**
-- `_worker_busy` is True for the whole `_dispatch`, including `run_turn`.
-- Ticker checks `_worker_busy or not self._jobs.empty()` under lock.
-- Race: Worker finishes job, sets `_worker_busy=False` in `finally`, **before** taking next job. Between `finally` and next `queue.get`, ticker may see busy=False and empty queue and enqueue ProposeJob. That's correct idle.
-- Race: Worker about to set busy=True after get — ticker could enqueue Propose between jobs. Serial worker still runs Propose then Turn one-at-a-time. **Two `govern_action` drivers at once? NO** — single worker.
-
-`queue.empty()` is unreliable in general but here only avoids unnecessary Propose enqueue; worst case extra ProposeJob runs when not idle-ideal. `_propose_pending` + cooldown + "no PROPOSED" limit stacking.
-
-**C2 claim "ticker cannot run propose while TurnJob mid-flight" as concurrent drivers:** CERTIFIED blocked by single worker. Propose while another task QUEUED is blocked by state check.
-
-**NON-finding** for dual govern drivers.
+**Caveat (nit):** ProposeJob can run “while a task is QUEUED” if submit wins the race after the ticker check — idle heuristic is slightly racy, **not** a dual-driver or authority bug.
 
 ---
 
-### F4 / Lock never held across `run_turn` / `approve` / `propose`
-**SEVERITY:** n/a (positive)  
-**LOCATION:** `host.py:320-333`, `336-377`, `379-386`, `388-398`
+### F5 / `set_leash` CAN LOOSEN HOST OVERRIDE UP TO SIGNED CAP / NOT A BUG (C4)  
+**Location:** `host.py:236-240`, `view.py:set_leash`
 
-Verified: lock only around state prep and absorb/record. `snapshot()` holds lock only for view+task projection — not across IO.
-
-**Blocked attack:** reader frozen for minutes — **NON-finding**.
+`set_leash` writes `session.leash_overrides` without applying `leash_cap` at write time. Effective leash at the seam is `apply_cap(override, leash_cap(...))`. Host may set `act_then_report`; signed cap still floors it. Design explicitly allows host to loosen relative to tool default within the cap. **Does not grant capability.** Snapshot shows effective leashes. **NON-finding for C4.**
 
 ---
 
-### F5 / `snapshot()` atomicity vs ledger appends
-**SEVERITY:** n/a (positive) / minor nit  
-**LOCATION:** `host.py:196-202`, `view.py: snapshot`, ledger appends under same `self._lock` in Host
+### F6 / APPROVE_PROPOSAL DOES NOT FLIP STATUS BEFORE ENQUEUE — TOCTOU DOUBLE ENQUEUE / LOW  
+**Location:** `host.py:279-289`, `host.py:372-379`, `propose.py:approve_proposal`
 
-All Host ledger writes go through worker paths that take `self._lock`. `JudgmentView.snapshot()` multi-pass over `ledger.decisions` / `proposals` runs entirely inside Host.snapshot's lock. 
+```python
+def approve_proposal(self, proposal_id):
+    with self._lock:
+        p = self._proposals.get(proposal_id)
+        if p is None or p.status != PROPOSED:
+            return False
+        self._touch()
+    self._jobs.put(_ApproveProposalJob(proposal_id))
+```
 
-**Is every append under the same lock?** Host-mediated ones yes. If external code called `ledger.record_*` without the lock — out of contract. Within Host: yes.
+**Interleaving:**
+1. Thread A and B both see PROPOSED, both enqueue ApproveProposalJob.
+2. Worker job1: `approve_proposal` → runs decision, sets APPROVED, `consumed=True`.
+3. Worker job2: `proposal.status != PROPOSED` → returns held decision unchanged; Host still `ledger.record_decision(d)` on the **same** HELD decision again?
 
-**Display reads `ledger.proposals` not ProposalPool** — good; pool dict iteration crash avoided.
+```python
+d = approve_proposal(self.session, p)  # returns proposal.decision unchanged if not PROPOSED
+with self._lock:
+    self.ledger.record_decision(d)  # records HELD again!
+```
 
-**Nit:** `counts["held"]` uses `d.status not in (RAN, FAILED)` which counts DENIED/HELD/NOTIFIED/PAUSED as "held" — display imprecision, pre-existing view semantics, not Host-introduced guarantee break.
+**Breaks:** 
+- **Not** double-execution (`consumed` + status check in `approve_proposal`).
+- **Does** double-record the same HELD decision in the ledger → inflated `counts["governed"]` / `"held"`, lying dashboard.
 
-**C2:** largely holds.
+**Another layer:** `loop.approve` consumed flag prevents double-run. Ledger integrity is Host responsibility — **not** caught elsewhere.
 
----
+**Severity:** LOW (honesty/telemetry, not authority).  
 
-### F6 / Task.history read/write by two threads?
-**SEVERITY:** LOW (blocked in practice)  
-**LOCATION:** `host.py:336-344`, `400-418`
-
-`history` is written in `_absorb_result` under lock; read in `_handle_resume` under lock into local `history` then passed to `run_turn` unlocked (local list reference).
-
-**Mutation during run_turn:** `run_turn` mutates the list it was given. Only worker calls `run_turn` with that list. No other thread writes `task.history` until absorb replaces it under lock.
-
-**Reader:** `task.view()` does not expose raw history. Good.
-
-**Blocked:** concurrent history RW — **NON-finding**.
-
----
-
-### F7 / DENIED-all path restores held but recorded DENIED decisions accumulate; re-approve calls `approve` on same Decision objects
-**SEVERITY:** LOW (works due to seam)  
-**LOCATION:** `host.py:350-361`, `loop.approve`
-
-On all-DENIED: `task.held = held` (original HELD decisions). `loop.approve` did not set `consumed`. Re-approve works. Test covers this.
-
-**Partial DENIED:** F1 above — real bug.
+**Fix:** Only record if `d.status == RAN` (or `!= HELD` / job-local “did work” flag); and/or mark proposal “pending approve” under lock before enqueue (like task RUNNING).
 
 ---
 
-### F8 / Human free-text as authoritative tool result?
-**SEVERITY:** n/a (positive)  
-**LOCATION:** `host.py:362-372`, `submit` vs resume notes
+### F7 / LOCK NOT HELD ACROSS `run_turn` / SNAPSHOT ATOMICITY / NON-FINDING (C2 core)  
+**Location:** `host.py:190-196`, `host.py:311-316`, `host.py:381-408`
 
-- Approve resume note is HOST-authored from `d.summary()` for RAN only.
-- Pause resume note is fixed host string.
-- `submit(user_message)` passes user text as a normal user message (not labeled tool-result authority beyond normal turn). C3 asks specifically about approve/resume path — human text does **not** become the post-approve TOOL RESULTS note.
+- `snapshot()` holds `_lock` for entire `view.snapshot()` + task views.
+- Ledger appends only under `_lock` in `_absorb_result`, `_handle_resume`, `_handle_propose`, `_handle_approve_proposal`.
+- `run_turn` / `approve` / `propose` / `client.complete` called **unlocked**.
 
-**Blocked attack.** NON-finding.
+Multi-pass view reads cannot tear vs appends. No dict iteration on `ProposalPool` under concurrent add — Host uses `ledger.proposals` list + `_proposals` dict mutated only under lock. **C2 lock-across-IO freeze: NON-finding.**
+
+**Minor C2 nit:** `view.snapshot()` counts `"held": sum(1 for d in ds if d.status not in (RAN, FAILED))` lumps DENIED/HELD/NOTIFIED/PAUSED — pre-existing view semantics, not Host-introduced lie about atomicity.
 
 ---
 
-### F9 / EMPTY / MAX_ITERATIONS → DONE?
-**SEVERITY:** n/a (positive)  
-**LOCATION:** `host.py:400-418`, `loop.py` STOPPED_* 
+### F8 / TASK.HELD READ DURING `task.view()` WHILE WORKER MUTATES — PROTECTED  
+**Location:** `host.py:82-93`, `host.py:190-196`
+
+`t.view()` calls `d.summary()` on held decisions; only called from `snapshot`/`get_task` under lock; worker mutates `task.held` under lock. **NON-finding.**
+
+---
+
+### F9 / HUMAN FREE TEXT AS TOOL RESULT ON APPROVE PATH / NON-FINDING (C3)  
+**Location:** `host.py:355-361`, `host.py:268-277`
+
+`approve(task_id)` takes no user message. Resume note is host-authored from `decision.summary()` lines. PAUSED resume uses fixed `"(resumed — ...)"`.  
+`submit(user_message)` puts text in `_TurnJob.user_message` as a normal user turn — correct. **Human text never injected as authoritative TOOL RESULTS on approve/resume.**
+
+---
+
+### F10 / EMPTY / MAX_ITERATIONS → FAILED / NON-FINDING (C3)  
+**Location:** `host.py:396-407`
 
 ```python
 if result.stopped in STOPPED_SUCCESS:  # only FINAL
-    DONE
-elif in STOPPED_AWAITING: ...
+    task.state = DONE
+elif result.stopped in STOPPED_AWAITING:
+    ...
 else:
-    FAILED
+    task.state = FAILED
 ```
-EMPTY/MAX_ITERATIONS → FAILED. Exception → `_fail_active` → FAILED. Test pins empty→FAILED.
 
-**Blocked.** NON-finding.
-
----
-
-### F10 / `loop.approve` twice for one decision (double run)?
-**SEVERITY:** n/a (blocked)  
-**LOCATION:** single worker serializes `_handle_resume`; `decision.consumed` in loop.approve
-
-Even if two ResumeJobs were queued for same task:
-1. Job1: approve D → consumed=True, RAN, held cleared, run_turn...
-2. Job2: held=[] (cleared), takes pause-style resume note, **another** `run_turn` — does **not** re-run D, but **does** start a second continuation turn unexpectedly.
-
-**When can two ResumeJobs queue?**
-- `approve` only if AWAITING — sets RUNNING before enqueue. Second approve fails.
-- **`resume()` only selects PAUSED.** Approve path doesn't use PAUSED.
-- Unless: Job1 all-DENIED restores AWAITING; user approves again — second job intentional.
-- **Race:** `approve` sets RUNNING and enqueues. Worker all-DENY restores AWAITING. User approves again quickly — two jobs both legitimate serial attempts.
-
-**Can `resume()` fire for AWAITING?** No.
-
-**Double run of action:** blocked by `consumed` + held clear.  
-**Spurious second `run_turn`:** only if duplicate jobs; approve gate mostly prevents.
-
-**C1 double-exec of same action: CERTIFIED blocked.** Spurious extra continuation is hard to hit; LOW if at all.
+EMPTY/MAX_ITERATIONS ⊂ else → FAILED. Exception → `_fail_active` → FAILED. **Holds.**
 
 ---
 
-### F11 / C4 — controls grant authority?
-**SEVERITY:** one real concern MEDIUM-LOW  
+### F11 / DENIED APPROVE LEAVES AWAITING, NOT DONE / NON-FINDING (C3)  
+**Location:** `host.py:340-350`
 
-**`set_leash(tool, leash)`** (`host.py:236-240` → `view.set_leash`):
-- Writes `session.leash_overrides` without applying signed `leash_cap` at set time.
-- Seam applies `apply_cap(leash, leash_cap(...))` at govern/execute — **cannot loosen past signed cap**.
-- Host may set ACT_THEN_REPORT in overrides; effective leash still capped. View snapshot shows effective leashes.
+`remaining` kept for `status != RAN`; if remaining: `AWAITING_APPROVAL` and return **without** `run_turn`. Test covers capability revoke. **Holds.**
 
-**Does set_leash "loosen past signed cap"?** Config can store a looser override; **effective** authority cannot. Claim C4 says "leash capped by the signed grant" — true at seam.
-
-**`set_proactivity`:** surfacing only; propose still govern_action + approve re-gate.
-
-**`approve` / `approve_proposal`:** re-gate via `loop.approve` / `approve_proposal` → `reauthorized_or_denied`. No capability add.
-
-**No path sets `autonomous=True`, `intent.source`, or calls `emit`.** Host does not touch emit.
-
-**`approve_proposal`:** enqueues; worker calls `approve_proposal(session, p)` which uses fixed proposal decision; no request-derived leash keyword.
-
-**Propose trigger:** fail-closed; `_propose_pending` prevents stack enqueue; ledger PROPOSED check prevents stack surface.
-
-**Nit:** `set_leash` allows any tool name string including unknown tools — harmless.
-
-**C4:** no control widens capabilities. **CERTIFIED** with note that leash override storage can be "looser" than cap but seam enforces cap (stated design).
+**Partial deny:** RAN summaries accumulated in `approved_ran`; remaining held kept; eventual full clear sends combined host note. Correct.
 
 ---
 
-### F12 / `approve` sets RUNNING before worker runs — snapshot lies "running" while still waiting in queue
-**SEVERITY:** LOW  
-**LOCATION:** `host.py:274-284`
-
-UX inaccuracy, not a safety break. Decline won't cancel (state≠AWAITING). User cannot decline after approve clicked even if worker hasn't started — **by design-ish**, but if they mis-clicked, too late without stop. Acceptable; not guarantee-breaking.
+### F12 / `loop.approve` NEVER CALLED ON REQUEST THREAD / NON-FINDING (C1)  
+Controls only enqueue `_ResumeJob` / `_ApproveProposalJob`. Pure-state controls (`pause`, `veto`, `decline`, `set_leash`, `set_proactivity`) do not execute actions. **Holds.**
 
 ---
 
-### F13 / `_handle_approve_proposal` TOCTOU on status
-**SEVERITY:** LOW (caught by propose layer)  
-**LOCATION:** `host.py:379-386`
+### F13 / CONCURRENT SUBMIT OF TWO TASKS — SERIAL BUT SHARED SESSION / LOW (stated boundary)  
+Two `submit`s → two TurnJobs. Worker runs serially; both use same `session` and ledger. No concurrent `govern_action`. Interleaved **tasks** (task2 runs after task1 completes or awaits) can interleave ledger history — **by design** of one worker one session. Not dual-drive. **Not a C1 break.**
+
+**Gap:** While task1 is AWAITING, task2 can still be submitted and run — host allows parallel task **lifecycle** but serial execution. Could surprise operators; **not** in certification claims as forbidden.
+
+---
+
+### F14 / `approve()` SETS RUNNING BEFORE WORKER COPIES HELD — DECLINE GAP / LOW  
+After approve sets RUNNING, decline won't cancel. If process kills worker mid-approve, state stuck RUNNING until restart. Operational nit.
+
+**Worse variant:** `approve` sets RUNNING; worker `_handle_resume` gets task; if `task is None` return — N/A. If held list empty **incorrectly** (bug elsewhere) would resume with "(resumed)" without running approvals. Only if `held` cleared without running — decline doesn't clear held; only sets CANCELLED.  
+
+**Bug:** `decline` sets CANCELLED but **leaves `task.held` populated**. Stale held on CANCELLED task. If something set state back to AWAITING, could re-approve. Nothing does that. **Nit.**
+
+**Real bug — approve after decline is false; but ResumeJob already queued:**
+
+1. State AWAITING.  
+2. `approve`: set RUNNING, enqueue ResumeJob.  
+3. There is no cancel. Worker runs actions. **OK.**
+
+What if:
+1. AWAITING.  
+2. Something enqueues ResumeJob via `resume()` — only for PAUSED, not AWAITING. **OK.**
+
+---
+
+### F15 / RACE: `resume()` ON PAUSED WHILE WORKER STILL IN `_absorb_result`? / NON-FINDING  
+Pause is lock-free read in `govern_action`. Turn returns STOPPED_PAUSED; `_absorb_result` sets PAUSED under lock. `resume()` reads PAUSED under lock. Ordering is coherent. **OK.**
+
+---
+
+### F16 / HOST `approve` OF TASK DOES NOT PASS THROUGH `reauthorized_or_denied`? / NON-FINDING  
+Worker calls `approve_held_decision` = `loop.approve` → re-gates. **OK.**
+
+---
+
+### F17 / CONTROLS GRANT AUTHORITY? / C4  
+
+| Control | Effect | Widens authority? |
+|---------|--------|-------------------|
+| pause | `session.paused=True` | No (restricts) |
+| resume | unpause + ResumeJob | No (continues) |
+| set_leash | override via view | Only within signed cap at seam |
+| set_proactivity | dial | Surfacing only |
+| veto | veto_proposal | Restricts |
+| decline | CANCELLED | Restricts |
+| approve | enqueue resume + loop.approve | Re-gates |
+| approve_proposal | enqueue + approve_proposal | Re-gates |
+| submit | user turn | Normal doer path through govern_action |
+
+No control calls `emit`, sets `autonomous=True`, passes `leash=` into `govern_action` from request data, or sets `intent.source`. Propose path uses `leash=PROPOSE_FIRST` default inside `propose()`. **C4 holds.**
+
+`set_leash(..., ACT_THEN_REPORT)` can widen host config vs default `propose_first` for tools — still capped by signed grant; still not a new capability. Claim: *"no control adds a capability; no request data reaches a leash= keyword or intent.source/emit"* — **holds.**
+
+---
+
+### F18 / SNAPSHOT `busy` FLAG vs ACTUAL EXECUTION / LOW nit  
+`_worker_busy` True only around `_dispatch`. Between jobs False even if queue non-empty. Snapshot can show `busy=False` with pending work. Display nit, not safety.
+
+---
+
+### F19 / CRITICAL LOOK: `_handle_resume` RECORDS DENIED DECISIONS AND EXTENDS `task.decisions` WITH NEW DECISION OBJECTS / NON-FINDING  
+`loop.approve` on DENIED returns a **new** Decision (not mutating to consume). Good. On RAN, consumes original. Host records `ran` list. Good.
+
+---
+
+### F20 / WORKER EXCEPTION DURING APPROVE MID-LIST / MEDIUM  
+
+**Location:** `host.py:333-350`
 
 ```python
-with lock:
-    p = get; if not PROPOSED: return
-# unlock
-d = approve_proposal(session, p)
-```
-Between unlock and approve, `veto` can set VETOED + `consumed=True`. `approve_proposal` checks `status != PROPOSED` and returns without running. **Caught by propose layer.**
-
-Double `approve_proposal` enqueue: both may pass Host check (Host does **not** flip proposal status before enqueue!).
-
-**CONCRETE:**
-1. P is PROPOSED.
-2. Thread A & B both `approve_proposal(pid)` → both see PROPOSED, both enqueue (Host only `_touch`, **no status claim**).
-3. Worker job1: approve → RAN, status=APPROVED, consumed.
-4. Worker job2: `approve_proposal` sees status≠PROPOSED → returns held decision, still records via `ledger.record_decision(d)` **again**?
-
-```python
-d = approve_proposal(...)  # returns proposal.decision unchanged (still old HELD object?)
-ledger.record_decision(d)  # records duplicate HELD decision into ledger!
+ran = [approve_held_decision(self.session, d) for d in held]
 ```
 
-On second call, `approve_proposal` returns `proposal.decision` without running — status may already be APPROVED from first call; decision may be RAN object if same reference updated... Actually first approve replaces flow: `d = approve(session, proposal.decision)` returns **new** Decision from execute path; `proposal.status = APPROVED` but `proposal.decision` is still the **original HELD** object (approve doesn't replace proposal.decision with RAN result!). 
+If decision 1 RAN (consumed, side effect done), decision 2 raises inside `approve` (promised not to raise — loop says never raise; execute paths catch) — practically OK.
 
-Look at `approve_proposal`:
-```python
-d = approve(session, proposal.decision)
-...
-if d.status != DENIED:
-    proposal.status = APPROVED
-return d
-```
-First call: `loop.approve` sets `decision.consumed=True` and returns RAN Decision (**may be new object** from execute_and_verify). Original `proposal.decision` has consumed=True, status still HELD on the old object!
+If `_absorb_result` or ledger throws after partial approve: `except` in `_run_worker` → `_fail_active` sets FAILED. **Already-executed held actions stay executed; task FAILED; remaining held may be lost from retry UX** (state FAILED, not AWAITING).  
 
-`loop.approve` on HELD with consumed:
-```python
-if getattr(decision, "consumed", False):
-    return decision  # still HELD status, consumed
-```
+**Concrete:** two held; first RAN; `ledger.record_decisions` throws (bug); task → FAILED; second never attempted; first already ran.  
 
-Second approve_proposal: status is APPROVED → returns `proposal.decision` (HELD+consumed) without calling approve. Host still `record_decision` that HELD decision again — **duplicate ledger noise**, not double execution.
-
-**C1 double-exec:** blocked by status + consumed.  
-**Ledger double-record:** LOW nit.
-
-**FIX:** Claim proposal under lock (`status` sentinel or "approving" flag) before enqueue; skip record if not newly run.
+**Severity:** LOW/MEDIUM — depends on ledger reliability. Another layer: physical world already changed; task state dishonest relative to partial progress. **Fix:** mark progress under lock per decision; on failure keep AWAITING with remaining, don't blanket FAILED if held remain.
 
 ---
 
-### F14 / CRITICAL hunt: execution off worker thread?
-Pure-state controls: pause, set_leash, veto, decline — no execute.  
-`veto_proposal` only flips status + consumed.  
-**No off-worker execution. C1 path claim holds.**
+### F21 / `stop()` DOES NOT JOIN TICKER / LOW  
+Ticker is daemon; `_stopping` set; may enqueue ProposeJob after stop sentinel drained? Order: `_stopping.set()`, `put(_STOP)`. Ticker may still `put(ProposeJob)` after _STOP is queued → worker already exited → ProposeJob orphaned in queue. No execution. **OK.** Ticker thread not joined — process exit / daemon. Nit.
 
 ---
 
-### F15 / `_absorb_result` STOPPED_HELD filters `result.decisions` for HELD — includes decisions from whole turn, OK
+## Real findings summary (guarantee-relevant)
 
-If approve path ran D then run_turn holds D2: absorb sets held correctly. Good.
+| ID | Title | Sev |
+|----|-------|-----|
+| F6 | Double `approve_proposal` enqueues twice → duplicate ledger record of HELD (no double-exec) | LOW |
+| F4-nit | ProposeJob can slip in after submit races ticker idle check (still serial) | LOW |
+| F20 | Exception after partial held-approve → task FAILED may strand remaining held UX | LOW |
+| F18 | `busy` false with non-empty queue | LOW |
 
----
-
-### F16 / Worker exception during `_handle_resume` after partial approve
-**SEVERITY:** MEDIUM  
-**LOCATION:** `host.py:350-377`, `host.py:420-428`
-
-**CONCRETE:**
-1. `held=[D]`, approve runs D → RAN, lock: record, `task.held=[]`.
-2. `run_turn(note, history)` raises (e.g. client error — out of scope as general follow-up, but Host handles via `_fail_active`).
-3. `_fail_active` sets FAILED. Action **already ran**; task FAILED after side effect — honest enough.
-4. If exception **during** `approve_held_decision` list comp mid-way: D1 ran, D2 not; exception → FAILED; D1 ran with held cleared only if exception after the record block...
-
-If exception inside list comp after D1 RAN:
-- held not yet cleared in task (clear is after full list)
-- `_fail_active` → FAILED
-- D1 **did run** (side effect), task FAILED, D1 may not be in ledger if exception before record block
-
-```python
-ran = [approve_held_decision(self.session, d) for d in held]  # D1 executed
-# exception on D2
-# never reaches record_decisions
-_fail_active → FAILED
-```
-**Lost audit record for D1 that already mutated the world.** Severity MEDIUM for audit/honesty; consumed=True on D1 so no re-run. Not double-exec; **silent loss of ledger record**.
-
-**FIX:** approve+record one decision at a time under try/finally per decision.
-
----
-
-### F17 / `stop()` does not join ticker; daemon OK
-
-Nit only.
-
----
-
-## Summary of REAL vs NON-findings
-
-| ID | Issue | Real break? |
-|----|--------|-------------|
-| F1 | Partial DENIED drops held + continues | YES — C3 |
-| F16 | Exception mid-multi-approve loses ledger | YES — C3 audit |
-| F13 | Double approve_proposal enqueue | Nit — no double run |
-| F3 | Propose concurrent with turn | NON-finding (serial worker) |
-| C1 double exec / off-thread | | BLOCKED |
-| C2 lock across IO / snapshot tear | | BLOCKED |
-| C3 human text as tool result / EMPTY→DONE | | BLOCKED |
-| C4 capability widen | | BLOCKED |
-
----
-
-## Findings (formal list)
-
-### F1 / Partial approval DENIED drops held decisions and still resumes
-**SEVERITY:** MEDIUM  
-**LOCATION:** `collaborator/host.py:350-366`  
-**INPUT:** Task with `held=[D_shell, D_write]` where re-gate DENIES D_shell (cap revoked) but RAN D_write.  
-**INTERLEAVING:** single `approve` → `_handle_resume` builds `ran_ok=[D_write]` non-empty → `task.held=[]` → `run_turn` continues.  
-**WHY:** C3 requires DENIED remain retryable / not silent loss; only the all-denied branch restores held.  
-**OTHER LAYER:** seam correctly leaves DENIED unconsumed; Host drops UX reference.  
-**FIX:** Partition ran / still_held; never clear still_held; only resume when held empty; if any still_held after partial run, set AWAITING (or document all-or-nothing approve).
-
-### F2 / Multi-held approve is not atomic per decision for audit on exception  
-**SEVERITY:** MEDIUM  
-**LOCATION:** `collaborator/host.py:350-355`, `420-428`  
-**INPUT:** `held=[D1,D2]`; D1 executes RAN; D2's `approve` raises.  
-**WHY:** World mutated; ledger may lack D1; task FAILED — C3 honest outcome/record gap.  
-**OTHER LAYER:** `consumed` prevents re-exec; does not fix audit.  
-**FIX:** per-decision try/record before next approve.
-
-### F3 / `approve_proposal` does not claim proposal before enqueue (duplicate jobs / duplicate ledger rows)
-**SEVERITY:** LOW  
-**LOCATION:** `collaborator/host.py:286-296`, `379-386`  
-**INPUT:** two concurrent `approve_proposal(pid)`.  
-**WHY:** no double-run (`propose.approve_proposal` + `consumed`); possible duplicate `record_decision` of non-RAN.  
-**OTHER LAYER:** catches double-exec.  
-**FIX:** under lock, only enqueue if PROPOSED and set transient claim or rely on single-flight set.
+No CRITICAL/HIGH break of C1–C4 linchpin invariants found.
 
 ---
 
 ## Certification
 
 **C1 — CERTIFIED.**  
-All `run_turn` / `loop.approve` / `approve_proposal` / `propose` execution is confined to the single worker via queued jobs; controls do not execute inline; `decision.consumed` + serial worker block double-execution of a held action. No concrete interleaving achieves off-thread or double run of the same action.
+All `run_turn` / `loop.approve` / `approve_proposal` / `propose` / `govern_action` execution is confined to the single worker via queued jobs; controls only enqueue or flip pure state; `decision.consumed` + proposal status block double-exec; no concrete interleaving runs an action on the request thread or twice.
 
 **C2 — CERTIFIED.**  
-`snapshot()` and ledger/task compound mutations share one RLock for micro-sections only; lock is not held across model I/O; multi-pass view reads cannot tear against Host appends; proposal display uses ledger list not live pool iteration. No freeze-the-reader or dict-mutation crash path found in Host.
+Ledger appends and `view.snapshot()` + task projections share one `RLock` for the full multi-pass read; lock is not held across model I/O; Host proposal index and ledger lists avoid pool-dict iteration crashes; concurrent snapshot test matches the design. (Nits: `busy` flag, view “held” count taxonomy — not atomicity failures.)
 
-**C3 — NOT-CERTIFIED.**  
-All-DENIED→AWAITING, host-authored resume notes, EMPTY/MAX→FAILED, and single-action approve paths hold and are tested, but partial multi-held approval clears `task.held` and resumes whenever any decision RAN (F1), and a mid-list approve exception can leave executed work unrecorded (F2) — silent loss / mis-stated task continuation.
+**C3 — CERTIFIED.**  
+held→approve→resume runs `loop.approve` once per non-consumed decision on the worker, records results, resumes only with host-authored notes; DENIED leaves AWAITING and retryable; PAUSED resumes without approval path; EMPTY/MAX_ITERATIONS/exception map to FAILED not DONE; human free text does not become TOOL RESULTS on the approve path.
 
 **C4 — CERTIFIED.**  
-Controls only pause/tighten/veto/decline or set host config; `set_leash` cannot widen past signed cap at the seam; approve paths re-gate; no control sets capabilities, `autonomous`/`emit`, or `intent.source`; propose trigger is fail-closed and non-stacking under the pending/ledger guards.
+Controls only restrict or set host config (leash overrides still seam-capped; proactivity is surfacing-only); approve/approve_proposal re-gate at run time; no control adds capabilities, reaches `emit`/`autonomous`, or threads request data into `leash=` / `intent.source`; propose trigger is fail-closed with pending/cooldown/idle gates and cannot stack concurrent proposers on the worker.
 
 ---
 
 ## STEELMAN
 
-The linchpin design is right: a single worker queue is the correct structural fix for double-turn / double-govern races, and the code consistently enqueues executing controls instead of running them on the request thread. Lock scope is disciplined (no IO under lock), resume notes are host-authored, and the STOPPED_* mapping with an explicit else→FAILED closes the classic “empty looks like done” hole. Authority stays in `govern_action` / `loop.approve`; the Host is genuinely a worker, not a second policy engine.
+The Host’s linchpin — one worker queue as the only path into the seam — is implemented consistently: eager state transitions (`AWAITING`→`RUNNING` before enqueue), unlocked I/O, and locked compound reads/writes match the threat model. Resume authorship (host notes only), DENIED→stay AWAITING, and FAILED mapping for empty/max-iter show deliberate C3 care, including the partial-deny `approved_ran` accumulation. P-01 is preserved: the Host is a scheduler/recorder, not a second authority path.
 
-## VERDICT: **MINOR_ISSUES**
+---
 
-Serial execution and P-01 hold under adversarial threading; the only guarantee-level cracks are in multi-held resume accounting (partial DENIED + exception audit), not in the linchpin concurrency model.
+## VERDICT: **SOUND**
 
-**Highest-value fix:** In `_handle_resume`, approve and ledger-record **one held decision at a time**, keep DENIED/unrun decisions in `task.held`, and call `run_turn` only when `held` is empty (otherwise return to `AWAITING_APPROVAL`).
+No guarantee-breaking hole in C1–C4; residual issues are ledger double-record on double `approve_proposal` enqueue and minor idle/busy telemetry races.
+
+**Single highest-value fix:** In `approve_proposal` (Host), claim the proposal under the lock before enqueue (e.g. set a non-`PROPOSED` in-flight marker or only enqueue once), and in `_handle_approve_proposal` record to the ledger only when the returned decision is a real run outcome (`RAN`/`FAILED`/`DENIED` from this attempt), not a no-op replay of the original HELD decision.

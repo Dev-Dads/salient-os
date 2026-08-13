@@ -308,7 +308,11 @@ class Collaborator:
     def _handle_resume(self, job: "_ResumeJob") -> None:
         with self._lock:
             task = self._tasks.get(job.task_id)
-            if task is None:
+            # Defensive invariant (panel gpt-5.1/qwen): a ResumeJob is only ever enqueued for a
+            # task left in a valid pre-resume state (RUNNING by approve(), QUEUED by resume()).
+            # Re-validate under the lock so a stale/duplicate job can never re-enter run_turn on a
+            # task that has since been declined/finished.
+            if task is None or task.state not in (RUNNING, QUEUED):
                 return
             held = list(task.held)
             history = task.history
