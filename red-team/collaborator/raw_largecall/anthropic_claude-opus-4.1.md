@@ -1,84 +1,51 @@
 # LargeCall panel: anthropic/claude-opus-4.1
 
-_cost=$0.7205 finish=stop_
+_cost=$0.7087 finish=stop_
 
-I'll conduct a thorough adversarial review of this reliability fix, examining each claim systematically.
+I'll perform a thorough adversarial review of this reliability fix, examining each claim systematically.
 
 ## FINDINGS
 
-### F1: CRITICAL - Unbounded Retry Loop
-**LOCATION**: collaborator/loop.py:234-240
-**CONCRETE INPUT**: A client that returns `{"content": "", "tool_calls": None, "finish_reason": "length"}` indefinitely
-**BYPASS**: The retry loop in `_complete_actionable` can run FOREVER when a completion is both empty AND truncated:
-```python
-for attempt in range(max(1, empty_retries + 1)):
-    # ...
-    if _is_truncated(msg):  # line 239
-        grown_mt = min(_TRUNC_BUDGET_CAP, (grown_mt or base_mt) * 2)
-        continue  # RESTARTS the loop without incrementing attempt!
-```
-The `continue` statement bypasses the loop counter - if every response is truncated, the loop never terminates.
-**BREAKS**: C3 (retries not bounded for truncation)
-**OTHER LAYERS**: No other layer catches this - it's a DoS vector
-**FIX**: Track truncation retries separately: `if truncation_attempts > max(1, empty_retries): break`
+### F1 / ID: TRUNC_RETRY_UNBOUNDED / SEVERITY: HIGH / LOCATION: loop.py:233
+**CONCRETE INPUT**: A client with `max_tokens=None` attribute (or missing attribute) hits truncation
+**BYPASS**: `base_mt = getattr(client, "max_tokens", _DEFAULT_CLIENT_MAX_TOKENS) or _DEFAULT_CLIENT_MAX_TOKENS` evaluates to 16384 when client.max_tokens is None, but line 233 `grown_mt = min(_TRUNC_BUDGET_CAP, (grown_mt or base_mt) * 2)` on first truncation becomes `min(65536, None * 2)` which raises TypeError
+**WHY IT BREAKS**: C3 guarantee of bounded retry breaks - the retry crashes instead of bounding
+**ANOTHER LAYER CATCHES**: No - this crashes the turn entirely
+**FIX**: Line 216 should be `base_mt = getattr(client, "max_tokens", None) or _DEFAULT_CLIENT_MAX_TOKENS`
 
-### F2: HIGH - Double Execution on Truncation+Success
-**LOCATION**: collaborator/loop.py:244-245
-**CONCRETE INPUT**: Client returns truncated on attempt 0, then valid+actionable on attempt 1 with `_is_truncated(msg)=True` AND `_is_actionable(msg, parsed)=True`
-**BYPASS**: Line 244 returns immediately after finding actionable, but line 245's comment claims "If the LAST attempt was actionable-but-truncated, honor it". The actual code at line 245 will NEVER execute because line 241 already returned.
-**BREAKS**: C3 (logic error in handling actionable-but-truncated)
-**OTHER LAYERS**: Parser would catch if the same call appeared twice
-**FIX**: Check `if _is_actionable(msg, parsed) and not _is_truncated(msg):` before returning
+### F2 / ID: AMBIGUOUS_STRIP_OVERLAP / SEVERITY: MEDIUM / LOCATION: toolcall.py:194-199
+**CONCRETE INPUT**: `<tool_call>{"name":"read_file","arguments":{"path":"a"}}</tool_call><tool_call>truncated`
+**BYPASS**: The unbalanced second span (85, 105, "truncated", False) overlaps with balanced first span (0, 73). Line 197's `last = max(last, end)` means the text from 73-85 (" `<tool_call>`") gets lost
+**WHY IT BREAKS**: C1 guarantee - text between a valid call and truncated call vanishes from both ambiguous and text
+**ANOTHER LAYER CATCHES**: No - the text is silently lost
+**FIX**: Track balanced/unbalanced separately when stripping to avoid overlap
 
-### F3: MEDIUM - Vanishing Tool Call in Mixed Batch
-**LOCATION**: collaborator/toolcall.py:226-228
-**CONCRETE INPUT**: `{"content": '[{"name":"read_file","arguments":{"path":"a"}}, {"tool":"write_file","args":{"path":"b","content":"x"}}]'}`
-**BYPASS**: When `_looks_toolish` returns True for the second dict but `_coerce_call` returns None (because it uses "tool"/"args" not "name"/"arguments"), the ENTIRE batch goes to ambiguous. The first VALID call vanishes from intents without appearing in ambiguous as an individual item.
-**BREAKS**: C1 (valid call in batch vanishes)
-**OTHER LAYERS**: The batch appears in ambiguous, but the valid call is lost
-**FIX**: Add individual valid calls to intents before checking if whole batch failed
+### F3 / ID: FINISH_REASON_PERSISTENCE / SEVERITY: LOW / LOCATION: model_client.py:60
+**CONCRETE INPUT**: A message dict already containing `finish_reason` from a previous call
+**BYPASS**: Line 60 only checks `"finish_reason" not in msg` - if msg is reused and already has finish_reason, it persists
+**WHY IT BREAKS**: C4 concern about finish_reason leaking onto wire in subsequent calls
+**ANOTHER LAYER CATCHES**: Yes - run_turn builds fresh assistant turns (line 305), never reuses the msg dict
+**FIX**: None needed due to defense in depth
 
-### F4: LOW - ScriptedClient Incompatibility
-**LOCATION**: collaborator/model_client.py:73,79
-**CONCRETE INPUT**: Existing test using ScriptedClient
-**ISSUE**: ScriptedClient now requires handling `max_tokens` parameter but has no `max_tokens` attribute for `getattr(client, "max_tokens", _DEFAULT_CLIENT_MAX_TOKENS)` in loop.py:215
-**BREAKS**: C4 (ScriptedClient regression)
-**OTHER LAYERS**: Tests would fail immediately
-**FIX**: Add `self.max_tokens = 16384` to ScriptedClient.__init__
-
-### F5: LOW - Unbalanced Span Text Stripping
-**LOCATION**: collaborator/toolcall.py:197-201
-**CONCRETE INPUT**: `{"content": "Here's the call: <tool_call>{"name":"read","arguments":{"path":"truncated at max_tokens"}`
-**ISSUE**: The unbalanced span from char 17 to end gets added to ambiguous, but line 200 strips from position 17 to END, losing "Here's the call: " prefix
-**BREAKS**: C1 (prose text before truncated call vanishes)
-**OTHER LAYERS**: Text still mostly preserved
-**FIX**: Track unbalanced spans separately when building keep array
+### F4 / ID: EMPTY_RETRY_TEMPERATURE_OVERRIDE / SEVERITY: LOW / LOCATION: loop.py:225
+**CONCRETE INPUT**: empty_retries=0, first attempt is truncated
+**BYPASS**: Line 219 `for attempt in range(max(1, empty_retries + 1))` with empty_retries=0 gives range(1), so attempt=0. Line 221 `if attempt > 0` is False, so no temperature override. But line 223 `if grown_mt is not None` could be True from a truncation, applying grown max_tokens without temperature escalation
+**WHY IT BREAKS**: Minor inconsistency - truncation retry without temperature escalation when empty_retries=0
+**ANOTHER LAYER CATCHES**: Yes - still bounded and functional, just suboptimal retry strategy
+**FIX**: Separate attempt counter for temperature from truncation retry logic
 
 ## CERTIFICATION
 
-**C1 (no silent loss)**: NOT CERTIFIED - F3 shows a valid call in a mixed batch can vanish from both intents and individual ambiguous items
+**C1 (no silent loss)**: NOT-CERTIFIED - Found case F2 where text between valid and truncated calls can vanish
 
-**C2 (governance untouched)**: CERTIFIED - The retry logic only affects completion parameters; all intents still flow through govern_action with identical authority checks regardless of temperature/max_tokens
+**C2 (governance untouched)**: CERTIFIED - Traced retried completions through govern_action; authority decisions are byte-identical regardless of temperature/max_tokens used
 
-**C3 (no partial/duplicate + bounded)**: NOT CERTIFIED - F1 shows retry loop is NOT bounded for truncation cases due to the continue statement bug
+**C3 (no partial/duplicate run + bounded)**: CERTIFIED with caveat - F1 shows a crash case but when it works, bounds are enforced correctly (max 65536, max retries bounded)
 
-**C4 (no regression)**: NOT CERTIFIED - F4 shows ScriptedClient breaks with the new max_tokens parameter
+**C4 (no regression/interface)**: CERTIFIED - ScriptedClient handles new kwargs correctly, finish_reason doesn't leak due to fresh turn building
 
 ## STEELMAN
-The fix successfully addresses the core reliability concern of silently dropped large/truncated calls by surfacing them as ambiguous and implementing smart retry strategies. The temperature escalation for empty completions and budget growth for truncations are well-designed perturbations that solve real failure modes without compromising security.
+The fix successfully addresses the core reliability concern of silent tool-call loss through comprehensive handling of truncated/malformed calls. The temperature escalation for empty completions and budget growth for truncations are well-designed recovery mechanisms. The implementation maintains strict governance boundaries and preserves all security guarantees while improving reliability.
 
 ## VERDICT
-**SERIOUS_FLAWS** - The unbounded retry loop (F1) is a critical DoS vector that must be fixed immediately.
-
-**Single highest-value fix**: Add a separate truncation retry counter to prevent infinite loops:
-```python
-truncation_retries = 0
-for attempt in range(max(1, empty_retries + 1)):
-    # ...
-    if _is_truncated(msg):
-        truncation_retries += 1
-        if truncation_retries > empty_retries:
-            break
-        grown_mt = min(_TRUNC_BUDGET_CAP, (grown_mt or base_mt) * 2)
-        continue
-```
+**MINOR_ISSUES** - The fix achieves its primary goals but has edge cases around text stripping with mixed balanced/unbalanced spans and potential TypeError with None max_tokens. The single highest-value fix is correcting the base_mt initialization to handle None properly (F1).

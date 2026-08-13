@@ -122,6 +122,19 @@ class NeverSilentlyDropped(unittest.TestCase):
         self.assertEqual(r.intents, ())                # strict: a partial batch is not run...
         self.assertEqual(len(r.ambiguous), 1)          # ...but the whole batch is surfaced, not lost
 
+    def test_truncated_whole_content_batch_is_surfaced_not_dropped(self):
+        # a whole-content JSON array clipped mid-way (no <tool_call> marker, invalid JSON)
+        clipped = ('[{"name":"write_file","arguments":{"path":"a","content":"x"}}, '
+                   '{"name":"write_file","arguments":{"path":"b","content":"cli')
+        r = parse_message({"content": clipped})
+        self.assertEqual(r.intents, ())
+        self.assertEqual(len(r.ambiguous), 1)          # surfaced, not silently lost
+
+    def test_plain_prose_is_not_misread_as_a_tool_call(self):
+        r = parse_message({"content": "Sure — I'll read the file and report back."})
+        self.assertEqual(r.intents, ())
+        self.assertEqual(r.ambiguous, ())              # no false positive
+
     def test_whole_content_all_valid_batch_still_runs(self):
         batch = ('[{"name":"write_file","arguments":{"path":"a","content":"x"}},'
                  ' {"name":"read_file","arguments":{"path":"a"}}]')

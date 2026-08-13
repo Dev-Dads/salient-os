@@ -226,9 +226,24 @@ def parse_message(message: object) -> ParseResult:
                 # a batch the model MEANT as calls but one element is malformed — surface the
                 # whole batch as ambiguous rather than silently drop every call in it.
                 ambiguous.append(candidate[:200])
+        elif payload is None and candidate[:1] in "[{" and _text_looks_toolish(candidate):
+            # a whole-content tool-call attempt that did NOT parse (e.g. a batch clipped by
+            # max_tokens, no <tool_call> marker) — surface it, never silently lose it (panel
+            # grok/qwen F1). It is tool-shaped but unrunnable, so it is ambiguous, never run.
+            ambiguous.append(candidate[:200])
 
     return ParseResult(intents=tuple(intents), ambiguous=tuple(ambiguous), text=remaining.strip())
 
 
 def _looks_toolish(obj: dict) -> bool:
     return any(k in obj for k in ("name", "tool", "tool_name", "function", "arguments", "args"))
+
+
+_TOOLISH_TOKENS = ('"name"', '"tool"', '"tool_name"', '"function"', '"arguments"', '"args"')
+
+
+def _text_looks_toolish(s: str) -> bool:
+    """A raw (possibly unparseable/clipped) string that appears to be an ATTEMPTED tool call —
+    used to surface a whole-content call that did not parse (e.g. a batch clipped by max_tokens)
+    so it is never silently lost."""
+    return any(tok in s for tok in _TOOLISH_TOKENS)

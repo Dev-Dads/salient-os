@@ -1,137 +1,169 @@
 # LargeCall panel: x-ai/grok-4.5
 
-_cost=$0.0877 finish=stop_
+_cost=$0.0934 finish=stop_
 
 # Adversarial Review: Large/Batched Tool-Call Reliability Fix
 
 ## Findings
 
-### F1 / Truncation retry discards a completed sibling call / MEDIUM  
-**Location:** `collaborator/loop.py` `_complete_actionable` (~lines with `if _is_truncated(msg): ... continue`)
+### F1 / truncated whole-content JSON array vanishes from intents, ambiguous, AND text / MEDIUM / `collaborator/toolcall.py:213-232`
 
 **Concrete input:**
 ```python
-msg = {
-  "content": '<tool_call>{"name":"write_file","arguments":{"path":"a.txt","content":"ok"}}</tool_call>'
-             '<tool_call>{"name":"write_file","arguments":{"path":"b.txt","content":"AAAA',
-  "finish_reason": "length",
-}
+parse_message({"content": '[{"name":"write_file","arguments":{"path":"a","content":"x"}},{"name":"write_file","arguments":{"path":"b","content":"'})
+# finish_reason would be "length"; content is a clipped JSON array (no <tool_call> markers)
 ```
-Parse yields: intent `write_file(a.txt)` + ambiguous truncated second call. `_is_actionable` is True, but truncation is checked **first** and `continue`s — the valid intent is never returned to `run_turn` / `govern_action`. On retry the model may emit only the second call (or something else); `a.txt` never runs from this completion.
 
-**Why it breaks a guarantee:** C3 says “a completed call plus a retry” must not lose work / must not partially mishandle; C1’s “not run → ambiguous or empty” is satisfied for the clip, but a **fully valid** call is discarded solely because a sibling was truncated. That is silent loss of a runnable intent from an obtained completion (retry may not reproduce it).
+**Why it breaks a guarantee:** C1 says every tool-shaped thing that is not RUN is in `ambiguous` or `text` (or empty→`stopped="empty"`). Path:
+1. No structured `tool_calls`.
+2. No `<tool_call` markers → `_tool_call_tag_objects` returns `[]`; the unbalanced-span path never fires.
+3. Whole-content branch: `_try_json(candidate)` fails on truncated JSON → `payload is None`.
+4. Neither the `dict` nor `list` arm runs. `ambiguous` stays empty. `remaining` stays the full clipped content → it lands in `text`.
 
-**Another layer?** No — `govern_action` never sees the dropped intent. Parser correctly extracted it.
+So the call does **not** vanish from the triple entirely — it remains in `text`. But it is **not** classified as tool-shaped/`ambiguous`. The human sees raw half-JSON in the reply with no `[ambiguous — NOT run]` marker. The truncation-retry path in `_complete_actionable` only continues when `_is_truncated and not parsed.intents`. Here `parsed.intents` is empty and if `finish_reason=="length"`, it **does** retry (good). After budget exhaustion, `_is_actionable` is True because `parsed.text` is non-empty → `stopped="final"` with garbage prose, not a clear “clipped tool call” surface.
 
-**Fix:** On truncation, if `parsed.intents` is non-empty, either (a) return that completion and surface remaining ambiguous (accept partial progress), or (b) stash intents and merge with the retry. Do not `continue` away runnable intents.
+**Another layer:** Truncation retry may still grow budget and recover on a later attempt. If every attempt is clipped the same way, the loss-of-classification stands. `govern_action` never sees it (correct — nothing to run). This is a **real C1 gap for the non-tag whole-content truncated form**, weaker than total vanish but weaker than the claimed “surfaced as ambiguous” contract. The pinned tests only cover truncated `<tool_call>` tags and well-formed mixed batches.
+
+**Fix:** If `finish_reason=="length"` (parser would need the flag, or loop post-check) and whole-content looks like an incomplete JSON object/array (`strip` starts with `{`/`[` and `_try_json` fails), append `candidate[:200]` to `ambiguous` and clear it from `text`. Alternatively, in `_complete_actionable`, treat truncated + no intents + text-that-looks-like-json as non-terminal ambiguous.
 
 ---
 
-### F2 / Whole-content list where no element `_looks_toolish` still vanishes / LOW (nit / edge)  
-**Location:** `collaborator/toolcall.py` `parse_message` whole-content list branch
+### F2 / whole-content list of dicts where NONE `_looks_toolish` still drops the batch with no ambiguous / LOW / `collaborator/toolcall.py:222-232`
 
 **Concrete input:**
-```json
-[{"foo": 1}, {"bar": 2}]
+```python
+parse_message({"content": '[{"foo":1},{"bar":2}]'})
 ```
-as entire content. `all(g is not None)` is false; `any(_looks_toolish(...))` is false → nothing in intents, ambiguous, or stripped specially; full JSON remains in `text`.
 
-**Why:** C1 says “tool-shaped” things must not vanish. These are not tool-shaped by `_looks_toolish`, so this is largely a **stated non-goal** / strictness edge. Pre-fix also left them as text. Not a regression.
+**Why:** `all(g is not None for g in got)` is False; `any(_looks_toolish(...))` is False → nothing added to intents or ambiguous; full JSON remains in `text`. C1 probe asked for “whole-content list of dicts none of which `_looks_toolish`”. Strictly, these are not tool-shaped, so “not silent loss of a tool call” holds. Stated concern was “batch the model MEANT as calls”. **Non-finding against C1** if we require tool-shape; note only.
 
-**Another layer?** N/A — not tool-shaped.
-
-**Fix:** Optional only: if whole content is a JSON array of objects, always surface as ambiguous. Not required for the shipped claim if “tool-shaped” is defined by `_looks_toolish`.
+**Another layer:** N/A. Nit / non-goal.
 
 ---
 
-### F3 / Unbalanced span swallows trailing prose after a truncated marker / LOW  
-**Location:** `collaborator/toolcall.py` `_tool_call_tag_objects` unbalanced branch: `hits.append((m.start(), len(content), content[start:], False))` + strip loop
+### F3 / unbalanced `<tool_call>` + valid call: span-to-EOF can shadow a later valid call’s prose handling, but does not drop the valid call if it appears FIRST / LOW (blocked) / `collaborator/toolcall.py:80-91,194-201`
 
 **Concrete input:**
 ```text
-Intro.
-<tool_call>{"name":"write_file","arguments":{"path":"a","content":"aa
-and then the model also said: please check disk.
+<tool_call>{"name":"write_file","arguments":{"path":"a","content":"x"}}</tool_call>
+prose here
+<tool_call>{"name":"write_file","arguments":{"path":"b","content":"yyyy
 ```
-Unbalanced hit spans to EOF → ambiguous gets the JSON prefix; trailing prose is stripped from `text` (not in intents/ambiguous/text as readable reply prose). The truncated call is in `ambiguous` (C1 OK for the call). Prose is lost from `text`.
 
-**Why:** Mild C1/C4 tension for **non-tool** text after an unclosed marker. Truncation at max_tokens usually means little meaningful prose after the clip; still a real strip behavior.
+Hits: (1) balanced valid, (2) unbalanced to EOF. Valid → intent; unbalanced → ambiguous; strip uses `last = max(last, end)` so prose between is kept, truncated tail stripped. **C1 holds.**
 
-**Another layer?** Surfacing ambiguous preserves the call; prose loss is UX.
+Reverse order (truncated marker first, then more text that contains another `{...}` without a new marker): second call never scanned past EOF span — but there is no second marker content after EOF. If two markers and first is unbalanced, first span is `(m1.start, len(content))` and second marker is still found by `finditer` on full content:
 
-**Fix:** Prefer spanning unbalanced only through the JSON-ish run, or keep a copy of post-marker prose when finish_reason is length (hard). Acceptable as LOW.
+```text
+<tool_call>{"name":"write_file","arguments":{"path":"a","content":"aa
+<tool_call>{"name":"read_file","arguments":{"path":"b"}}
+```
 
----
+Both markers match. First unbalanced → js from first `{` to EOF (includes second tag). Second: may find `{` of read_file, balance it → valid intent **and** ambiguous blob that duplicates/superset. Valid call still runs; truncated not lost. Over-strip: `last = max(last,end)` → remaining empty. **No vanish. No double-run of truncated.** Acceptable.
 
-### F4 / Nested / second marker inside unbalanced span / LOW  
-**Location:** same strip loop: `last = max(last, end)` with unbalanced `end = len(content)`
-
-**Concrete input:** two markers where the first never closes; second marker appears later in the same content. First unbalanced hit consumes to EOF; second hit may still be found by `finditer` and processed for ambiguous, but strip already consumed everything — OK for ambiguous append order; possible **duplicate** ambiguous slices or odd overlap. Valid-first + truncated-second is OK when first is balanced (F1 is the loop issue, not parser span overlap).
-
-**Valid `<tool_call>` + prose:** balanced end stops at closing brace; prose remains — **C4 parser claim holds**.
-
-**Another layer?** N/A.
+**C4 span-overlap concern:** VALID call followed by prose — balanced end stops at closing brace; prose preserved. **Blocked attack.**
 
 ---
 
-### F5 / `finish_reason` on message dict — wire leak / NON-FINDING  
-**Location:** `model_client.py` attaches `finish_reason` on returned msg; `run_turn` builds `history.append({"role":"assistant","content": assistant_text})` with **only** role+content.
+### F4 / `grown_mt` doubles only on truncation continue; temperature still applied on truncation retries / LOW (nit) / `collaborator/loop.py:218-236`
 
-**Bypass attempt:** Subsequent `client.complete(history)` — history has no `finish_reason`. ScriptedClient/propose path: `complete(..., max_tokens=None)` default OK.
-
-**Blocked.** C4 wire claim holds.
+Truncation retries set both `temperature=_retry_temperature(attempt)` (for attempt>0) and grown `max_tokens`. C2 asks whether temp/budget change authority — they do not enter `govern_action`. **Non-finding for C2.** Orthogonal coupling (temp raised when only budget needed) is a quality nit, not a guarantee break.
 
 ---
 
-### F6 / Grown max_tokens / temperature alter authority / NON-FINDING  
-**Trace:** `_complete_actionable` → `parse_message` → `run_turn` → `for intent in parsed.intents: govern_action(session, intent, importance=..., risk=...)`. No `finish_reason`, `max_tokens`, or temperature enters `govern_action`. Ambiguous never iterated as intents. Authority byte-identical for retried completions.
+### F5 / retry bound `max(1, empty_retries+1)` and budget `min(65536, …)` / NON-FINDING / `collaborator/loop.py:218-234,171-175`
 
-**Blocked.** C2 holds. (F1 is loss of intent before govern, not extra authority.)
+| `empty_retries` | attempts |
+|-----------------|----------|
+| 0 | 1 |
+| 1 | 2 |
+| 3 | 4 |
 
----
-
-### F7 / Partial write of clipped call / duplicate run / budget bounds / NON-FINDING (with F1 caveat)  
-- Clipped `<tool_call>` → `balanced=False` → ambiguous only → not in `parsed.intents` → no execute. **No partial write.**  
-- Retry replaces prior completion (empties/truncations not appended to history until success). **No double run of the same completion.**  
-- `grown_mt = min(65536, (grown_mt or base_mt) * 2)` → bounded.  
-- `range(max(1, empty_retries + 1))` → empty_retries ∈ {0,1,3} → 1 / 2 / 4 attempts.  
-- Valid whole-content batch: unchanged `all(g is not None)` → all run.  
-- Mixed batch: `elif any(_looks_toolish)` → ambiguous only, **no partial run.**
-
-F1 is the only related hole (drop valid sibling on trunc), not partial execute of clipped JSON.
+Growth: `base_mt=16384` → 32768 → 65536 → 65536. Cap holds. **C3 bounds certified.**
 
 ---
 
-### F8 / ScriptedClient / propose / resume / NON-FINDING  
-ScriptedClient accepts `max_tokens=None`. propose.py not in delta; `complete` kwargs optional. Resume uses same `run_turn` + fresh assistant turns. **No break found.**
+### F6 / partial write / duplicate action on truncation retry / NON-FINDING / `collaborator/loop.py:227-234` + parser
+
+- Clipped `<tool_call>` → `balanced=False` → ambiguous only → never `_coerce_call` success → never `govern_action`.
+- Guard `not parsed.intents` prevents discarding a complete sibling call; fall-through runs complete intents once; no second complete of same message.
+- Retry replaces message; does not re-execute prior turn’s intents (prior truncated-only attempt `continue`s without appending history).
+
+Pinned test `test_truncation_never_discards_a_complete_call_parsed_in_the_same_turn` matches. **C3 partial/duplicate: blocked.**
 
 ---
 
-### F9 / Last truncated-but-actionable honored / intentional  
-After budget, `return msg, parsed, _is_actionable(msg, parsed)` — persistent trunc with ambiguous returns actionable True → `stopped=final` with ambiguous surfaced (pinned test). Matches claim; out-of-scope note about ambiguous-only `final` acknowledged.
+### F7 / mixed whole-content batch strictness / NON-FINDING / `collaborator/toolcall.py:222-232`
+
+Mixed batch → no intents, one ambiguous. All-valid → all intents. **C3 strictness preserved.**
 
 ---
 
-### F10 / Marker without `{`/`[` within 40 chars / NON-FINDING for C1  
-`<tool_call` with no JSON start → no hit → may remain in text after replace of literal `<tool_call`. Not a closed tool-shaped payload; pre-existing.
+### F8 / governance path for retried completion / NON-FINDING / `loop.py:run_turn` + `govern_action`
+
+Trace (grown-budget retry):
+1. `_complete_actionable` returns `(msg, parsed, True)` after retry with `max_tokens=grown_mt`.
+2. `run_turn` appends assistant text from content/intents only — **not** `finish_reason`.
+3. `for intent in parsed.intents: govern_action(session, intent, importance=..., risk=...)`.
+4. No `max_tokens`, `temperature`, or `finish_reason` parameters on `govern_action`.
+5. `ambiguous` only extended onto `TurnResult` / TOOL RESULTS line — never iterated as intents.
+
+Authority is byte-identical to a first-shot parse of the same intent bytes. **C2 certified.**
 
 ---
 
-## Certification
+### F9 / `finish_reason` on wire / resume / ScriptedClient / NON-FINDING / `model_client.py` + `loop.py`
 
-| Claim | Status | Sentence |
-|-------|--------|----------|
-| **C1** | **NOT-CERTIFIED** | Truncated/malformed single calls and mixed toolish batches are surfaced, but a **valid intent co-emitted with a truncated sibling is dropped on truncation retry** (F1), which is silent loss of a tool-shaped runnable call with no trace in the turn that obtained it. |
-| **C2** | **CERTIFIED** | Retries and `finish_reason`/`max_tokens` never enter `govern_action`; ambiguous is never executed; authority path is unchanged for whatever intents actually reach the loop. |
-| **C3** | **NOT-CERTIFIED** | No partial execute of clipped JSON, no double-run from history replay, bounds and batch strictness hold — but truncation `continue` **drops already-parsed complete calls** (F1), violating “no lost completed work / clean retry” spirit of C3. |
-| **C4** | **CERTIFIED** | Optional kwargs, ScriptedClient, assistant history without `finish_reason`, and balanced-span validity+prose behavior hold; unbalanced EOF strip is a minor prose nit, not an interface break. |
+- `history.append({"role":"assistant","content": assistant_text})` — fresh dict, no `finish_reason`, no `tool_calls` passthrough of raw msg.
+- `ScriptedClient.complete(..., max_tokens=None)` accepts kwargs; records `max_tokens_seen`.
+- `propose.py` / callers using `complete(messages)` unchanged (defaults).
+- Resume uses `history=` built the same way.
+
+**C4 interface: blocked attacks.**
+
+---
+
+### F10 / `_EmptyAtLowTempClient` in tests lacks `max_tokens` kwarg / LOW (test-only) / `tests/test_collaborator_loop.py` (~`_EmptyAtLowTempClient.complete`)
+
+```python
+def complete(self, messages, tools=None, temperature=None) -> dict:
+```
+
+Production loop now calls `complete(..., max_tokens=...)` only when `grown_mt is not None`. Empty-temp tests never set `grown_mt`, so still work. If a future test combines empty+truncation against this helper, it TypeErrors. **Not a production C4 break**; ScriptedClient was updated correctly.
+
+---
+
+### F11 / persistently truncated with only ambiguous: actionable True → `stopped="final"` / LOW (stated non-goal adjacent) / `loop.py:237-240, run_turn`
+
+Docstring says truncated-but-parseable surfaces ambiguous as actionable; run_turn with no intents returns `stopped="final"`. Out of scope notes already call ambiguous-only `stopped="final"` pre-existing. **Not rated as regression.**
+
+---
+
+### F12 / nested braces in clipped span / NON-FINDING / `toolcall.py:_balanced_span` + unbalanced branch
+
+Clipped content with braces inside strings: balance never returns; unbalanced hit to EOF; `ambiguous.append(js[:200])`; stripped from text. **C1 holds for tag form.**
+
+---
+
+## Certification lines
+
+| Claim | Verdict | One sentence |
+|-------|---------|--------------|
+| **C1** | **NOT-CERTIFIED** | Truncated **tag**-shaped and mixed **whole-content** batches are surfaced, but a **truncated whole-content JSON** (no `<tool_call>`, `_try_json` fails) never enters `ambiguous` and is only residual `text` / possible `final` garbage — silent loss of *tool-call classification* (F1). |
+| **C2** | **CERTIFIED** | Retries only change client sampling kwargs; intents still only execute via `govern_action`; `ambiguous` never runs; `finish_reason`/budget/temp never touch the seam. |
+| **C3** | **CERTIFIED** | Clipped calls are ambiguous not executed; complete+clipped same message runs complete once; budget ≤65536; attempts = `max(1, empty_retries+1)`; all-valid batches run all; mixed batches run none. |
+| **C4** | **CERTIFIED** | ScriptedClient/OllamaClient signatures are backward-compatible; assistant history is rebuilt without `finish_reason`; balanced spans do not swallow following prose; structured/content-json paths unchanged. |
 
 ---
 
 ## STEELMAN
 
-The fix correctly targets the real failure mode: clipped `<tool_call>` JSON and mixed whole-content arrays used to disappear from both execution and ambiguous. Parser unbalanced spans + toolish batch surfacing, paired with bounded max_tokens growth on `finish_reason==length`, are the right levers and are well pinned by tests. Governance remains untouched; clipped calls never become intents.
+The change correctly targets the two real silent-loss bugs (unbalanced `<tool_call>` dropped by the old balancer, and mixed whole-content arrays dropped when any element failed coerce) and pairs them with a bounded truncation retry that refuses to throw away already-complete intents in the same clipped message — the subtle failure mode that naive “always retry on length” would introduce. Governance stays out of the reliability path by construction: parser classification and `run_turn`’s intent loop are unchanged as authority boundaries. For the dominant model path (`<tool_call>` / structured calls), the no-silent-loss + no-partial-run story is tight and well pinned by tests.
+
+---
 
 ## VERDICT
 
-**MINOR_ISSUES** — Core no-silent-drop for the clipped-only and mixed-batch cases is real and tested; the highest-value fix is **F1: do not discard non-empty `parsed.intents` when `finish_reason==length`** (return and govern them, or merge across retry).
+**MINOR_ISSUES** — Core tag/batch/retry/governance guarantees hold under adversarial probe; the residual hole is truncated **marker-free** whole-content JSON never promoted to `ambiguous` (F1), so C1 cannot be fully certified.
+
+**Single highest-value fix:** In `parse_message` whole-content branch (or in `_complete_actionable` when `finish_reason=="length"` and `not intents`), if content strips to a `{`/`[` prefix and `json.loads` fails, push `candidate[:200]` into `ambiguous` and clear it from `text` so clipped hermes-style / bare-JSON large calls get the same surface contract as clipped `<tool_call>` blocks.
