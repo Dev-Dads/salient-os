@@ -225,13 +225,19 @@ def _complete_actionable(client, history, empty_retries: int):
             kwargs["max_tokens"] = grown_mt
         msg = client.complete(history, tools=tools, **kwargs)
         parsed = parse_message(msg)
-        if _is_truncated(msg):  # output was cut off — grow the budget and try again
+        if _is_truncated(msg) and not parsed.intents:
+            # Output was cut off BEFORE any complete call landed — grow the budget and try
+            # again. Guard on ``not parsed.intents`` (panel grok F1): if the clip only ate a
+            # TRAILING call, complete calls already parsed in this same message must NOT be
+            # discarded by the retry — fall through, run them, and surface the clipped tail as
+            # ambiguous. Never throw away completed work.
             grown_mt = min(_TRUNC_BUDGET_CAP, (grown_mt or base_mt) * 2)
             continue
         if _is_actionable(msg, parsed):
             return msg, parsed, True
-    # Budget exhausted. If the LAST attempt was actionable-but-truncated, honor it (surfaced
-    # ambiguous is better than discarding); otherwise it is empty -> not actionable.
+    # Budget exhausted: report the last attempt's actionability honestly. A persistently
+    # truncated-but-parseable turn surfaces its clipped call as ambiguous (actionable);
+    # a persistently empty one is not actionable -> the caller returns stopped="empty".
     return msg, parsed, _is_actionable(msg, parsed)
 
 

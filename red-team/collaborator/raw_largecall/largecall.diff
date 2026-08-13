@@ -1,0 +1,208 @@
+diff --git a/collaborator/loop.py b/collaborator/loop.py
+index b7861e7..aab2844 100644
+--- a/collaborator/loop.py
++++ b/collaborator/loop.py
+@@ -171,6 +171,12 @@ def _render_intent(intent) -> str:
+ _RETRY_BASE_TEMP = 0.7    # first retry temperature (validated escape point)
+ _RETRY_TEMP_STEP = 0.15   # escalate each further retry...
+ _RETRY_TEMP_MAX = 1.0     # ...up to this cap
++# A TRUNCATED turn (finish_reason == "length") means the output hit the token cap — e.g. a
++# large tool call clipped mid-JSON, which the parser then surfaces as ambiguous (never runs,
++# never silently drops it). Retrying at the SAME cap would clip again, so a truncation retry
++# GROWS the budget (double, bounded) to let the call complete. Orthogonal to the empty-escape.
++_TRUNC_BUDGET_CAP = 65536  # upper bound when growing max_tokens on truncation (well under 131072 ctx)
++_DEFAULT_CLIENT_MAX_TOKENS = 16384  # assumed client cap when it exposes none (matches OllamaClient)
+ 
+ 
+ def _retry_temperature(attempt: int) -> float:
+@@ -180,6 +186,11 @@ def _retry_temperature(attempt: int) -> float:
+     return min(_RETRY_TEMP_MAX, _RETRY_BASE_TEMP + _RETRY_TEMP_STEP * (attempt - 1))
+ 
+ 
++def _is_truncated(msg) -> bool:
++    """The completion was cut off at the token cap (its tool call / content may be clipped)."""
++    return isinstance(msg, dict) and msg.get("finish_reason") == "length"
++
++
+ def _is_actionable(msg, parsed) -> bool:
+     """A completion is actionable if it DID something (a tool intent), TRIED something (an
+     ambiguous call we surface for you), or SAID something (non-empty text). An EMPTY
+@@ -192,24 +203,36 @@ def _is_actionable(msg, parsed) -> bool:
+ 
+ 
+ def _complete_actionable(client, history, empty_retries: int):
+-    """Get an ACTIONABLE completion, retrying past empty (reasoning-only) responses up to
+-    ``empty_retries`` extra times, escalating the temperature on each retry to escape a
+-    deterministic empty streak (see the module note above). The first attempt uses the
+-    client's configured temperature; only retries perturb it. Returns
+-    ``(msg, parsed, actionable)`` — ``actionable`` is False only if STILL empty after the
+-    whole budget, which the caller must surface honestly, never as a finished turn."""
++    """Get an ACTIONABLE, non-truncated completion, retrying up to ``empty_retries`` extra
++    times. Two failure modes, two perturbations (see the module note above):
++      * EMPTY (reasoning-only, no content/call) — escalate the TEMPERATURE to break a
++        deterministic streak a same-temp retry cannot.
++      * TRUNCATED (finish_reason == "length", a large call/content clipped at the cap) — GROW
++        max_tokens (double, bounded) so the call can complete instead of being clipped.
++    The first attempt uses the client's own settings; only retries perturb. Returns
++    ``(msg, parsed, actionable)`` — ``actionable`` is False only if STILL empty/truncated after
++    the whole budget, which the caller surfaces honestly, never as a finished turn."""
+     tools = openai_tools()
++    base_mt = getattr(client, "max_tokens", _DEFAULT_CLIENT_MAX_TOKENS) or _DEFAULT_CLIENT_MAX_TOKENS
+     msg: dict = {}
+     parsed = parse_message(msg)
++    grown_mt = None  # raised only after a truncation
+     for attempt in range(max(1, empty_retries + 1)):
+-        if attempt == 0:
+-            msg = client.complete(history, tools=tools)  # the model's preferred (low-temp) shot
+-        else:
+-            msg = client.complete(history, tools=tools, temperature=_retry_temperature(attempt))
++        kwargs = {}
++        if attempt > 0:
++            kwargs["temperature"] = _retry_temperature(attempt)
++        if grown_mt is not None:
++            kwargs["max_tokens"] = grown_mt
++        msg = client.complete(history, tools=tools, **kwargs)
+         parsed = parse_message(msg)
++        if _is_truncated(msg):  # output was cut off — grow the budget and try again
++            grown_mt = min(_TRUNC_BUDGET_CAP, (grown_mt or base_mt) * 2)
++            continue
+         if _is_actionable(msg, parsed):
+             return msg, parsed, True
+-    return msg, parsed, False
++    # Budget exhausted. If the LAST attempt was actionable-but-truncated, honor it (surfaced
++    # ambiguous is better than discarding); otherwise it is empty -> not actionable.
++    return msg, parsed, _is_actionable(msg, parsed)
+ 
+ 
+ def run_turn(session, client, user_message: str, history=None, max_iterations: int = 6,
+diff --git a/collaborator/model_client.py b/collaborator/model_client.py
+index 9454466..eaff0bc 100644
+--- a/collaborator/model_client.py
++++ b/collaborator/model_client.py
+@@ -1,11 +1,14 @@
+ """Model client for the loop, and the tiny interface the loop depends on.
+ 
+-The loop needs only ``complete(messages, tools=None, temperature=None) -> assistant
+-message dict`` (shape: ``{"content": str|None, "tool_calls": [...]}``). ``temperature``
+-is a per-call override (None → the client's configured default); the loop raises it on
+-a retry to escape a deterministic empty-completion streak (see loop._complete_actionable).
+-Tests inject a scripted fake so the whole governed loop runs without a live model; real
+-runs use ``OllamaClient`` against an OpenAI-compatible ``/v1`` endpoint. urllib only.
++The loop needs only ``complete(messages, tools=None, temperature=None, max_tokens=None)
++-> assistant message dict`` (shape: ``{"content": str|None, "tool_calls": [...],
++"finish_reason": str|None}``). ``temperature`` and ``max_tokens`` are per-call overrides
++(None → the client's configured default); the loop raises the temperature on a retry to
++escape a deterministic empty-completion streak, and raises max_tokens on a retry when a
++turn was TRUNCATED (finish_reason == "length"), so a large tool call clipped mid-JSON can
++complete rather than be lost (see loop._complete_actionable). Tests inject a scripted fake
++so the whole governed loop runs without a live model; real runs use ``OllamaClient``
++against an OpenAI-compatible ``/v1`` endpoint. urllib only.
+ """
+ 
+ from __future__ import annotations
+@@ -33,10 +36,11 @@ class OllamaClient:
+         self.max_tokens = max_tokens
+         self.temperature = temperature
+ 
+-    def complete(self, messages, tools=None, temperature=None) -> dict:
++    def complete(self, messages, tools=None, temperature=None, max_tokens=None) -> dict:
+         temp = self.temperature if temperature is None else temperature
++        mt = self.max_tokens if max_tokens is None else max_tokens
+         body = {"model": self.model, "messages": messages,
+-                "max_tokens": self.max_tokens, "temperature": temp}
++                "max_tokens": mt, "temperature": temp}
+         if tools:
+             body["tools"] = tools
+         req = urllib.request.Request(
+@@ -48,7 +52,14 @@ class OllamaClient:
+         with urllib.request.urlopen(req, timeout=self.timeout) as r:
+             resp = json.load(r)
+         choice = (resp.get("choices") or [{}])[0]
+-        return choice.get("message") or {}
++        msg = choice.get("message") or {}
++        # Expose why generation stopped so the loop can retry a TRUNCATED turn (finish_reason
++        # == "length" — output hit the cap, e.g. a large tool call clipped mid-JSON) with a
++        # bigger budget. Attached to the returned dict (never sent back on the wire — the loop
++        # builds its own assistant turns); leave any server-provided value untouched.
++        if isinstance(msg, dict) and "finish_reason" not in msg:
++            msg["finish_reason"] = choice.get("finish_reason")
++        return msg
+ 
+ 
+ class ScriptedClient:
+@@ -59,11 +70,13 @@ class ScriptedClient:
+     def __init__(self, messages) -> None:
+         self._queue = list(messages)
+         self.seen: list = []
+-        self.temps: list = []   # per-call temperature the loop requested (None = default)
++        self.temps: list = []            # per-call temperature the loop requested (None = default)
++        self.max_tokens_seen: list = []  # per-call max_tokens the loop requested (None = default)
+ 
+-    def complete(self, messages, tools=None, temperature=None) -> dict:
++    def complete(self, messages, tools=None, temperature=None, max_tokens=None) -> dict:
+         self.seen.append(list(messages))
+         self.temps.append(temperature)
++        self.max_tokens_seen.append(max_tokens)
+         if self._queue:
+             return self._queue.pop(0)
+         return {"content": "done.", "tool_calls": None}
+diff --git a/collaborator/toolcall.py b/collaborator/toolcall.py
+index 381fcae..901b7b5 100644
+--- a/collaborator/toolcall.py
++++ b/collaborator/toolcall.py
+@@ -62,7 +62,11 @@ def _balanced_span(text: str, i: int) -> int:
+ 
+ def _tool_call_tag_objects(content: str):
+     """For each ``<tool_call`` marker, extract the balanced JSON that follows it
+-    (skipping tag chars/whitespace). Returns list of (start, end, json_str)."""
++    (skipping tag chars/whitespace). Returns list of (start, end, json_str, balanced).
++    An UNBALANCED span — a call whose JSON never closes, e.g. a large call clipped by
++    max_tokens — is still returned (balanced=False, spanning to end-of-content) so the
++    caller can SURFACE it as ambiguous and strip it from the prose. It is never silently
++    dropped: a truncated tool call is the exact 'large call rejected' failure to avoid."""
+     hits = []
+     for m in _TOOL_CALL_MARKER_RE.finditer(content):
+         start = None
+@@ -76,7 +80,9 @@ def _tool_call_tag_objects(content: str):
+             continue
+         end = _balanced_span(content, start)
+         if end != -1:
+-            hits.append((m.start(), end, content[start:end]))
++            hits.append((m.start(), end, content[start:end], True))
++        else:  # unbalanced (truncated / malformed) — surface it, do not lose it
++            hits.append((m.start(), len(content), content[start:], False))
+     return hits
+ 
+ 
+@@ -175,7 +181,10 @@ def parse_message(message: object) -> ParseResult:
+     remaining = content
+     hits = _tool_call_tag_objects(content)
+     if hits:
+-        for _start, _end, js in hits:
++        for _start, _end, js, balanced in hits:
++            if not balanced:  # truncated / never-closed call — surface, never run, never drop
++                ambiguous.append(js[:200])
++                continue
+             payload = _try_json(js)
+             objs = payload if isinstance(payload, list) else [payload]
+             for obj in objs:
+@@ -185,7 +194,7 @@ def parse_message(message: object) -> ParseResult:
+                 else:
+                     ambiguous.append(js[:200])
+         keep, last = [], 0
+-        for start, end, _js in hits:
++        for start, end, _js, _balanced in hits:
+             keep.append(content[last:start])
+             last = max(last, end)
+         keep.append(content[last:])
+@@ -213,6 +222,10 @@ def parse_message(message: object) -> ParseResult:
+             if all(g is not None for g in got):
+                 intents.extend(g for g in got if g is not None)
+                 remaining = ""
++            elif any(_looks_toolish(o) for o in payload if isinstance(o, dict)):
++                # a batch the model MEANT as calls but one element is malformed — surface the
++                # whole batch as ambiguous rather than silently drop every call in it.
++                ambiguous.append(candidate[:200])
+ 
+     return ParseResult(intents=tuple(intents), ambiguous=tuple(ambiguous), text=remaining.strip())
+ 
