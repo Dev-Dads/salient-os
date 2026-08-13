@@ -100,12 +100,22 @@ direct, no governance jargon ("I proposed that command and I'm waiting on your O
 "run_command HELD under propose_first"). Reliability of acting comes first; a clear, honest
 final answer comes next."""
 
+_TOOL_MANIFEST_SENTINEL = "__TOOL_MANIFEST__"
+assert _SAL_SYSTEM_TEMPLATE.count(_TOOL_MANIFEST_SENTINEL) == 1  # exactly one splice point
+
 
 def sal_system_prompt() -> str:
     """Sal's directive-loop system prompt with the live tool manifest spliced in (single source
     of truth in tools.py). ``.replace`` — not ``.format`` — because the prompt is full of literal
-    JSON braces that ``str.format`` would choke on."""
-    return _SAL_SYSTEM_TEMPLATE.replace("__TOOL_MANIFEST__", tool_manifest())
+    JSON braces that ``str.format`` would choke on. Fail CLOSED (grounding panel opus/qwen C2) if
+    the generated manifest ever contains the splice sentinel: the hints are static and host-owned,
+    so this can only trip on a self-inflicted edit — and it trips loudly at build time rather than
+    silently corrupting the prompt. (No untrusted input reaches here — tool/model/memory content
+    never flows into the manifest; opus F1's 'tool output corrupts the prompt' path does not exist.)"""
+    manifest = tool_manifest()
+    if _TOOL_MANIFEST_SENTINEL in manifest:
+        raise ValueError("tool manifest contains the splice sentinel — refusing to build a corrupt prompt")
+    return _SAL_SYSTEM_TEMPLATE.replace(_TOOL_MANIFEST_SENTINEL, manifest)
 
 
 @dataclass
@@ -123,16 +133,34 @@ def _content(msg) -> str:
     return str(msg or "")
 
 
+def _render_intent(intent) -> str:
+    """A compact one-line record of a requested tool call (name + its primary arg). Used to keep
+    the assistant's turn non-empty when a reasoning model emits tool_calls with EMPTY content, so a
+    blank assistant turn doesn't erase what was requested across a multi-step task."""
+    a = getattr(intent, "args", None) or {}
+    cmd = a.get("command")
+    prim = (a.get("path") or a.get("url")
+            or (" ".join(map(str, cmd)) if isinstance(cmd, (list, tuple)) else cmd) or "")
+    return f"{intent.name}({str(prim)[:60]})"
+
+
 def run_turn(session, client, user_message: str, history=None, max_iterations: int = 6,
              importance=None, risk=None) -> TurnResult:
     """Run one user turn to completion (or until max_iterations)."""
     history = list(history or [])
-    # Ground the model with Sal's system prompt (make-it-move). Idempotent: a resumed turn passes
-    # its full history back, which already carries the system message — never double-prepend. The
-    # prompt grants nothing; it only tells the model what it can call and how — govern_action below
-    # stays the sole authority boundary.
-    if not any(isinstance(m, dict) and m.get("role") == "system" for m in history):
-        history.insert(0, {"role": "system", "content": sal_system_prompt()})
+    # Ground the model with Sal's system prompt (make-it-move), AUTHORITATIVELY (grounding panel
+    # gpt-5.1 F1): Sal's prompt must LEAD every turn. A resumed turn passes its full history back
+    # with Sal's prompt already at the front — re-assert it (idempotent, identical content) rather
+    # than trust whatever leading system message is present, so a caller-supplied history cannot
+    # suppress or swap the grounding. The model can never introduce a system message (its turns are
+    # role=="assistant"; tool results are role=="user"), so only the host seeds history[0]. This
+    # replaces the list slot with a fresh dict (never mutates the caller's dict). The prompt grants
+    # nothing; govern_action below stays the sole authority boundary.
+    sys_msg = {"role": "system", "content": sal_system_prompt()}
+    if history and isinstance(history[0], dict) and history[0].get("role") == "system":
+        history[0] = sys_msg           # re-assert Sal's prompt at the front (authoritative)
+    else:
+        history.insert(0, sys_msg)     # fresh turn — prepend it
     history.append({"role": "user", "content": user_message})
     decisions: list[Decision] = []
     ambiguous: list = []
@@ -142,7 +170,15 @@ def run_turn(session, client, user_message: str, history=None, max_iterations: i
         # calls; the in-prompt manifest is the floor for backends that emit calls as content.
         msg = client.complete(history, tools=openai_tools())
         parsed = parse_message(msg)
-        history.append({"role": "assistant", "content": _content(msg)})
+        # Record the assistant turn. When a reasoning model returns tool_calls with EMPTY content
+        # (gpt-oss:120b does — its plan lives in a separate reasoning channel), synthesize a compact
+        # record of what it REQUESTED, so a blank assistant turn doesn't erase the thread across a
+        # multi-step task (found by the live Sparky proof: a task's later steps were dropped). The
+        # authoritative TOOL RESULTS still follow as the outcome side; this is the request side.
+        assistant_text = _content(msg)
+        if not assistant_text and parsed.intents:
+            assistant_text = "(requested: " + "; ".join(_render_intent(i) for i in parsed.intents) + ")"
+        history.append({"role": "assistant", "content": assistant_text})
         ambiguous.extend(parsed.ambiguous)
 
         if not parsed.intents:

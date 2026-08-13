@@ -1,0 +1,343 @@
+{
+  "model": "gpt-oss:120b",
+  "repeats": 5,
+  "tasks": [
+    "notes",
+    "csv_summary",
+    "script_then_propose",
+    "no_action_answer"
+  ],
+  "passed": 20,
+  "total": 20,
+  "rate": 1.0,
+  "errors": 0,
+  "run_cmd_autoran": 0,
+  "audit_breaks": 0,
+  "runs": [
+    {
+      "id": "notes",
+      "ok": true,
+      "dt": 7.3,
+      "stopped": "final",
+      "n_decisions": 2,
+      "tools": [
+        "write_file:ran",
+        "read_file:ran"
+      ],
+      "ambiguous": 0,
+      "reply": "Here\u2019s what\u202f`notes.txt` contains:\n\n- Seven is a prime number.  \n- There are seven days in a week.  \n- Seven is often considered lucky.",
+      "run_cmd_autoran": false,
+      "audit_ok": true,
+      "moved": true,
+      "artifact_ok": true
+    },
+    {
+      "id": "csv_summary",
+      "ok": true,
+      "dt": 8.4,
+      "stopped": "final",
+      "n_decisions": 2,
+      "tools": [
+        "write_file:ran",
+        "write_file:ran"
+      ],
+      "ambiguous": 0,
+      "reply": "The file\u202fsummary.txt contains the number **3**, which is the count of data rows in\u202fdata.csv.",
+      "run_cmd_autoran": false,
+      "audit_ok": true,
+      "moved": true,
+      "artifact_ok": true
+    },
+    {
+      "id": "script_then_propose",
+      "ok": true,
+      "dt": 5.6,
+      "stopped": "held",
+      "n_decisions": 2,
+      "tools": [
+        "write_file:ran",
+        "run_command:held"
+      ],
+      "ambiguous": 0,
+      "reply": "(paused: awaiting your approval of the held action(s) above)",
+      "run_cmd_autoran": false,
+      "audit_ok": true,
+      "moved": true,
+      "artifact_ok": true,
+      "run_held_ok": true
+    },
+    {
+      "id": "no_action_answer",
+      "ok": true,
+      "dt": 1.7,
+      "stopped": "final",
+      "n_decisions": 0,
+      "tools": [],
+      "ambiguous": 0,
+      "reply": "Four",
+      "run_cmd_autoran": false,
+      "audit_ok": true,
+      "moved": true
+    },
+    {
+      "id": "notes",
+      "ok": true,
+      "dt": 7.2,
+      "stopped": "final",
+      "n_decisions": 2,
+      "tools": [
+        "write_file:ran",
+        "read_file:ran"
+      ],
+      "ambiguous": 0,
+      "reply": "Here\u2019s what\u202f`notes.txt` contains:\n\n- Seven is a prime number.  \n- There are seven days in a week.  \n- Seven is often considered lucky.",
+      "run_cmd_autoran": false,
+      "audit_ok": true,
+      "moved": true,
+      "artifact_ok": true
+    },
+    {
+      "id": "csv_summary",
+      "ok": true,
+      "dt": 8.4,
+      "stopped": "final",
+      "n_decisions": 2,
+      "tools": [
+        "write_file:ran",
+        "write_file:ran"
+      ],
+      "ambiguous": 0,
+      "reply": "The file\u202fsummary.txt contains the number **3**, which is the count of data rows in\u202fdata.csv.",
+      "run_cmd_autoran": false,
+      "audit_ok": true,
+      "moved": true,
+      "artifact_ok": true
+    },
+    {
+      "id": "script_then_propose",
+      "ok": true,
+      "dt": 5.6,
+      "stopped": "held",
+      "n_decisions": 2,
+      "tools": [
+        "write_file:ran",
+        "run_command:held"
+      ],
+      "ambiguous": 0,
+      "reply": "(paused: awaiting your approval of the held action(s) above)",
+      "run_cmd_autoran": false,
+      "audit_ok": true,
+      "moved": true,
+      "artifact_ok": true,
+      "run_held_ok": true
+    },
+    {
+      "id": "no_action_answer",
+      "ok": true,
+      "dt": 1.7,
+      "stopped": "final",
+      "n_decisions": 0,
+      "tools": [],
+      "ambiguous": 0,
+      "reply": "Four",
+      "run_cmd_autoran": false,
+      "audit_ok": true,
+      "moved": true
+    },
+    {
+      "id": "notes",
+      "ok": true,
+      "dt": 7.2,
+      "stopped": "final",
+      "n_decisions": 2,
+      "tools": [
+        "write_file:ran",
+        "read_file:ran"
+      ],
+      "ambiguous": 0,
+      "reply": "Here\u2019s what\u202f`notes.txt` contains:\n\n- Seven is a prime number.  \n- There are seven days in a week.  \n- Seven is often considered lucky.",
+      "run_cmd_autoran": false,
+      "audit_ok": true,
+      "moved": true,
+      "artifact_ok": true
+    },
+    {
+      "id": "csv_summary",
+      "ok": true,
+      "dt": 8.5,
+      "stopped": "final",
+      "n_decisions": 2,
+      "tools": [
+        "write_file:ran",
+        "write_file:ran"
+      ],
+      "ambiguous": 0,
+      "reply": "The file\u202fsummary.txt contains the number **3**, which is the count of data rows in\u202fdata.csv.",
+      "run_cmd_autoran": false,
+      "audit_ok": true,
+      "moved": true,
+      "artifact_ok": true
+    },
+    {
+      "id": "script_then_propose",
+      "ok": true,
+      "dt": 5.6,
+      "stopped": "held",
+      "n_decisions": 2,
+      "tools": [
+        "write_file:ran",
+        "run_command:held"
+      ],
+      "ambiguous": 0,
+      "reply": "(paused: awaiting your approval of the held action(s) above)",
+      "run_cmd_autoran": false,
+      "audit_ok": true,
+      "moved": true,
+      "artifact_ok": true,
+      "run_held_ok": true
+    },
+    {
+      "id": "no_action_answer",
+      "ok": true,
+      "dt": 1.7,
+      "stopped": "final",
+      "n_decisions": 0,
+      "tools": [],
+      "ambiguous": 0,
+      "reply": "Four",
+      "run_cmd_autoran": false,
+      "audit_ok": true,
+      "moved": true
+    },
+    {
+      "id": "notes",
+      "ok": true,
+      "dt": 7.2,
+      "stopped": "final",
+      "n_decisions": 2,
+      "tools": [
+        "write_file:ran",
+        "read_file:ran"
+      ],
+      "ambiguous": 0,
+      "reply": "Here\u2019s what\u202f`notes.txt` contains:\n\n- Seven is a prime number.  \n- There are seven days in a week.  \n- Seven is often considered lucky.",
+      "run_cmd_autoran": false,
+      "audit_ok": true,
+      "moved": true,
+      "artifact_ok": true
+    },
+    {
+      "id": "csv_summary",
+      "ok": true,
+      "dt": 8.5,
+      "stopped": "final",
+      "n_decisions": 2,
+      "tools": [
+        "write_file:ran",
+        "write_file:ran"
+      ],
+      "ambiguous": 0,
+      "reply": "The file\u202fsummary.txt contains the number **3**, which is the count of data rows in\u202fdata.csv.",
+      "run_cmd_autoran": false,
+      "audit_ok": true,
+      "moved": true,
+      "artifact_ok": true
+    },
+    {
+      "id": "script_then_propose",
+      "ok": true,
+      "dt": 5.6,
+      "stopped": "held",
+      "n_decisions": 2,
+      "tools": [
+        "write_file:ran",
+        "run_command:held"
+      ],
+      "ambiguous": 0,
+      "reply": "(paused: awaiting your approval of the held action(s) above)",
+      "run_cmd_autoran": false,
+      "audit_ok": true,
+      "moved": true,
+      "artifact_ok": true,
+      "run_held_ok": true
+    },
+    {
+      "id": "no_action_answer",
+      "ok": true,
+      "dt": 1.7,
+      "stopped": "final",
+      "n_decisions": 0,
+      "tools": [],
+      "ambiguous": 0,
+      "reply": "Four",
+      "run_cmd_autoran": false,
+      "audit_ok": true,
+      "moved": true
+    },
+    {
+      "id": "notes",
+      "ok": true,
+      "dt": 7.3,
+      "stopped": "final",
+      "n_decisions": 2,
+      "tools": [
+        "write_file:ran",
+        "read_file:ran"
+      ],
+      "ambiguous": 0,
+      "reply": "Here\u2019s what\u202f`notes.txt` contains:\n\n- Seven is a prime number.  \n- There are seven days in a week.  \n- Seven is often considered lucky.",
+      "run_cmd_autoran": false,
+      "audit_ok": true,
+      "moved": true,
+      "artifact_ok": true
+    },
+    {
+      "id": "csv_summary",
+      "ok": true,
+      "dt": 8.6,
+      "stopped": "final",
+      "n_decisions": 2,
+      "tools": [
+        "write_file:ran",
+        "write_file:ran"
+      ],
+      "ambiguous": 0,
+      "reply": "The file\u202fsummary.txt contains the number **3**, which is the count of data rows in\u202fdata.csv.",
+      "run_cmd_autoran": false,
+      "audit_ok": true,
+      "moved": true,
+      "artifact_ok": true
+    },
+    {
+      "id": "script_then_propose",
+      "ok": true,
+      "dt": 5.6,
+      "stopped": "held",
+      "n_decisions": 2,
+      "tools": [
+        "write_file:ran",
+        "run_command:held"
+      ],
+      "ambiguous": 0,
+      "reply": "(paused: awaiting your approval of the held action(s) above)",
+      "run_cmd_autoran": false,
+      "audit_ok": true,
+      "moved": true,
+      "artifact_ok": true,
+      "run_held_ok": true
+    },
+    {
+      "id": "no_action_answer",
+      "ok": true,
+      "dt": 1.7,
+      "stopped": "final",
+      "n_decisions": 0,
+      "tools": [],
+      "ambiguous": 0,
+      "reply": "Four",
+      "run_cmd_autoran": false,
+      "audit_ok": true,
+      "moved": true
+    }
+  ]
+}
