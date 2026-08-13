@@ -16,6 +16,7 @@ from collaborator.host import (
     DONE,
     FAILED,
     PAUSED,
+    RUNNING,
     Collaborator,
 )
 from collaborator.model_client import ScriptedClient
@@ -113,6 +114,45 @@ class HostLifecycle(unittest.TestCase):
         _wait(h, tid, {AWAITING_APPROVAL})
         self.assertTrue(h.decline(tid))
         self.assertEqual(h.get_task(tid)["state"], CANCELLED)
+
+    def test_partial_deny_keeps_the_denied_held_action_retryable(self):
+        # panel grok F1: a turn holding TWO actions where one is later DENIED must NOT silently
+        # drop the denied one — it stays in `held`, re-approvable; the approvable one still runs.
+        from pathlib import Path
+        from collaborator.tools import PROPOSE_FIRST
+        both = {"content": None, "tool_calls": [
+            {"id": "a", "function": {"name": "write_file",
+                                     "arguments": json.dumps({"path": "w.txt", "content": "x"})}},
+            {"id": "b", "function": {"name": "run_command",
+                                     "arguments": json.dumps({"command": ["echo", "hi"]})}}]}
+        doer = ScriptedClient([both, {"content": "done"}])
+        h, s = self._host(doer=doer)
+        h.set_leash("write_file", PROPOSE_FIRST)  # so the write HOLDS too
+        tid = h.submit("write and run")
+        t = _wait(h, tid, {AWAITING_APPROVAL})
+        self.assertEqual(len(t["held"]), 2)
+        s.capabilities = ("fs.write:project",)  # revoke shell.exec -> run_command will DENY
+        h.approve(tid)
+        # write ran; run_command denied but NOT dropped -> stays awaiting + re-approvable
+        t = _wait(h, tid, {AWAITING_APPROVAL})
+        self.assertEqual((Path(self.tmp) / "w.txt").read_text(), "x")
+        held = h._tasks[tid].held
+        self.assertEqual(len(held), 1)
+        self.assertEqual(held[0].tool, "run_command")
+
+    def test_should_not_propose_while_busy_or_running(self):
+        # refutes "ProposeJob can run while a turn is mid-flight": the trigger is gated.
+        h, s = self._host(caps=("fs.write:project",))
+        s.proactivity = "eager"
+        h._idle_seconds = 0.0
+        h._propose_cooldown = 0.0
+        with h._lock:
+            self.assertTrue(h._should_propose())          # idle + eager -> would fire
+            h._worker_busy = True
+            self.assertFalse(h._should_propose())          # ...but not while the worker is busy
+            h._worker_busy = False
+            h._tasks["x"] = type("T", (), {"state": RUNNING})()
+            self.assertFalse(h._should_propose())          # ...nor while a task is RUNNING
 
     def test_empty_completion_task_is_FAILED_not_done(self):
         # a persistently empty model -> stopped="empty" -> honest FAILED, never a fake DONE

@@ -73,7 +73,8 @@ class Task:
     state: str = QUEUED
     reply: str = ""
     decisions: list = field(default_factory=list)  # all governed Decisions across the task
-    held: list = field(default_factory=list)        # HELD decisions awaiting your approval
+    held: list = field(default_factory=list)        # HELD decisions still awaiting your approval
+    approved_ran: list = field(default_factory=list)  # summaries of held actions run across rounds
     history: list = field(default_factory=list)      # the loop's running message history
     error: str = ""
 
@@ -317,23 +318,31 @@ class Collaborator:
             # A task holding propose_first action(s) for approval. Run each NOW (re-gates
             # authority; single-use). UNLOCKED.
             ran = [approve_held_decision(self.session, d) for d in held]
-            ran_ok = [d for d in ran if d.status == RAN]
+            # Keep any that could NOT run (DENIED — e.g. capability revoked; loop.approve does not
+            # consume those, so they stay retryable) as STILL-HELD, and remember the ones that DID
+            # run so a later round's resume note covers ALL approved actions. Never silently drop a
+            # held decision on a PARTIAL deny (panel grok F1).
             with self._lock:
                 self.ledger.record_decisions(ran)
                 task.decisions.extend(ran)
-                task.held = []
-            if not ran_ok:
-                # Every approval came back DENIED (e.g. capability revoked) — nothing ran; the
-                # held decisions stay retryable, so leave the task AWAITING (never flip to done).
+                task.approved_ran.extend(d.summary() for d in ran if d.status == RAN)
+                remaining = [held[i] for i, d in enumerate(ran) if d.status != RAN]
+                task.held = remaining
+            if remaining:
+                # Some held actions still can't run — keep the task AWAITING (re-approvable); do
+                # NOT resume the turn until every held action has cleared. The ones that DID run
+                # are recorded and their results are held on the task for the eventual resume.
                 with self._lock:
-                    task.held = held
                     task.state = AWAITING_APPROVAL
                     self._touch()
                 return
-            # Resume with a HOST-AUTHORED authoritative note (never the human's free text): the
-            # approved actions' real outcomes, as ground truth for the model.
+            # All held actions have now cleared (across one or more rounds). Resume with a
+            # HOST-AUTHORED authoritative note (never the human's free text) covering ALL of them.
+            with self._lock:
+                approved = list(task.approved_ran)
+                task.approved_ran = []
             note = ("TOOL RESULTS (approved by the human, now executed — authoritative, treat as "
-                    "ground truth):\n" + "\n".join(d.summary() for d in ran_ok))
+                    "ground truth):\n" + "\n".join(approved))
         else:
             # A task the HOST paused mid-turn (no held decisions to approve — the paused action
             # never ran). Now unpaused, just continue the turn; the model re-issues its next step.
