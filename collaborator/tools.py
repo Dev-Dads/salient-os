@@ -275,6 +275,66 @@ def toolset() -> dict[str, Tool]:
     return dict(_TOOLS)
 
 
+# --- Model-facing tool manifest (make-it-move) ---------------------------------------------
+# The SINGLE SOURCE OF TRUTH for what the model is TOLD it can call. One spec drives BOTH the
+# human-readable block spliced into Sal's system prompt (``tool_manifest``) AND the OpenAI/ollama
+# ``tools=`` function schema (``openai_tools``), so the names + argument keys the model sees can
+# never drift from the executors above (the same one-source lesson as ``SEALED_TOOLS``). Only the
+# tools the model may INITIATE on the directive path are listed: net_post and maint_fetch are
+# operator-directed (``emit()`` / human-gated) and are deliberately NOT advertised — a model that
+# names one anyway is still governed (held/denied), it is simply never invited to.
+_MODEL_FACING = (
+    {"name": "read_file",
+     "desc": "Read a text file from the workspace.",
+     "params": {"path": {"type": "string", "desc": "relative path in the workspace"}},
+     "required": ["path"],
+     "hint": '{"path": "<relative path in the workspace>"}'},
+    {"name": "write_file",
+     "desc": "Create or overwrite a workspace file with the given text.",
+     "params": {"path": {"type": "string", "desc": "relative path in the workspace"},
+                "content": {"type": "string", "desc": "the full file text"}},
+     "required": ["path", "content"],
+     "hint": '{"path": "<relative path in the workspace>", "content": "<full file text>"}'},
+    {"name": "run_command",
+     "desc": ("Run a local command given as an argv list (never a shell string). Consequential, so "
+              "it always waits for the user's approval before it runs."),
+     "params": {"command": {"type": "array", "items": {"type": "string"},
+                            "desc": 'argv list, e.g. ["python", "x.py"] — never a shell string'}},
+     "required": ["command"],
+     "hint": '{"command": ["<program>", "<arg>", ...]}   (an argv list, never a shell string)'},
+    {"name": "web_fetch",
+     "desc": "HTTP GET a URL and return its body (read-only). The host must already be allowlisted.",
+     "params": {"url": {"type": "string", "desc": "https URL; the host must be pre-allowlisted"}},
+     "required": ["url"],
+     "hint": '{"url": "https://<host>/..."}              (read-only; the host must be allowlisted)'},
+)
+
+
+def tool_manifest() -> str:
+    """The model-facing tool block spliced into Sal's system prompt. Same source as
+    ``openai_tools`` so the prompt's names/args cannot drift from the executor."""
+    return "\n".join(f"  {t['name']:<12} {t['hint']}" for t in _MODEL_FACING)
+
+
+def openai_tools() -> list:
+    """The OpenAI/ollama ``tools=`` function-schema array, from the same ``_MODEL_FACING`` spec.
+    Passed to the model so a backend with native function-calling emits structured calls; the
+    in-prompt manifest is the cross-backend floor for models that emit calls as content."""
+    out = []
+    for t in _MODEL_FACING:
+        props = {}
+        for key, spec in t["params"].items():
+            p = {"type": spec["type"], "description": spec["desc"]}
+            if "items" in spec:
+                p["items"] = spec["items"]
+            props[key] = p
+        out.append({"type": "function", "function": {
+            "name": t["name"], "description": t["desc"],
+            "parameters": {"type": "object", "properties": props,
+                           "required": list(t["required"])}}})
+    return out
+
+
 def resolve_in_workspace(workspace, rel: str) -> Path:
     """Resolve ``rel`` under ``workspace`` and refuse anything that escapes it."""
     root = Path(workspace).resolve()
