@@ -118,13 +118,29 @@ def sal_system_prompt() -> str:
     return _SAL_SYSTEM_TEMPLATE.replace(_TOOL_MANIFEST_SENTINEL, manifest)
 
 
+# TurnResult.stopped terminal states. Named so a host has an UNAMBIGUOUS contract: a host
+# MUST switch on this explicitly and MUST NOT treat "anything not held/paused" as success —
+# both EMPTY and MAX_ITERATIONS are failures-to-complete, surfaced honestly (external panel
+# gpt-5.1 + gemini: a caller that if/elifs the old, smaller enum without an else could turn a
+# new EMPTY back into a silent no-op at the UI layer). Only FINAL is a normal completion;
+# HELD/PAUSED are awaiting-you; EMPTY/MAX_ITERATIONS did not finish.
+STOPPED_FINAL = "final"                     # ran to a normal end
+STOPPED_HELD = "held"                       # a propose_first action is awaiting your approval
+STOPPED_PAUSED = "paused"                   # the host paused the session
+STOPPED_MAX_ITERATIONS = "max_iterations"   # gave up after max_iterations — did NOT finish
+STOPPED_EMPTY = "empty"                     # the model returned nothing actionable — did NOT finish
+STOPPED_SUCCESS = frozenset({STOPPED_FINAL})            # a host may treat only these as "completed"
+STOPPED_AWAITING = frozenset({STOPPED_HELD, STOPPED_PAUSED})  # ...these as "your move"
+STOPPED_FAILED = frozenset({STOPPED_MAX_ITERATIONS, STOPPED_EMPTY})  # ...these as "did not finish"
+
+
 @dataclass
 class TurnResult:
     reply: str
     decisions: list = field(default_factory=list)
     history: list = field(default_factory=list)
     ambiguous: list = field(default_factory=list)
-    stopped: str = "final"  # "final" | "held" | "paused" | "max_iterations" | "empty"
+    stopped: str = STOPPED_FINAL  # one of STOPPED_* above
 
 
 def _content(msg) -> str:
@@ -230,7 +246,7 @@ def run_turn(session, client, user_message: str, history=None, max_iterations: i
             return TurnResult(
                 reply=f"(no action taken — the model returned an empty response "
                       f"{empty_retries + 1} times)",
-                decisions=decisions, history=history, ambiguous=ambiguous, stopped="empty")
+                decisions=decisions, history=history, ambiguous=ambiguous, stopped=STOPPED_EMPTY)
         # Record the assistant turn. When a reasoning model returns tool_calls with EMPTY content
         # (gpt-oss:120b does — its plan lives in a separate reasoning channel), synthesize a compact
         # record of what it REQUESTED, so a blank assistant turn doesn't erase the thread across a
@@ -244,7 +260,7 @@ def run_turn(session, client, user_message: str, history=None, max_iterations: i
 
         if not parsed.intents:
             return TurnResult(reply=parsed.text or _content(msg), decisions=decisions,
-                              history=history, ambiguous=ambiguous, stopped="final")
+                              history=history, ambiguous=ambiguous, stopped=STOPPED_FINAL)
 
         # Each tool call is its own governed action; feed authoritative results back.
         lines = []
@@ -271,14 +287,14 @@ def run_turn(session, client, user_message: str, history=None, max_iterations: i
         if any(d.status == PAUSED for d in iter_decisions):
             return TurnResult(reply="(stopped: the host paused the session)",
                               decisions=decisions, history=history, ambiguous=ambiguous,
-                              stopped="paused")
+                              stopped=STOPPED_PAUSED)
         if any(d.status == HELD for d in iter_decisions):
             return TurnResult(reply="(paused: awaiting your approval of the held action(s) above)",
                               decisions=decisions, history=history, ambiguous=ambiguous,
-                              stopped="held")
+                              stopped=STOPPED_HELD)
 
     return TurnResult(reply="(stopped: max iterations reached)", decisions=decisions,
-                      history=history, ambiguous=ambiguous, stopped="max_iterations")
+                      history=history, ambiguous=ambiguous, stopped=STOPPED_MAX_ITERATIONS)
 
 
 def approve(session, decision: Decision) -> Decision:

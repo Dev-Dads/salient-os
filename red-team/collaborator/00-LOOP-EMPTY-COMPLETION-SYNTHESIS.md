@@ -63,6 +63,20 @@ response was obtained; every response still flows through `govern_action`):
   true residual: some prompts deterministically decline to emit; the loop surfaces that
   truthfully rather than faking done.
 
+## External panel (5 vendors, $1.0080; `redteam_loopfix.py`, raw in `raw_loopfix/`)
+
+Certification claims C1 (no silent no-op), C2 (governance untouched), C3 (bounded
+termination) — **CERTIFIED 5/5**. C4 (interface/no-regression): CERTIFIED 3/5
+(opus-4.1, grok-4.5, qwen3-max → SOUND); gpt-5.1 + gemini-2.5-pro raised the SAME
+forward-looking point (MINOR_ISSUES): the *new* `stopped="empty"` could re-create a silent
+no-op **at a higher layer** if a future caller `if/elif`s the old, smaller `stopped` enum
+without an `else`. **Reproduced:** every current `.stopped` consumer is a test / red-team
+harness — no production/Host caller exists yet (the Host is gap #0 that ② builds), so the
+failure mode does not reproduce today. **Hardened anyway:** `loop.py` now names the terminal
+states (`STOPPED_FINAL/HELD/PAUSED/MAX_ITERATIONS/EMPTY`) and groups them
+(`STOPPED_SUCCESS / STOPPED_AWAITING / STOPPED_FAILED`) as an explicit contract, so ②'s Host
+must switch on them and cannot silently treat EMPTY/MAX_ITERATIONS as success.
+
 ## Residual / follow-up (backend, not the loop)
 
 Fully overcoming a backend that deterministically refuses to emit a tool call on certain

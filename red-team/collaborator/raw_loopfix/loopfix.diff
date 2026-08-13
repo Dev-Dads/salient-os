@@ -1,0 +1,253 @@
+diff --git a/collaborator/loop.py b/collaborator/loop.py
+index 5fe46d1..e1d4343 100644
+--- a/collaborator/loop.py
++++ b/collaborator/loop.py
+@@ -124,7 +124,7 @@ class TurnResult:
+     decisions: list = field(default_factory=list)
+     history: list = field(default_factory=list)
+     ambiguous: list = field(default_factory=list)
+-    stopped: str = "final"  # "final" | "held" | "paused" | "max_iterations"
++    stopped: str = "final"  # "final" | "held" | "paused" | "max_iterations" | "empty"
+ 
+ 
+ def _content(msg) -> str:
+@@ -144,8 +144,60 @@ def _render_intent(intent) -> str:
+     return f"{intent.name}({str(prim)[:60]})"
+ 
+ 
++# Empty-completion recovery (live-found on gpt-oss:120b, 2026-08-13). A reasoning model
++# sometimes ends a turn after ONLY its private reasoning channel: empty content, no tool
++# call, finish_reason=stop (not truncation). At a greedy temperature this is DETERMINISTIC
++# and streaks — so a plain retry on the identical history reproduces the empty (measured
++# 0/6 escaped), and a prompt "you returned nothing, act now" nudge also fails (0/6). What
++# reliably escapes it is PERTURBING the sampling: raising the temperature (temp 0.7 → 5/6
++# recovered). So retries escalate the temperature. This affects only WHETHER a response is
++# obtained; every response still flows through govern_action unchanged — the seam is untouched.
++_RETRY_BASE_TEMP = 0.7    # first retry temperature (validated escape point)
++_RETRY_TEMP_STEP = 0.15   # escalate each further retry...
++_RETRY_TEMP_MAX = 1.0     # ...up to this cap
++
++
++def _retry_temperature(attempt: int) -> float:
++    """Temperature for retry ``attempt`` (1-based; attempt 0 is the initial call, which uses
++    the client's own temperature). Escalates from ``_RETRY_BASE_TEMP`` to break a deterministic
++    empty streak that a same-temperature retry cannot."""
++    return min(_RETRY_TEMP_MAX, _RETRY_BASE_TEMP + _RETRY_TEMP_STEP * (attempt - 1))
++
++
++def _is_actionable(msg, parsed) -> bool:
++    """A completion is actionable if it DID something (a tool intent), TRIED something (an
++    ambiguous call we surface for you), or SAID something (non-empty text). An EMPTY
++    completion — a reasoning model that ended its turn after only its private reasoning
++    channel: no content, no tool call (finish_reason=stop, not truncation) — is none of
++    these. It is silence, not a finished turn, and must never be read as a clean 'final'."""
++    if parsed.intents or parsed.ambiguous:
++        return True
++    return bool((parsed.text or _content(msg)).strip())
++
++
++def _complete_actionable(client, history, empty_retries: int):
++    """Get an ACTIONABLE completion, retrying past empty (reasoning-only) responses up to
++    ``empty_retries`` extra times, escalating the temperature on each retry to escape a
++    deterministic empty streak (see the module note above). The first attempt uses the
++    client's configured temperature; only retries perturb it. Returns
++    ``(msg, parsed, actionable)`` — ``actionable`` is False only if STILL empty after the
++    whole budget, which the caller must surface honestly, never as a finished turn."""
++    tools = openai_tools()
++    msg: dict = {}
++    parsed = parse_message(msg)
++    for attempt in range(max(1, empty_retries + 1)):
++        if attempt == 0:
++            msg = client.complete(history, tools=tools)  # the model's preferred (low-temp) shot
++        else:
++            msg = client.complete(history, tools=tools, temperature=_retry_temperature(attempt))
++        parsed = parse_message(msg)
++        if _is_actionable(msg, parsed):
++            return msg, parsed, True
++    return msg, parsed, False
++
++
+ def run_turn(session, client, user_message: str, history=None, max_iterations: int = 6,
+-             importance=None, risk=None) -> TurnResult:
++             importance=None, risk=None, empty_retries: int = 3) -> TurnResult:
+     """Run one user turn to completion (or until max_iterations)."""
+     history = list(history or [])
+     # Ground the model with Sal's system prompt (make-it-move), AUTHORITATIVELY (grounding panel
+@@ -168,8 +220,17 @@ def run_turn(session, client, user_message: str, history=None, max_iterations: i
+     for _ in range(max_iterations):
+         # Pass the tool schema too, so a backend with native function-calling emits structured
+         # calls; the in-prompt manifest is the floor for backends that emit calls as content.
+-        msg = client.complete(history, tools=openai_tools())
+-        parsed = parse_message(msg)
++        # Retry past an EMPTY (reasoning-only) completion rather than let the empty-intents check
++        # below read it as a clean "final" — a silent no-op narrated as a finished task is the
++        # exact dishonesty this loop exists to prevent (live-found on gpt-oss:120b, 2026-08-13).
++        msg, parsed, actionable = _complete_actionable(client, history, empty_retries)
++        if not actionable:
++            # Still nothing after the retry budget: surface it HONESTLY. Never a success-looking
++            # "final" with an empty reply — a step that produced nothing cannot read as done.
++            return TurnResult(
++                reply=f"(no action taken — the model returned an empty response "
++                      f"{empty_retries + 1} times)",
++                decisions=decisions, history=history, ambiguous=ambiguous, stopped="empty")
+         # Record the assistant turn. When a reasoning model returns tool_calls with EMPTY content
+         # (gpt-oss:120b does — its plan lives in a separate reasoning channel), synthesize a compact
+         # record of what it REQUESTED, so a blank assistant turn doesn't erase the thread across a
+diff --git a/collaborator/model_client.py b/collaborator/model_client.py
+index 9fa83ee..e44d5fe 100644
+--- a/collaborator/model_client.py
++++ b/collaborator/model_client.py
+@@ -1,9 +1,11 @@
+ """Model client for the loop, and the tiny interface the loop depends on.
+ 
+-The loop needs only ``complete(messages, tools=None) -> assistant message dict``
+-(shape: ``{"content": str|None, "tool_calls": [...]}``). Tests inject a scripted
+-fake so the whole governed loop runs without a live model; real runs use
+-``OllamaClient`` against an OpenAI-compatible ``/v1`` endpoint. urllib only.
++The loop needs only ``complete(messages, tools=None, temperature=None) -> assistant
++message dict`` (shape: ``{"content": str|None, "tool_calls": [...]}``). ``temperature``
++is a per-call override (None → the client's configured default); the loop raises it on
++a retry to escape a deterministic empty-completion streak (see loop._complete_actionable).
++Tests inject a scripted fake so the whole governed loop runs without a live model; real
++runs use ``OllamaClient`` against an OpenAI-compatible ``/v1`` endpoint. urllib only.
+ """
+ 
+ from __future__ import annotations
+@@ -16,7 +18,7 @@ COLLABORATOR_MODEL_CLIENT_VERSION = "0.1.0"
+ 
+ class OllamaClient:
+     def __init__(self, base_url: str, model: str, api_key: str = "ollama",
+-                 timeout: int = 120, max_tokens: int = 1024, temperature: float = 0.2) -> None:
++                 timeout: int = 120, max_tokens: int = 4096, temperature: float = 0.2) -> None:
+         self.base_url = base_url.rstrip("/")
+         self.model = model
+         self.api_key = api_key
+@@ -24,9 +26,10 @@ class OllamaClient:
+         self.max_tokens = max_tokens
+         self.temperature = temperature
+ 
+-    def complete(self, messages, tools=None) -> dict:
++    def complete(self, messages, tools=None, temperature=None) -> dict:
++        temp = self.temperature if temperature is None else temperature
+         body = {"model": self.model, "messages": messages,
+-                "max_tokens": self.max_tokens, "temperature": self.temperature}
++                "max_tokens": self.max_tokens, "temperature": temp}
+         if tools:
+             body["tools"] = tools
+         req = urllib.request.Request(
+@@ -49,9 +52,11 @@ class ScriptedClient:
+     def __init__(self, messages) -> None:
+         self._queue = list(messages)
+         self.seen: list = []
++        self.temps: list = []   # per-call temperature the loop requested (None = default)
+ 
+-    def complete(self, messages, tools=None) -> dict:
++    def complete(self, messages, tools=None, temperature=None) -> dict:
+         self.seen.append(list(messages))
++        self.temps.append(temperature)
+         if self._queue:
+             return self._queue.pop(0)
+         return {"content": "done.", "tool_calls": None}
+diff --git a/tests/test_collaborator_loop.py b/tests/test_collaborator_loop.py
+index f17c5a6..da24518 100644
+--- a/tests/test_collaborator_loop.py
++++ b/tests/test_collaborator_loop.py
+@@ -116,5 +116,98 @@ class NetPostF1ModelCannotSelfOriginate(unittest.TestCase):
+             self.assertEqual(r.stopped, "held")
+ 
+ 
++EMPTY = {"content": "", "tool_calls": None}  # a reasoning-only completion: no content, no call
++
++
++class _EmptyAtLowTempClient:
++    """Emulates the live failure mode: a DETERMINISTIC empty streak at greedy temperature
++    (a same-temp retry never escapes it), which breaks only when the temperature is raised.
++    Acts once called at temperature >= 0.5, then answers plainly."""
++
++    def __init__(self, act_msg) -> None:
++        self._act = act_msg
++        self._acted = False
++        self.temps: list = []
++
++    def complete(self, messages, tools=None, temperature=None) -> dict:
++        self.temps.append(temperature)
++        if self._acted:
++            return {"content": "done"}
++        if temperature is not None and temperature >= 0.5:
++            self._acted = True
++            return self._act
++        return {"content": "", "tool_calls": None}  # empty at greedy / default temp
++
++
++class EmptyCompletionIsNotDone(unittest.TestCase):
++    """Live-found (gpt-oss:120b, 2026-08-13): the model intermittently ends a turn after
++    only its private reasoning channel — empty content, no tool call, finish_reason=stop —
++    DETERMINISTICALLY at greedy temperature. The loop must treat that as SILENCE (retry with
++    an escalating temperature to escape the streak), never as a finished 'final' turn."""
++
++    def test_retries_past_empty_then_acts(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            s = Session(workspace=tmp)
++            client = ScriptedClient([
++                EMPTY, EMPTY,                                   # two reasoning-only no-ops
++                _call("write_file", {"path": "out.txt", "content": "hi"}),  # then it acts
++                {"content": "done"},
++            ])
++            r = run_turn(s, client, "write out.txt")
++            self.assertEqual(len(r.decisions), 1)
++            self.assertEqual(r.decisions[0].status, RAN)
++            self.assertEqual((Path(tmp) / "out.txt").read_text(), "hi")
++            self.assertEqual(r.stopped, "final")
++            # loop hygiene: the discarded empties are NEVER appended as blank assistant turns
++            blanks = [m for m in r.history
++                      if m.get("role") == "assistant" and not (m.get("content") or "").strip()]
++            self.assertEqual(blanks, [])
++            # the first attempt uses the client's own temperature; retries escalate it
++            self.assertIsNone(client.temps[0])
++            self.assertGreaterEqual(client.temps[1], 0.5)
++
++    def test_retry_escalates_temperature_to_escape_a_deterministic_empty_streak(self):
++        # A plain same-temperature retry would loop forever here; only the raised temperature
++        # gets an action out of the model.
++        with tempfile.TemporaryDirectory() as tmp:
++            s = Session(workspace=tmp)
++            client = _EmptyAtLowTempClient(_call("write_file", {"path": "o.txt", "content": "x"}))
++            r = run_turn(s, client, "write o.txt")
++            self.assertEqual(r.stopped, "final")
++            self.assertEqual((Path(tmp) / "o.txt").read_text(), "x")
++            self.assertIsNone(client.temps[0])                 # first shot: model's own temp
++            self.assertTrue(any(t is not None and t >= 0.5 for t in client.temps))  # escalated
++
++    def test_all_empty_surfaces_error_never_silent_success(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            s = Session(workspace=tmp)
++            client = ScriptedClient([EMPTY, EMPTY, EMPTY])     # empty through the whole budget
++            r = run_turn(s, client, "do something", empty_retries=2)   # 3 attempts
++            self.assertEqual(r.stopped, "empty")               # NOT "final"
++            self.assertEqual(r.decisions, [])
++            self.assertFalse((Path(tmp) / "out.txt").exists())
++            self.assertIn("empty response", r.reply)           # honest, not a fake success
++            self.assertEqual(len(client.seen), 3)              # exactly the retry budget, no more
++
++    def test_legit_final_answer_is_not_retried(self):
++        # A real answer with no tool call is a valid, immediate 'final' — never re-rolled.
++        with tempfile.TemporaryDirectory() as tmp:
++            s = Session(workspace=tmp)
++            client = ScriptedClient([{"content": "The answer is 42."}])
++            r = run_turn(s, client, "what is the answer?")
++            self.assertEqual(r.stopped, "final")
++            self.assertEqual(r.reply, "The answer is 42.")
++            self.assertEqual(len(client.seen), 1)              # one call, no wasted retries
++            self.assertEqual(client.temps, [None])             # used the client's own temperature
++
++    def test_empty_retries_zero_is_single_attempt(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            s = Session(workspace=tmp)
++            client = ScriptedClient([EMPTY])
++            r = run_turn(s, client, "do something", empty_retries=0)
++            self.assertEqual(r.stopped, "empty")
++            self.assertEqual(len(client.seen), 1)
++
++
+ if __name__ == "__main__":
+     unittest.main()
