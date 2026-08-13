@@ -62,7 +62,11 @@ def _balanced_span(text: str, i: int) -> int:
 
 def _tool_call_tag_objects(content: str):
     """For each ``<tool_call`` marker, extract the balanced JSON that follows it
-    (skipping tag chars/whitespace). Returns list of (start, end, json_str)."""
+    (skipping tag chars/whitespace). Returns list of (start, end, json_str, balanced).
+    An UNBALANCED span — a call whose JSON never closes, e.g. a large call clipped by
+    max_tokens — is still returned (balanced=False, spanning to end-of-content) so the
+    caller can SURFACE it as ambiguous and strip it from the prose. It is never silently
+    dropped: a truncated tool call is the exact 'large call rejected' failure to avoid."""
     hits = []
     for m in _TOOL_CALL_MARKER_RE.finditer(content):
         start = None
@@ -76,7 +80,9 @@ def _tool_call_tag_objects(content: str):
             continue
         end = _balanced_span(content, start)
         if end != -1:
-            hits.append((m.start(), end, content[start:end]))
+            hits.append((m.start(), end, content[start:end], True))
+        else:  # unbalanced (truncated / malformed) — surface it, do not lose it
+            hits.append((m.start(), len(content), content[start:], False))
     return hits
 
 
@@ -175,7 +181,10 @@ def parse_message(message: object) -> ParseResult:
     remaining = content
     hits = _tool_call_tag_objects(content)
     if hits:
-        for _start, _end, js in hits:
+        for _start, _end, js, balanced in hits:
+            if not balanced:  # truncated / never-closed call — surface, never run, never drop
+                ambiguous.append(js[:200])
+                continue
             payload = _try_json(js)
             objs = payload if isinstance(payload, list) else [payload]
             for obj in objs:
@@ -185,7 +194,7 @@ def parse_message(message: object) -> ParseResult:
                 else:
                     ambiguous.append(js[:200])
         keep, last = [], 0
-        for start, end, _js in hits:
+        for start, end, _js, _balanced in hits:
             keep.append(content[last:start])
             last = max(last, end)
         keep.append(content[last:])
@@ -213,9 +222,28 @@ def parse_message(message: object) -> ParseResult:
             if all(g is not None for g in got):
                 intents.extend(g for g in got if g is not None)
                 remaining = ""
+            elif any(_looks_toolish(o) for o in payload if isinstance(o, dict)):
+                # a batch the model MEANT as calls but one element is malformed — surface the
+                # whole batch as ambiguous rather than silently drop every call in it.
+                ambiguous.append(candidate[:200])
+        elif payload is None and candidate[:1] in "[{" and _text_looks_toolish(candidate):
+            # a whole-content tool-call attempt that did NOT parse (e.g. a batch clipped by
+            # max_tokens, no <tool_call> marker) — surface it, never silently lose it (panel
+            # grok/qwen F1). It is tool-shaped but unrunnable, so it is ambiguous, never run.
+            ambiguous.append(candidate[:200])
 
     return ParseResult(intents=tuple(intents), ambiguous=tuple(ambiguous), text=remaining.strip())
 
 
 def _looks_toolish(obj: dict) -> bool:
     return any(k in obj for k in ("name", "tool", "tool_name", "function", "arguments", "args"))
+
+
+_TOOLISH_TOKENS = ('"name"', '"tool"', '"tool_name"', '"function"', '"arguments"', '"args"')
+
+
+def _text_looks_toolish(s: str) -> bool:
+    """A raw (possibly unparseable/clipped) string that appears to be an ATTEMPTED tool call —
+    used to surface a whole-content call that did not parse (e.g. a batch clipped by max_tokens)
+    so it is never silently lost."""
+    return any(tok in s for tok in _TOOLISH_TOKENS)

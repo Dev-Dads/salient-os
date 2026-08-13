@@ -209,5 +209,59 @@ class EmptyCompletionIsNotDone(unittest.TestCase):
             self.assertEqual(len(client.seen), 1)
 
 
+TRUNC = {"content": "", "tool_calls": None, "finish_reason": "length"}  # output hit the cap
+
+
+class TruncatedTurnGrowsBudgetAndRetries(unittest.TestCase):
+    """A large tool call clipped at the token cap (finish_reason == "length") must not be
+    accepted as-is: the loop grows max_tokens and retries so the call can complete."""
+
+    def test_truncation_retries_with_a_larger_budget_then_acts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = Session(workspace=tmp)
+            client = ScriptedClient([
+                TRUNC,                                                       # clipped
+                _call("write_file", {"path": "big.py", "content": "ok"}),   # completes on retry
+                {"content": "done"},
+            ])
+            r = run_turn(s, client, "write a big file")
+            self.assertEqual(len(r.decisions), 1)
+            self.assertEqual(r.decisions[0].status, RAN)
+            self.assertEqual((Path(tmp) / "big.py").read_text(), "ok")
+            self.assertEqual(r.stopped, "final")
+            # the truncation retry asked for a LARGER budget than the first (default) call
+            self.assertIsNone(client.max_tokens_seen[0])                    # first: client default
+            self.assertIsNotNone(client.max_tokens_seen[1])                 # retry: an explicit, grown cap
+            self.assertGreater(client.max_tokens_seen[1], 16384)
+
+    def test_truncation_never_discards_a_complete_call_parsed_in_the_same_turn(self):
+        # panel grok F1: a COMPLETE call co-emitted with a truncated trailing call (the whole
+        # message is finish_reason=="length") must NOT be thrown away by the truncation retry.
+        mixed = ('<tool_call>{"name":"write_file","arguments":{"path":"done.txt","content":"hi"}}'
+                 '</tool_call> <tool_call>{"name":"write_file","arguments":{"path":"clipped.txt","content":"aa')
+        with tempfile.TemporaryDirectory() as tmp:
+            s = Session(workspace=tmp)
+            client = ScriptedClient([{"content": mixed, "tool_calls": None, "finish_reason": "length"},
+                                     {"content": "done"}])
+            r = run_turn(s, client, "write two files")
+            ran = [d for d in r.decisions if d.tool == "write_file" and d.status == RAN]
+            self.assertEqual(len(ran), 1)                          # the complete call RAN...
+            self.assertEqual((Path(tmp) / "done.txt").read_text(), "hi")
+            self.assertTrue(r.ambiguous)                           # ...and the clipped tail was surfaced
+            self.assertFalse((Path(tmp) / "clipped.txt").exists())  # the clipped call did NOT run
+
+    def test_persistent_truncation_surfaces_ambiguous_never_silently_lost(self):
+        # every attempt clips a <tool_call> mid-JSON; it must be surfaced, not vanish
+        clipped = {"content": '<tool_call>{"name":"write_file","arguments":{"path":"a","content":"aaaa',
+                   "tool_calls": None, "finish_reason": "length"}
+        with tempfile.TemporaryDirectory() as tmp:
+            s = Session(workspace=tmp)
+            client = ScriptedClient([clipped, clipped, clipped, clipped])
+            r = run_turn(s, client, "write a huge file", empty_retries=3)
+            self.assertEqual(r.decisions, [])              # nothing ran (it never completed)...
+            self.assertTrue(r.ambiguous)                   # ...but the clipped call was SURFACED
+            self.assertFalse((Path(tmp) / "a").exists())   # and no partial write happened
+
+
 if __name__ == "__main__":
     unittest.main()

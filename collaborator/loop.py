@@ -171,6 +171,12 @@ def _render_intent(intent) -> str:
 _RETRY_BASE_TEMP = 0.7    # first retry temperature (validated escape point)
 _RETRY_TEMP_STEP = 0.15   # escalate each further retry...
 _RETRY_TEMP_MAX = 1.0     # ...up to this cap
+# A TRUNCATED turn (finish_reason == "length") means the output hit the token cap — e.g. a
+# large tool call clipped mid-JSON, which the parser then surfaces as ambiguous (never runs,
+# never silently drops it). Retrying at the SAME cap would clip again, so a truncation retry
+# GROWS the budget (double, bounded) to let the call complete. Orthogonal to the empty-escape.
+_TRUNC_BUDGET_CAP = 65536  # upper bound when growing max_tokens on truncation (well under 131072 ctx)
+_DEFAULT_CLIENT_MAX_TOKENS = 16384  # assumed client cap when it exposes none (matches OllamaClient)
 
 
 def _retry_temperature(attempt: int) -> float:
@@ -178,6 +184,11 @@ def _retry_temperature(attempt: int) -> float:
     the client's own temperature). Escalates from ``_RETRY_BASE_TEMP`` to break a deterministic
     empty streak that a same-temperature retry cannot."""
     return min(_RETRY_TEMP_MAX, _RETRY_BASE_TEMP + _RETRY_TEMP_STEP * (attempt - 1))
+
+
+def _is_truncated(msg) -> bool:
+    """The completion was cut off at the token cap (its tool call / content may be clipped)."""
+    return isinstance(msg, dict) and msg.get("finish_reason") == "length"
 
 
 def _is_actionable(msg, parsed) -> bool:
@@ -192,24 +203,42 @@ def _is_actionable(msg, parsed) -> bool:
 
 
 def _complete_actionable(client, history, empty_retries: int):
-    """Get an ACTIONABLE completion, retrying past empty (reasoning-only) responses up to
-    ``empty_retries`` extra times, escalating the temperature on each retry to escape a
-    deterministic empty streak (see the module note above). The first attempt uses the
-    client's configured temperature; only retries perturb it. Returns
-    ``(msg, parsed, actionable)`` — ``actionable`` is False only if STILL empty after the
-    whole budget, which the caller must surface honestly, never as a finished turn."""
+    """Get an ACTIONABLE, non-truncated completion, retrying up to ``empty_retries`` extra
+    times. Two failure modes, two perturbations (see the module note above):
+      * EMPTY (reasoning-only, no content/call) — escalate the TEMPERATURE to break a
+        deterministic streak a same-temp retry cannot.
+      * TRUNCATED (finish_reason == "length", a large call/content clipped at the cap) — GROW
+        max_tokens (double, bounded) so the call can complete instead of being clipped.
+    The first attempt uses the client's own settings; only retries perturb. Returns
+    ``(msg, parsed, actionable)`` — ``actionable`` is False only if STILL empty/truncated after
+    the whole budget, which the caller surfaces honestly, never as a finished turn."""
     tools = openai_tools()
+    base_mt = getattr(client, "max_tokens", _DEFAULT_CLIENT_MAX_TOKENS) or _DEFAULT_CLIENT_MAX_TOKENS
     msg: dict = {}
     parsed = parse_message(msg)
+    grown_mt = None  # raised only after a truncation
     for attempt in range(max(1, empty_retries + 1)):
-        if attempt == 0:
-            msg = client.complete(history, tools=tools)  # the model's preferred (low-temp) shot
-        else:
-            msg = client.complete(history, tools=tools, temperature=_retry_temperature(attempt))
+        kwargs = {}
+        if attempt > 0:
+            kwargs["temperature"] = _retry_temperature(attempt)
+        if grown_mt is not None:
+            kwargs["max_tokens"] = grown_mt
+        msg = client.complete(history, tools=tools, **kwargs)
         parsed = parse_message(msg)
+        if _is_truncated(msg) and not parsed.intents:
+            # Output was cut off BEFORE any complete call landed — grow the budget and try
+            # again. Guard on ``not parsed.intents`` (panel grok F1): if the clip only ate a
+            # TRAILING call, complete calls already parsed in this same message must NOT be
+            # discarded by the retry — fall through, run them, and surface the clipped tail as
+            # ambiguous. Never throw away completed work.
+            grown_mt = min(_TRUNC_BUDGET_CAP, (grown_mt or base_mt) * 2)
+            continue
         if _is_actionable(msg, parsed):
             return msg, parsed, True
-    return msg, parsed, False
+    # Budget exhausted: report the last attempt's actionability honestly. A persistently
+    # truncated-but-parseable turn surfaces its clipped call as ambiguous (actionable);
+    # a persistently empty one is not actionable -> the caller returns stopped="empty".
+    return msg, parsed, _is_actionable(msg, parsed)
 
 
 def run_turn(session, client, user_message: str, history=None, max_iterations: int = 6,
