@@ -90,5 +90,44 @@ class Strictness(unittest.TestCase):
         self.assertEqual(len(r.intents), 1)
 
 
+class NeverSilentlyDropped(unittest.TestCase):
+    """A large or batched tool call must never VANISH: if it can't be run (truncated,
+    malformed, or a mixed batch) it is SURFACED as ambiguous, never silently dropped."""
+
+    def test_large_wellformed_call_has_no_size_cap(self):
+        big = "x" * 50000
+        msg = {"tool_calls": [{"function": {"name": "write_file",
+               "arguments": json.dumps({"path": "big.py", "content": big})}}]}
+        r = parse_message(msg)
+        self.assertEqual(len(r.intents), 1)
+        self.assertEqual(len(r.intents[0].args["content"]), 50000)
+
+    def test_large_set_has_no_count_cap(self):
+        calls = [{"function": {"name": "write_file",
+                  "arguments": json.dumps({"path": f"f{i}.txt", "content": "z"})}} for i in range(25)]
+        r = parse_message({"tool_calls": calls})
+        self.assertEqual(len(r.intents), 25)
+
+    def test_truncated_tool_call_block_is_surfaced_not_dropped(self):
+        # a <tool_call> whose JSON never closes (clipped by max_tokens)
+        clipped = '<tool_call>{"name":"write_file","arguments":{"path":"big.py","content":"aaaaaa'
+        r = parse_message({"content": clipped})
+        self.assertEqual(r.intents, ())
+        self.assertEqual(len(r.ambiguous), 1)          # surfaced, not vanished
+        self.assertNotIn("write_file", r.text)         # and NOT leaked into the prose reply
+
+    def test_whole_content_batch_with_one_bad_call_is_surfaced_not_dropped(self):
+        batch = '[{"name":"write_file","arguments":{"path":"a","content":"x"}}, {"not":"a call"}]'
+        r = parse_message({"content": batch})
+        self.assertEqual(r.intents, ())                # strict: a partial batch is not run...
+        self.assertEqual(len(r.ambiguous), 1)          # ...but the whole batch is surfaced, not lost
+
+    def test_whole_content_all_valid_batch_still_runs(self):
+        batch = ('[{"name":"write_file","arguments":{"path":"a","content":"x"}},'
+                 ' {"name":"read_file","arguments":{"path":"a"}}]')
+        r = parse_message({"content": batch})
+        self.assertEqual(len(r.intents), 2)
+
+
 if __name__ == "__main__":
     unittest.main()
