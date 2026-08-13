@@ -74,7 +74,7 @@ def phase(name: str, ok: bool, detail: str) -> None:
 
 def main() -> int:
     print(f"INTEGRATED partner-surface proof — {MODEL} @ {BASE_URL} (temp={TEMP})\n")
-    client = OllamaClient(BASE_URL, MODEL, timeout=180, max_tokens=4096, temperature=TEMP)
+    client = OllamaClient(BASE_URL, MODEL, timeout=180, temperature=TEMP)  # uses the shipped max_tokens default
 
     ws = Path(tempfile.mkdtemp(prefix="sal_integrated_"))
     # ONE session, ONE ledger, ONE view — the whole surface reads from these.
