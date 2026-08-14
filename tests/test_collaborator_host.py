@@ -18,6 +18,7 @@ from collaborator.host import (
     PAUSED,
     RUNNING,
     Collaborator,
+    Task,
 )
 from collaborator.model_client import ScriptedClient
 from collaborator.session import Session
@@ -64,6 +65,93 @@ class HostLifecycle(unittest.TestCase):
         self.assertEqual(t["decisions"], 1)
         self.assertEqual((Path(self.tmp) / "o.txt").read_text(), "hi")
         self.assertEqual(h.snapshot()["counts"]["ran"], 1)
+
+    def test_conversation_memory_threads_across_submits(self):
+        # Sal is "one presence you talk to" — a second message must carry the first (else it can't
+        # remember a file it just read / a thing you just said). Two plain-answer turns; the second
+        # turn's model call MUST have seen the first user message.
+        doer = ScriptedClient([{"content": "Hello Bob."},
+                               {"content": "You told me your name is Bob."}])
+        h, _ = self._host(doer=doer)
+        _wait(h, h.submit("My name is Bob."), {DONE})
+        _wait(h, h.submit("What did I tell you?"), {DONE})
+        second_turn_msgs = doer.seen[-1]
+        blob = json.dumps(second_turn_msgs)
+        self.assertIn("My name is Bob.", blob,
+                      "second turn did not carry the first message — conversation not threaded")
+        self.assertIn("What did I tell you?", blob)
+        # The first message should appear ONCE (threaded, not duplicated).
+        self.assertEqual(blob.count("My name is Bob."), 1)
+
+    def test_reply_shown_in_full_not_clipped_at_2000(self):
+        # The old view clipped reply at 2000 chars, chopping Sal's answers mid-word. Now a normal
+        # reply shows in full; only a pathological dump is capped, and then WITH an ellipsis.
+        t = Task(task_id="x", prompt="p")
+        t.reply = "R" * 5000
+        self.assertEqual(len(t.view()["reply"]), 5000)          # not clipped at 2000
+        t.reply = "R" * 20000
+        v = t.view()["reply"]
+        self.assertTrue(v.endswith("…"))                        # capped honestly, not silently
+        self.assertLessEqual(len(v), Task._REPLY_CAP + 1)
+
+    def test_current_datetime_grounded_in_system_prompt(self):
+        import datetime
+        doer = ScriptedClient([{"content": "hi"}])
+        h, _ = self._host(doer=doer)
+        _wait(h, h.submit("hello"), {DONE})
+        sysmsg = doer.seen[-1][0]
+        self.assertEqual(sysmsg["role"], "system")
+        self.assertIn(str(datetime.datetime.now().year), sysmsg["content"])
+        self.assertIn("current date and time", sysmsg["content"].lower())
+
+    def test_history_trim_bounds_growth_and_returns_fresh_list(self):
+        # Unbounded self._history growth was the unanimous external-panel C3 finding. _trim_history
+        # caps the running history to the char budget (keeping the MOST-RECENT messages) and always
+        # returns a FRESH list, so run_turn's in-place edits can never mutate a stored history.
+        h, _ = self._host()
+        big = [{"role": "system", "content": "S"}]
+        big += [{"role": ("user" if i % 2 == 0 else "assistant"), "content": "X" * 2000}
+                for i in range(200)]
+        trimmed = h._trim_history(big)
+        total = sum(len(m["content"]) for m in trimmed)
+        self.assertLessEqual(total, Collaborator._HISTORY_CHAR_BUDGET)
+        self.assertLess(len(trimmed), len(big))                 # actually trimmed
+        self.assertEqual(trimmed[-1], big[-1])                  # kept the most-recent
+        self.assertIsNot(trimmed, big)                          # fresh list (de-aliased)
+        self.assertIsNone(h._trim_history(None))                # None-safe
+        # a single over-budget message is still kept — never returns empty
+        self.assertEqual(len(h._trim_history([{"role": "user", "content": "Z" * 999999}])), 1)
+
+    def test_held_step_does_not_advance_the_conversation_until_resolved(self):
+        # A HELD step is a side-quest (external panel grok F1): it must NOT advance the shared
+        # conversation thread until it RESOLVES — else a new message would thread a dangling,
+        # unapproved tool-call and a later approve could rewind the thread.
+        doer = ScriptedClient([_call("run_command", {"command": ["echo", "hi"]}),  # -> HELD
+                               {"content": "done after approval"}])                # resume -> DONE
+        h, _ = self._host(doer=doer)
+        tid = h.submit("run echo")
+        _wait(h, tid, {AWAITING_APPROVAL})
+        self.assertIsNone(h._history)          # held turn did NOT advance the main thread
+        self.assertTrue(h.approve(tid))
+        _wait(h, tid, {DONE})
+        self.assertIsNotNone(h._history)       # resolved -> now in the thread
+
+    def test_new_message_while_held_threads_completed_history_not_held_partial(self):
+        # The core F1 case: with a step HELD, a NEW message must be answered from the last COMPLETED
+        # conversation, never from the held task's partial (which holds a dangling, unapproved
+        # tool-call). Reachable because held tasks are non-terminal (max_pending=32).
+        doer = ScriptedClient([
+            {"content": "Noted: the sky is teal."},                   # 1: remember -> DONE
+            _call("run_command", {"command": ["frobnicate_xyzzy"]}),  # 2: HELD (never approved)
+            {"content": "You said teal."},                            # 3: recall -> DONE
+        ])
+        h, _ = self._host(doer=doer)
+        _wait(h, h.submit("remember: the sky is teal"), {DONE})
+        _wait(h, h.submit("run the tool"), {AWAITING_APPROVAL})
+        _wait(h, h.submit("what did I say?"), {DONE})
+        blob = json.dumps(doer.seen[-1])                     # turn 3's model messages
+        self.assertIn("teal", blob)                          # threaded from the COMPLETED turn 1
+        self.assertNotIn("frobnicate_xyzzy", blob)           # NOT the held, unapproved partial
 
     def test_held_then_approve_resumes_to_done(self):
         # run_command defaults to propose_first -> HELD; approve -> worker runs it -> resume.

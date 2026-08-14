@@ -282,9 +282,15 @@ class ProposerContext(unittest.TestCase):
             self.assertIn("<<facts", ctx)
             self.assertIn("the system previously", ctx)
 
-    def test_empty_when_no_views(self):
+    def test_only_workspace_grounding_when_no_views(self):
+        # The proposer is now ALWAYS grounded in the workspace (so it can't propose phantom files);
+        # with no views/recent-actions and an EMPTY workspace, that grounding block — which says the
+        # workspace is empty — is the only content. (Was: asserted "" before grounding was added.)
         with tempfile.TemporaryDirectory() as tmp:
-            self.assertEqual(build_proposer_context(Session(workspace=tmp)), "")
+            ctx = build_proposer_context(Session(workspace=tmp))
+            self.assertIn("<<workspace", ctx)
+            self.assertIn("EMPTY", ctx)
+            self.assertNotIn("<<recent-actions", ctx)
 
 
 # --------------------------------------------------------------------------- #
@@ -501,8 +507,9 @@ class RecentActionsContext(unittest.TestCase):
             self.assertIn("<<end recent-actions>>", ctx)
 
     def test_no_recent_actions_no_block(self):
+        # No recent_actions -> no recent-actions block (the workspace grounding block may be present).
         with tempfile.TemporaryDirectory() as tmp:
-            self.assertEqual(build_proposer_context(Session(workspace=tmp)), "")
+            self.assertNotIn("<<recent-actions", build_proposer_context(Session(workspace=tmp)))
 
 
 class _QueuedClient:

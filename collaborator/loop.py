@@ -118,6 +118,17 @@ def sal_system_prompt() -> str:
     return _SAL_SYSTEM_TEMPLATE.replace(_TOOL_MANIFEST_SENTINEL, manifest)
 
 
+def _now_line() -> str:
+    """A factual 'the current date/time is …' grounding line, so Sal is anchored in REAL time
+    instead of guessing the date from training data. Refreshed every turn (run_turn re-asserts the
+    system message each turn). Grants nothing — pure grounding, like the tool manifest."""
+    from datetime import datetime
+    now = datetime.now().astimezone()
+    tz = now.strftime("%Z") or "local"
+    return (f"\n\nThe current date and time is {now:%A, %d %B %Y, %H:%M} ({tz}). "
+            f"Treat this as the real 'now' — do not guess the date from training data.")
+
+
 # TurnResult.stopped terminal states. Named so a host has an UNAMBIGUOUS contract: a host
 # MUST switch on this explicitly and MUST NOT treat "anything not held/paused" as success —
 # both EMPTY and MAX_ITERATIONS are failures-to-complete, surfaced honestly (external panel
@@ -253,7 +264,7 @@ def run_turn(session, client, user_message: str, history=None, max_iterations: i
     # role=="assistant"; tool results are role=="user"), so only the host seeds history[0]. This
     # replaces the list slot with a fresh dict (never mutates the caller's dict). The prompt grants
     # nothing; govern_action below stays the sole authority boundary.
-    sys_msg = {"role": "system", "content": sal_system_prompt()}
+    sys_msg = {"role": "system", "content": sal_system_prompt() + _now_line()}
     if history and isinstance(history[0], dict) and history[0].get("role") == "system":
         history[0] = sys_msg           # re-assert Sal's prompt at the front (authoritative)
     else:

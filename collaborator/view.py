@@ -27,6 +27,22 @@ _VALID_LEASHES = (ACT_THEN_REPORT, PROPOSE_FIRST, NOTIFY_ONLY)
 _VALID_PROACTIVITY = ("off", "conservative", "eager")
 
 
+def _action_target(args) -> str:
+    """A short, human-readable rendering of WHAT an action (a governed step OR a proposal) acts
+    on — which file, which command, which URL — so the view isn't just 'a command was run' with
+    no idea what it did, or 'read the main README' with no path. Display-only; never the raw
+    content of a write."""
+    if not isinstance(args, dict):
+        return ""
+    for key in ("path", "url", "dest", "target"):
+        if key in args and args[key]:
+            return str(args[key])[:200]
+    if "command" in args:
+        c = args["command"]
+        return (" ".join(str(x) for x in c) if isinstance(c, (list, tuple)) else str(c))[:200]
+    return ""
+
+
 class JudgmentLedger:
     """What the view shows: the stream of governed decisions and surfaced proposals. The
     host records into it as it drives (run_turn returns decisions; propose returns
@@ -112,11 +128,13 @@ class JudgmentView:
 
     def _decision(self, d: Decision) -> dict:
         return {"tool": d.tool, "status": d.status, "leash": d.leash,
-                "origin": getattr(d, "origin", "direct"), "summary": d.summary()}
+                "origin": getattr(d, "origin", "direct"), "summary": d.summary(),
+                "target": _action_target(getattr(d, "args", None))}
 
     def _proposal(self, p: Proposal) -> dict:
         return {"id": p.proposal_id, "tool": p.decision.tool, "confidence": p.confidence,
-                "rationale": p.rationale, "leash": p.decision.leash, "summary": p.summary()}
+                "rationale": p.rationale, "leash": p.decision.leash, "summary": p.summary(),
+                "target": _action_target(p.decision.args)}
 
     def snapshot(self) -> dict:
         ds = self.ledger.decisions

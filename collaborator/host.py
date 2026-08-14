@@ -66,6 +66,12 @@ FAILED = "failed"                        # empty / max_iterations / exception �
 CANCELLED = "cancelled"                  # you declined a held task
 
 
+def _clip(text: str, cap: int) -> str:
+    """Show up to ``cap`` chars; if it bites, mark it with an ellipsis (never a silent mid-word cut)."""
+    text = text or ""
+    return text if len(text) <= cap else text[:cap] + "…"
+
+
 @dataclass
 class Task:
     task_id: str
@@ -78,13 +84,20 @@ class Task:
     history: list = field(default_factory=list)      # the loop's running message history
     error: str = ""
 
+    # Display caps — generous enough that a normal conversational reply is shown IN FULL (the old
+    # 2000-char reply cap chopped Sal's answers mid-word, which read as broken "truncation"). A cap
+    # still exists so a pathological dump can't bloat every /state poll; when it bites we say so with
+    # an ellipsis rather than cut silently.
+    _PROMPT_CAP = 4000
+    _REPLY_CAP = 16000
+
     def view(self) -> dict:
         """A display-safe projection (no raw history / args) for the surface."""
         return {
             "id": self.task_id,
-            "prompt": self.prompt[:200],
+            "prompt": _clip(self.prompt, self._PROMPT_CAP),
             "state": self.state,
-            "reply": self.reply[:2000],
+            "reply": _clip(self.reply, self._REPLY_CAP),
             "decisions": len(self.decisions),
             "held": [d.summary() for d in self.held],
             "error": self.error[:400],
@@ -123,6 +136,15 @@ class Collaborator:
     methods (``pause``/``resume``/``set_leash``/``set_proactivity``/``veto``/``approve``/
     ``decline``) are host authority — pure-state ones act inline, executing ones enqueue."""
 
+    # The conversation is a ROLLING WINDOW: before each turn the running history is trimmed to
+    # (roughly) the most-recent this-many characters, so a long session cannot grow ``self._history``
+    # without bound and eventually overflow the model context / the process (external panel C3, the
+    # unanimous highest-value fix). ``run_turn`` re-asserts Sal's system message at history[0] every
+    # turn, so dropping the OLD system message during a trim is safe — a fresh one is re-inserted.
+    # A coarse char budget (not a token count) is deliberately simple and fail-safe; ~15k tokens of
+    # tail. Deeper, durable recall is the CDMS memory layer (③), not this turn buffer.
+    _HISTORY_CHAR_BUDGET = 60000
+
     def __init__(self, session, doer_client, proposer_client=None, *,
                  ledger=None, idle_seconds: float = 45.0, propose_cooldown: float = 120.0,
                  tick_seconds: float = 5.0, clock=time.monotonic) -> None:
@@ -139,6 +161,15 @@ class Collaborator:
         self._tasks: dict = {}
         self._proposals: dict = {}       # Host index; same Proposal objects the pool holds
         self._worker_busy = False
+        # THE CONVERSATION. Sal is "one presence you TALK TO" — so each new turn continues the same
+        # running history instead of starting blank (else Sal can't remember a file it just read or a
+        # thing you just said). Worker-confined (only the serial worker reads/writes it). Advanced in
+        # _absorb_result ONLY when a turn reaches a TERMINAL state (DONE/FAILED) — a HELD/PAUSED turn
+        # is a side-quest kept on task.history for resume, and advancing the shared thread to it would
+        # thread a dangling, unapproved tool-call into an unrelated next message and let a later
+        # approve() rewind the thread (external panel grok F1). run_turn re-prepends its system
+        # grounding idempotently, so threading a prior (trimmed) history is safe.
+        self._history = None
 
         self._idle_seconds = float(idle_seconds)
         self._propose_cooldown = float(propose_cooldown)
@@ -302,7 +333,11 @@ class Collaborator:
                 return
             task.state = RUNNING
             self._touch()
-        result = run_turn(self.session, self.doer_client, job.user_message)  # UNLOCKED
+        # Continue the CONVERSATION (thread the running history) rather than start blank — this is
+        # what makes Sal remember across your messages. Trimmed to the rolling window (bounds growth
+        # + returns a FRESH list, so run_turn's in-place edits never mutate a stored history).
+        result = run_turn(self.session, self.doer_client, job.user_message,
+                          history=self._trim_history(self._history))  # UNLOCKED
         self._absorb_result(job.task_id, result)
 
     def _handle_resume(self, job: "_ResumeJob") -> None:
@@ -351,7 +386,8 @@ class Collaborator:
             # A task the HOST paused mid-turn (no held decisions to approve — the paused action
             # never ran). Now unpaused, just continue the turn; the model re-issues its next step.
             note = "(resumed — the session is active again; continue the task.)"
-        result = run_turn(self.session, self.doer_client, note, history=history)  # UNLOCKED
+        result = run_turn(self.session, self.doer_client, note,
+                          history=self._trim_history(history))  # UNLOCKED
         self._absorb_result(job.task_id, result)
 
     def _handle_approve_proposal(self, job: "_ApproveProposalJob") -> None:
@@ -376,6 +412,26 @@ class Collaborator:
                 self._proposals[p.proposal_id] = p
             self._last_propose = self._clock()
 
+    def _trim_history(self, history):
+        """The rolling-window bound on the running conversation. Returns a FRESH list holding the
+        most-recent messages whose contents total <= ``_HISTORY_CHAR_BUDGET`` (always at least the
+        single most-recent message, even if it alone exceeds the budget). Two jobs in one: it caps
+        unbounded growth (panel C3), and — because it always allocates a new list — it de-aliases
+        ``self._history``/``task.history`` from the list ``run_turn`` mutates in place, so a later
+        turn can never corrupt a stored history. ``run_turn`` re-asserts the system message at
+        history[0], so an older system message dropped by the trim is harmlessly re-inserted."""
+        if not history:
+            return history
+        kept, total = [], 0
+        for msg in reversed(history):
+            c = len(str(msg.get("content", "") if isinstance(msg, dict) else msg))
+            if kept and total + c > self._HISTORY_CHAR_BUDGET:
+                break
+            kept.append(msg)
+            total += c
+        kept.reverse()
+        return kept
+
     def _absorb_result(self, task_id: str, result) -> None:
         """Record a turn's outcome + map ``stopped`` -> task state, atomically."""
         with self._lock:
@@ -385,6 +441,13 @@ class Collaborator:
             self.ledger.record_decisions(result.decisions)
             task.decisions.extend(result.decisions)
             task.history = result.history
+            # Advance THE CONVERSATION so the next turn (a new message, or a resume) continues from
+            # here — but ONLY on a TERMINAL turn. A HELD/PAUSED turn is a side-quest: its history
+            # lives on task.history (resume reads it), and advancing the shared thread to a partial,
+            # unapproved tool-call would corrupt an unrelated next message and let a later approve()
+            # rewind the thread (external panel grok F1). Worker-confined + serial ⇒ consistent.
+            if result.stopped not in STOPPED_AWAITING:
+                self._history = result.history
             task.reply = result.reply
             if result.stopped in STOPPED_SUCCESS:
                 task.state = DONE
@@ -407,6 +470,10 @@ class Collaborator:
             if t is not None:
                 t.state = FAILED
                 t.error = f"{type(exc).__name__}: {exc}"
+                # Intentionally do NOT advance self._history here (panel grok F3): a hard exception
+                # inside run_turn yields no coherent result.history, so the conversation stays at the
+                # last GOOD state rather than threading a half-built turn. The failed task is still
+                # shown honestly in the UI; the model just doesn't carry the blown-up turn forward.
                 self._touch()
 
     # --- propose trigger (idle) ---------------------------------------------
