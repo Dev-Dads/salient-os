@@ -104,6 +104,55 @@ class HostLifecycle(unittest.TestCase):
         self.assertIn(str(datetime.datetime.now().year), sysmsg["content"])
         self.assertIn("current date and time", sysmsg["content"].lower())
 
+    def test_history_trim_bounds_growth_and_returns_fresh_list(self):
+        # Unbounded self._history growth was the unanimous external-panel C3 finding. _trim_history
+        # caps the running history to the char budget (keeping the MOST-RECENT messages) and always
+        # returns a FRESH list, so run_turn's in-place edits can never mutate a stored history.
+        h, _ = self._host()
+        big = [{"role": "system", "content": "S"}]
+        big += [{"role": ("user" if i % 2 == 0 else "assistant"), "content": "X" * 2000}
+                for i in range(200)]
+        trimmed = h._trim_history(big)
+        total = sum(len(m["content"]) for m in trimmed)
+        self.assertLessEqual(total, Collaborator._HISTORY_CHAR_BUDGET)
+        self.assertLess(len(trimmed), len(big))                 # actually trimmed
+        self.assertEqual(trimmed[-1], big[-1])                  # kept the most-recent
+        self.assertIsNot(trimmed, big)                          # fresh list (de-aliased)
+        self.assertIsNone(h._trim_history(None))                # None-safe
+        # a single over-budget message is still kept — never returns empty
+        self.assertEqual(len(h._trim_history([{"role": "user", "content": "Z" * 999999}])), 1)
+
+    def test_held_step_does_not_advance_the_conversation_until_resolved(self):
+        # A HELD step is a side-quest (external panel grok F1): it must NOT advance the shared
+        # conversation thread until it RESOLVES — else a new message would thread a dangling,
+        # unapproved tool-call and a later approve could rewind the thread.
+        doer = ScriptedClient([_call("run_command", {"command": ["echo", "hi"]}),  # -> HELD
+                               {"content": "done after approval"}])                # resume -> DONE
+        h, _ = self._host(doer=doer)
+        tid = h.submit("run echo")
+        _wait(h, tid, {AWAITING_APPROVAL})
+        self.assertIsNone(h._history)          # held turn did NOT advance the main thread
+        self.assertTrue(h.approve(tid))
+        _wait(h, tid, {DONE})
+        self.assertIsNotNone(h._history)       # resolved -> now in the thread
+
+    def test_new_message_while_held_threads_completed_history_not_held_partial(self):
+        # The core F1 case: with a step HELD, a NEW message must be answered from the last COMPLETED
+        # conversation, never from the held task's partial (which holds a dangling, unapproved
+        # tool-call). Reachable because held tasks are non-terminal (max_pending=32).
+        doer = ScriptedClient([
+            {"content": "Noted: the sky is teal."},                   # 1: remember -> DONE
+            _call("run_command", {"command": ["frobnicate_xyzzy"]}),  # 2: HELD (never approved)
+            {"content": "You said teal."},                            # 3: recall -> DONE
+        ])
+        h, _ = self._host(doer=doer)
+        _wait(h, h.submit("remember: the sky is teal"), {DONE})
+        _wait(h, h.submit("run the tool"), {AWAITING_APPROVAL})
+        _wait(h, h.submit("what did I say?"), {DONE})
+        blob = json.dumps(doer.seen[-1])                     # turn 3's model messages
+        self.assertIn("teal", blob)                          # threaded from the COMPLETED turn 1
+        self.assertNotIn("frobnicate_xyzzy", blob)           # NOT the held, unapproved partial
+
     def test_held_then_approve_resumes_to_done(self):
         # run_command defaults to propose_first -> HELD; approve -> worker runs it -> resume.
         doer = ScriptedClient([_call("run_command", {"command": ["echo", "hi"]}),
