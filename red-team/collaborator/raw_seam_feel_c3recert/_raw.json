@@ -1,0 +1,62 @@
+{
+  "x-ai/grok-4.5": {
+    "model": "x-ai/grok-4.5",
+    "seconds": 13.7,
+    "usage": {
+      "prompt_tokens": 8714,
+      "completion_tokens": 614,
+      "total_tokens": 9328,
+      "cost": 0.0208944,
+      "is_byok": false,
+      "prompt_tokens_details": {
+        "cached_tokens": 128,
+        "cache_write_tokens": 0,
+        "audio_tokens": 0,
+        "video_tokens": 0
+      },
+      "cost_details": {
+        "upstream_inference_cost": 0.0208944,
+        "upstream_inference_prompt_cost": 0.0172104,
+        "upstream_inference_completions_cost": 0.003684
+      },
+      "completion_tokens_details": {
+        "reasoning_tokens": 45,
+        "image_tokens": 0,
+        "audio_tokens": 0
+      }
+    },
+    "cost": 0.0208944,
+    "content": "## Finding A \u2014 UNBOUNDED GROWTH: **RESOLVED**\n`_trim_history` is applied on every path into `run_turn` (`_handle_turn` and `_handle_resume`), keeps a most-recent char-bounded tail (always \u22651 msg when input non-empty), and returns a fresh list so `self._history` cannot grow without bound across turns.\n\n## Finding B \u2014 HELD + INTERVENING SUBMIT + APPROVE CLOBBER: **RESOLVED**\nTraced sequence: submit A \u2192 DONE advances `self._history=H1`; submit B \u2192 HELD stores partial on `task.history` only (`stopped in STOPPED_AWAITING` \u21d2 no `self._history` advance); submit C runs with `_trim_history(H1)` (no dangling tool-call); approve B resumes from `task.history` fork and on terminal absorb may set `self._history` to B\u2019s completion (forward from H1, not a rewind past a HELD-advanced H2). Fresh list from `_trim_history` also kills list aliasing.\n\n## Trim adversarial notes\n- Dropping an old system message is safe: `run_turn` re-asserts system at `[0]`.\n- Splitting a turn\u2019s messages is possible at the char boundary (no role/tool-pair pairing); that can yield slightly odd tails but not unbounded growth, clobber, or empty history.\n- Empty: only if input is empty/None; non-empty always keeps \u22651 message (even if over budget alone).\n- Char budget bounds *what is sent* each turn; `result.history` assigned to `self._history` may still be a long full trace until the next trim \u2014 process RSS is bounded in practice by the rolling send window + single retained full tail, not by per-turn re-trim of the stored list. Residual, not a reopen of A\u2019s \u201cevery turn resend full ever-growing history.\u201d\n- I cannot break the HELD/intervening-submit/approve clobber or aliasing with the patched control flow.\n\n## NEW issues?\n**No** correctness/safety regression that reopens C3. (Minor non-blocking: stored `self._history` isn\u2019t re-trimmed until next send; trim may cut mid-turn tool pairs \u2014 degraded context, not unsound threading.)\n\n## C3: **CERTIFIED**\nBoth panel findings are genuinely fixed; memory advances only on terminal outcomes, HELD side-quests stay on `task.history`, and the rolling fresh-list window bounds what is threaded into `run_turn`.\n\n## VERDICT\n**C3 CERTIFIED** \u2014 A and B resolved; no new memory-threading break found.",
+    "finish": "stop"
+  },
+  "openai/gpt-5.1": {
+    "model": "openai/gpt-5.1",
+    "seconds": 16.5,
+    "usage": {
+      "prompt_tokens": 8059,
+      "completion_tokens": 1796,
+      "total_tokens": 9855,
+      "cost": 0.02803375,
+      "is_byok": false,
+      "prompt_tokens_details": {
+        "cached_tokens": 0,
+        "cache_write_tokens": 0,
+        "audio_tokens": 0,
+        "video_tokens": 0
+      },
+      "cost_details": {
+        "upstream_inference_cost": 0.02803375,
+        "upstream_inference_prompt_cost": 0.01007375,
+        "upstream_inference_completions_cost": 0.01796
+      },
+      "completion_tokens_details": {
+        "reasoning_tokens": 0,
+        "image_tokens": 0,
+        "audio_tokens": 0
+      }
+    },
+    "cost": 0.02803375,
+    "content": "FINDING A \u2014 UNBOUNDED HISTORY GROWTH: **RESOLVED**\n\n- Every call to `run_turn` in `_handle_turn` and `_handle_resume` now passes `history=self._trim_history(...)`, which:\n  - Walks from the end, accumulating messages until `_HISTORY_CHAR_BUDGET` (60k chars) would be exceeded, then stops.\n  - Always keeps at least the single most recent message (because it only breaks when `kept` is non-empty).\n  - Returns a fresh list, never the original object.\n- `self._history` is only reassigned in `_absorb_result` from `result.history` on terminal states (not on held/paused), and that history itself will have been subject to trimming at the start of the turn; so across turns, the maximum length of the history list and total characters in contents is bounded by the budget plus whatever `run_turn` adds in the current step.\n- Since the model\u2019s context length is bounded by the char window each turn, neither context nor process RSS can grow without bound via history accumulation.\n\nFINDING B \u2014 HELD + INTERVENING SUBMIT + APPROVE CLOBBER/INTERLEAVE: **RESOLVED**\n\nTrace the adversarial sequence exactly under the patch:\n\n1. **submit A \u2192 DONE**\n   - `_handle_turn` calls `run_turn(..., history=_trim_history(self._history))`.\n   - Suppose this yields `result_A` with `stopped in STOPPED_SUCCESS`.\n   - `_absorb_result`:\n     - `task_A.history = result_A.history`\n     - `result_A.stopped not in STOPPED_AWAITING` \u21d2 `self._history = result_A.history` (rooted at H1).\n   - Shared conversation is now H1.\n\n2. **submit B \u2192 HELD**\n   - `_handle_turn` for B calls `run_turn(..., history=_trim_history(self._history))`, i.e. trimmed H1.\n   - `run_turn` mutates its passed history in place, but that is a copy; `_trim_history` has de-aliased it from `self._history`.\n   - Suppose we get `result_B` with `stopped == STOPPED_HELD` and history H2 (H1 + dangling tool-call).\n   - `_absorb_result`:\n     - `task_B.history = H2`\n     - `result_B.stopped in STOPPED_AWAITING` \u21d2 **no update** to `self._history`; it remains H1.\n     - B is moved to `AWAITING_APPROVAL`, and held decisions are stored.\n\n3. **submit C while B is HELD**\n   - `_handle_turn` for C calls `run_turn(..., history=_trim_history(self._history))` again, i.e. based on H1, not H2.\n   - So the dangling unapproved tool-call from B in H2 is not present in C\u2019s input history; C\u2019s run is cleanly threaded after A.\n   - Suppose `result_C` is DONE, with history H3 rooted in H1 (plus C-related messages).\n   - `_absorb_result` on C:\n     - `task_C.history = H3`\n     - Terminal \u21d2 `self._history = H3`.\n   - Global history is now H3 (which already includes all of A and C\u2019s relevant context, bounded by the trim).\n\n4. **approve B**\n   - `approve(task_B)` sets `task_B.state = RUNNING` and enqueues `_ResumeJob(task_B.id)`.\n   - `_handle_resume` for B:\n     - Under lock, it reloads `task_B` and ensures state in `(RUNNING, QUEUED)`; that\u2019s still true.\n     - `held = list(task.held)`; `history = task.history` \u2192 this is still H2, the forked held history for B only.\n     - Releases lock, then:\n       - Runs all held decisions (`approve_held_decision`) and mutates `task.held`/`task.approved_ran`/`task.decisions` under lock.\n       - If any still held, it returns without resuming; otherwise constructs the `note` summarizing approved actions.\n     - Finally calls `run_turn(..., note, history=self._trim_history(history))`:\n       - This resumes B from its own private history H2 (trimmed), not from `self._history` (H3).\n       - The dangling tool-call is properly closed out in B\u2019s own thread; C remains logically on H3.\n     - `_absorb_result` on this resumed B:\n       - `task_B.history = result_B2.history`.\n       - If B now terminates, `self._history` becomes `result_B2.history`, i.e. the full H2\u2192B2 story, trimmed.\n\nKey points:\n\n- The clobber/rewind that used to happen (because `_history` was set to H2 on HELD and later overwritten from a stale fork) is removed: HELD/PAUSED outcomes never advance `self._history`.\n- Intervening C runs strictly atop the last terminal history (H1) and cannot see H2\u2019s dangling tool-call; later approval/resume of B operates over B\u2019s own copied `task.history` only.\n- Because `_trim_history` always creates a new list, neither `task.history` nor `self._history` ever alias the list `run_turn` mutates in place, so later turns cannot corrupt stored histories indirectly.\n\n**NEW ISSUES INTRODUCED BY THE FIX?**\n\nI looked for:\n\n1. **History possibly becoming empty or structurally invalid:**\n   - `_trim_history` on `None` or `[]` returns it unchanged; `run_turn` will then be invoked with `history=None` or `history=[]`.\n   - The pre-existing contract says `run_turn` re-asserts the system message at `history[0]` every turn, so even if we trimmed away an old system message or start with an empty history, `run_turn` will inject the system message and maintain the expected system-first structure.\n   - `_trim_history` itself always keeps at least one message when `history` is non-empty (by construction of the `if kept and ...: break` guard), so it never returns an empty list when given a non-empty one. There\u2019s no way to \u201csplit\u201d a single logical turn\u2019s messages: it just drops a prefix; it doesn\u2019t create partial messages.\n\n2. **Mis-bounding of context / unbounded growth sneaking back indirectly:**\n   - Each turn\u2019s input history is bounded to `_HISTORY_CHAR_BUDGET` plus any new content added during that turn. On the next turn, `_trim_history` re-applies to the expanded history, re-constraining it. So steady-state, the size is O(budget) per turn, not growing with time.\n   - The crude char-based measure is an over-approximation of tokens but not an under-approximation; at worst, you get fewer than intended tokens, not more. This is safe for C3\u2019s \u201cno unbounded growth / overflow\u201d concern.\n\n3. **Interaction with `_fail_active`:**\n   - On exceptions, `_fail_active` explicitly does not touch `self._history`, preserving the last coherent terminal state; this cannot cause history corruption because a failed `run_turn` never produced a new `result.history` to adopt.\n   - Task-level failure state and `error` are still recorded correctly.\n\n4. **Run-resume races / stale `_ResumeJob`s:**\n   - `_handle_resume` re-checks `task.state in (RUNNING, QUEUED)` under the lock and bails if the task has since been declined/finished; this prevents stale resume jobs from re-entering `run_turn` and does not conflict with history trimming.\n\nI do not see a concrete new correctness or safety bug introduced by the patch under adversarial sequences, including the previously-problematic HELD + intervening submit + approve path.\n\n**C3 (memory-threading soundness):** **CERTIFIED**\n\n- History is now kept to a bounded rolling window with explicit trimming, aliased histories are eliminated via fresh-list copies, and HELD/PAUSED turns no longer advance the shared conversation or allow later approvals to rewind past intervening turns; I cannot construct a sequence that breaks memory-threading invariants under this design.\n\n**VERDICT:** C3 findings A and B are resolved, no new issues are introduced, and claim C3 is certified for this patch.",
+    "finish": "stop"
+  }
+}
