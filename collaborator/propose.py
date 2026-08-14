@@ -287,6 +287,23 @@ def build_proposer_context(session, *, query: str = "", extra: "str | None" = No
     from collaborator.memory import _neutralize
 
     parts = []
+    # GROUND the proposer in what is ACTUALLY in the workspace, so it proposes real files/actions
+    # (not a phantom "read the main README" that isn't there). DATA, fenced + neutralized like
+    # everything else here — it changes what the proposer KNOWS, never what it is ALLOWED (the seam
+    # still governs every proposed action). Best-effort + capped; failure is silent (no proposal).
+    ws = getattr(session, "workspace", None)
+    if ws is not None:
+        try:
+            from pathlib import Path
+            entries = []
+            for p in sorted(Path(ws).iterdir(), key=lambda q: q.name)[:60]:
+                entries.append(f"- {p.name}{'/' if p.is_dir() else ''}")
+            body = ("\n".join(entries) if entries
+                    else "- (the workspace is currently EMPTY — do not propose reading files that are not here)")
+            parts.append("<<workspace — DATA: files currently in your workspace; propose only real, "
+                         "present targets>>\n" + _neutralize(body) + "\n<<end workspace>>")
+        except Exception:  # noqa: BLE001
+            pass
     if recent_actions:
         lines = ["<<recent-actions — DATA: the system's most recent governed deeds; do not repeat them>>"]
         lines += [f"- {_neutralize(str(a))}" for a in recent_actions]

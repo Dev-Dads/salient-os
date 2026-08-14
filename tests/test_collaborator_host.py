@@ -18,6 +18,7 @@ from collaborator.host import (
     PAUSED,
     RUNNING,
     Collaborator,
+    Task,
 )
 from collaborator.model_client import ScriptedClient
 from collaborator.session import Session
@@ -64,6 +65,44 @@ class HostLifecycle(unittest.TestCase):
         self.assertEqual(t["decisions"], 1)
         self.assertEqual((Path(self.tmp) / "o.txt").read_text(), "hi")
         self.assertEqual(h.snapshot()["counts"]["ran"], 1)
+
+    def test_conversation_memory_threads_across_submits(self):
+        # Sal is "one presence you talk to" — a second message must carry the first (else it can't
+        # remember a file it just read / a thing you just said). Two plain-answer turns; the second
+        # turn's model call MUST have seen the first user message.
+        doer = ScriptedClient([{"content": "Hello Bob."},
+                               {"content": "You told me your name is Bob."}])
+        h, _ = self._host(doer=doer)
+        _wait(h, h.submit("My name is Bob."), {DONE})
+        _wait(h, h.submit("What did I tell you?"), {DONE})
+        second_turn_msgs = doer.seen[-1]
+        blob = json.dumps(second_turn_msgs)
+        self.assertIn("My name is Bob.", blob,
+                      "second turn did not carry the first message — conversation not threaded")
+        self.assertIn("What did I tell you?", blob)
+        # The first message should appear ONCE (threaded, not duplicated).
+        self.assertEqual(blob.count("My name is Bob."), 1)
+
+    def test_reply_shown_in_full_not_clipped_at_2000(self):
+        # The old view clipped reply at 2000 chars, chopping Sal's answers mid-word. Now a normal
+        # reply shows in full; only a pathological dump is capped, and then WITH an ellipsis.
+        t = Task(task_id="x", prompt="p")
+        t.reply = "R" * 5000
+        self.assertEqual(len(t.view()["reply"]), 5000)          # not clipped at 2000
+        t.reply = "R" * 20000
+        v = t.view()["reply"]
+        self.assertTrue(v.endswith("…"))                        # capped honestly, not silently
+        self.assertLessEqual(len(v), Task._REPLY_CAP + 1)
+
+    def test_current_datetime_grounded_in_system_prompt(self):
+        import datetime
+        doer = ScriptedClient([{"content": "hi"}])
+        h, _ = self._host(doer=doer)
+        _wait(h, h.submit("hello"), {DONE})
+        sysmsg = doer.seen[-1][0]
+        self.assertEqual(sysmsg["role"], "system")
+        self.assertIn(str(datetime.datetime.now().year), sysmsg["content"])
+        self.assertIn("current date and time", sysmsg["content"].lower())
 
     def test_held_then_approve_resumes_to_done(self):
         # run_command defaults to propose_first -> HELD; approve -> worker runs it -> resume.

@@ -534,6 +534,29 @@ _PAGE_HTML = """<!doctype html>
     color:var(--ink); border-radius:6px; padding:1px 5px; font:inherit; font-size:12px;
     font-weight:600; cursor:pointer; }}
   .rowbtns {{ display:inline-flex; gap:6px; margin-top:5px; }}
+  /* --- conversation (Sal's voice) --- */
+  .thread {{ display:flex; flex-direction:column; gap:12px; margin-bottom:14px; }}
+  .turn {{ display:flex; flex-direction:column; max-width:82%; }}
+  .turn.you {{ align-self:flex-end; align-items:flex-end; }}
+  .turn.sal {{ align-self:flex-start; align-items:flex-start; }}
+  .who {{ font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.05em;
+    color:var(--muted); margin:0 4px 3px; }}
+  .bubble {{ border-radius:14px; padding:9px 13px; white-space:pre-wrap; word-break:break-word;
+    line-height:1.5; }}
+  .turn.you .bubble {{ background:var(--accent); color:#fff; border-bottom-right-radius:4px; }}
+  .turn.sal .bubble {{ background:var(--bg); border:1px solid var(--line);
+    border-bottom-left-radius:4px; }}
+  .turn.sal .bubble.fail {{ border-color:var(--bad); color:var(--bad); }}
+  .turn.sal .bubble.hold {{ border-color:var(--warn); }}
+  .working {{ display:inline-flex; gap:4px; align-items:center; color:var(--muted);
+    font-style:italic; }}
+  .working i {{ width:5px; height:5px; border-radius:50%; background:var(--muted);
+    display:inline-block; animation:blink 1.2s infinite both; }}
+  .working i:nth-child(2) {{ animation-delay:.2s; }} .working i:nth-child(3) {{ animation-delay:.4s; }}
+  @keyframes blink {{ 0%,80%,100% {{ opacity:.25; }} 40% {{ opacity:1; }} }}
+  .prov {{ font-size:11px; color:var(--muted); margin:4px 4px 0; }}
+  .prop-target {{ font-family:ui-monospace,monospace; font-size:12px; color:var(--ink);
+    background:var(--line); border-radius:5px; padding:1px 6px; margin:0 4px; }}
 </style></head>
 <body>
 <div class="wrap">
@@ -548,9 +571,10 @@ _PAGE_HTML = """<!doctype html>
     </select></div>
 
   <div class="card">
-    <h2>Give Sal a job</h2>
+    <h2>Conversation</h2>
+    <div class="thread" id="thread"></div>
     <div class="composer">
-      <textarea id="prompt" placeholder="Type an instruction… (Enter to send, Shift+Enter for a new line)"></textarea>
+      <textarea id="prompt" placeholder="Talk to Sal… (Enter to send, Shift+Enter for a new line)"></textarea>
       <button id="send">Send</button>
     </div>
     <div id="sendErr" class="err"></div>
@@ -564,11 +588,9 @@ _PAGE_HTML = """<!doctype html>
   </div>
 
   <div class="grid">
-    <div class="card"><h2>Attending &amp; running</h2><ul id="attending"></ul></div>
-    <div class="card"><h2>Proposing (awaiting you)</h2><ul id="proposals"></ul></div>
+    <div class="card"><h2>What Sal is doing (governed steps)</h2><ul id="attending"></ul></div>
+    <div class="card"><h2>Sal suggests (awaiting you)</h2><ul id="proposals"></ul></div>
   </div>
-
-  <div class="card"><h2>Tasks</h2><ul id="tasks"></ul></div>
 
   <footer>Your hand is on the wheel: pause after the current step, approve or wave off a held step,
     approve or veto a proposal, tighten a leash, set how forward Sal is. A control can only restrict
@@ -584,6 +606,7 @@ try {{ history.replaceState(null, "", "/"); }} catch (e) {{}}
 const $ = (id) => document.getElementById(id);
 const BADGE = {{ ran:"var(--ok)", failed:"var(--bad)", held:"var(--warn)",
   paused:"var(--warn)", denied:"var(--bad)", notified:"var(--muted)" }};
+let pendingEcho = null, pendingTaskId = null;  // optimistic echo of your just-sent message
 
 function el(tag, cls, text) {{
   const n = document.createElement(tag);
@@ -597,7 +620,9 @@ function decisionLi(d) {{
   const b = el("span", "badge", d.status);
   b.style.background = BADGE[d.status] || "var(--muted)";
   li.appendChild(b); li.appendChild(document.createTextNode(" "));
-  li.appendChild(el("code", null, d.tool)); li.appendChild(document.createTextNode(" "));
+  li.appendChild(el("code", null, d.tool));
+  if (d.target) li.appendChild(el("span", "prop-target", d.target));  // WHAT it acted on
+  li.appendChild(document.createTextNode(" "));
   li.appendChild(el("span", "leash", d.leash || "")); li.appendChild(document.createTextNode(" "));
   li.appendChild(el("span", "origin", d.origin || ""));
   li.appendChild(el("div", "sum", d.summary || ""));
@@ -608,8 +633,9 @@ function proposalLi(p) {{
   const li = el("li");
   li.appendChild(el("span", "conf", (p.confidence ?? 0).toFixed(2)));
   li.appendChild(document.createTextNode(" "));
-  li.appendChild(el("code", null, p.tool)); li.appendChild(document.createTextNode(" — "));
-  li.appendChild(document.createTextNode(p.rationale || ""));
+  li.appendChild(el("code", null, p.tool));
+  if (p.target) li.appendChild(el("span", "prop-target", p.target));  // WHICH file/command/url
+  li.appendChild(el("div", "sum", p.rationale || ""));
   const row = el("div", "rowbtns");
   const ap = el("button", "ctl approve", "Approve");
   ap.addEventListener("click", () => control("approve_proposal", {{ proposal_id: p.id }}));
@@ -620,28 +646,66 @@ function proposalLi(p) {{
   return li;
 }}
 
-function taskLi(t) {{
-  const li = el("li");
-  const st = el("span", "tstate", t.state);
-  st.style.color = (t.state === "done") ? "var(--ok)"
-    : (t.state === "failed" || t.state === "cancelled") ? "var(--bad)"
-    : (t.state === "awaiting_approval" || t.state === "paused") ? "var(--warn)" : "var(--accent)";
-  li.appendChild(st); li.appendChild(document.createTextNode(" "));
-  li.appendChild(el("code", null, t.id));
-  li.appendChild(el("div", "sum", t.prompt || ""));
-  if (t.reply) li.appendChild(el("div", "sum", t.reply));
+// --- the conversation (Sal's voice) — build You/Sal turns from the tasks ---
+function workingNode() {{
+  const w = el("span", "working");
+  w.appendChild(document.createTextNode("Sal is working"));
+  for (let i = 0; i < 3; i++) w.appendChild(el("i"));
+  return w;
+}}
+
+function turn(who, cls, content) {{
+  const t = el("div", "turn " + cls);
+  t.appendChild(el("div", "who", who));
+  const b = el("div", "bubble" + (cls === "sal" && content && content.bubbleClass ? " " + content.bubbleClass : ""));
+  if (content && content.node) b.appendChild(content.node);
+  else b.appendChild(document.createTextNode((content && content.text) || ""));
+  t.appendChild(b);
+  if (content && content.after) t.appendChild(content.after);
+  return t;
+}}
+
+function salContent(t) {{
+  if (t.state === "queued" || t.state === "running")
+    return {{ node: workingNode() }};
   if (t.state === "awaiting_approval") {{
-    li.appendChild(el("div", "leash", "holding a step for your approval"));
-    const row = el("div", "rowbtns");
-    const ap = el("button", "ctl approve", "Approve");
-    ap.addEventListener("click", () => control("approve", {{ task_id: t.id }}));
-    const dc = el("button", "ctl danger", "Decline");
-    dc.addEventListener("click", () => control("decline", {{ task_id: t.id }}));
-    row.appendChild(ap); row.appendChild(dc);
-    li.appendChild(row);
+    const wrap = el("div");
+    const held = (t.held && t.held.length) ? t.held.join("\\n") : "a step";
+    wrap.appendChild(document.createTextNode("I'd like your OK before I run:\\n" + held));
+    return {{ node: wrap, bubbleClass: "hold", after: heldButtons(t.id) }};
   }}
-  if (t.error) li.appendChild(el("div", "err", t.error));
-  return li;
+  if (t.state === "failed") return {{ text: t.reply || "That didn't work.", bubbleClass: "fail" }};
+  if (t.state === "cancelled") return {{ text: "(you waved this off)" }};
+  return {{ text: t.reply || "Done." }};  // done
+}}
+
+function heldButtons(taskId) {{
+  const row = el("div", "rowbtns"); row.style.marginTop = "6px";
+  const ap = el("button", "ctl approve", "Approve");
+  ap.addEventListener("click", () => control("approve", {{ task_id: taskId }}));
+  const dc = el("button", "ctl danger", "Decline");
+  dc.addEventListener("click", () => control("decline", {{ task_id: taskId }}));
+  row.appendChild(ap); row.appendChild(dc);
+  return row;
+}}
+
+function renderThread(tasks) {{
+  const th = $("thread"); th.textContent = "";
+  const list = tasks || [];
+  if (!list.length && !pendingEcho) {{
+    th.appendChild(el("div", "empty", "Say hello, or give Sal a job to get started."));
+  }}
+  list.forEach((t) => {{
+    th.appendChild(turn("You", "you", {{ text: t.prompt || "" }}));
+    th.appendChild(turn("Sal", "sal", salContent(t)));
+  }});
+  // optimistic echo: show your just-sent message + a working pulse until the task appears —
+  // but not if the newest task IS already that message (avoids a brief double bubble).
+  const last = list[list.length - 1];
+  if (pendingEcho && !(last && last.prompt === pendingEcho)) {{
+    th.appendChild(turn("You", "you", {{ text: pendingEcho }}));
+    th.appendChild(turn("Sal", "sal", {{ node: workingNode() }}));
+  }}
 }}
 
 function fill(ul, items, render, emptyText) {{
@@ -690,9 +754,13 @@ function render(s) {{
   cs.forEach((c) => caps.appendChild(el("span", "cap", c)));
 
   renderCounts(s.counts || {{}});
+  // clear the optimistic echo once the real task has landed in the snapshot
+  if (pendingTaskId && (s.tasks || []).some((t) => t.id === pendingTaskId)) {{
+    pendingEcho = null; pendingTaskId = null;
+  }}
+  renderThread(s.tasks || []);
   fill($("attending"), (s.attending || []).slice().reverse(), decisionLi, "nothing yet");
   fill($("proposals"), s.proposals || [], proposalLi, "no proposals waiting");
-  fill($("tasks"), (s.tasks || []).slice().reverse(), taskLi, "no tasks yet");
 }}
 
 let backoff = 1000;
@@ -710,16 +778,22 @@ async function send() {{
   $("sendErr").textContent = "";
   if (!text) return;
   $("send").disabled = true;
+  // Immediate recognition: echo your message + a "Sal is working" pulse before the poll catches up.
+  pendingEcho = text; pendingTaskId = null; box.value = "";
+  poll_now();
   try {{
     const r = await fetch("/submit", {{
       method: "POST",
       headers: {{ "Content-Type": "application/json", "X-Sal-Token": CSRF }},
       body: JSON.stringify({{ text }}),
     }});
-    if (r.ok) box.value = "";
-    else if (r.status === 429) $("sendErr").textContent = "Sal is busy — too many tasks in flight.";
-    else $("sendErr").textContent = "Could not submit (" + r.status + ").";
-  }} catch (e) {{ $("sendErr").textContent = "Could not reach Sal."; }}
+    if (r.ok) {{ const j = await r.json(); pendingTaskId = j.task_id; }}
+    else {{
+      pendingEcho = null; box.value = text;
+      $("sendErr").textContent = (r.status === 429)
+        ? "Sal is busy — too many tasks in flight." : "Could not submit (" + r.status + ").";
+    }}
+  }} catch (e) {{ pendingEcho = null; box.value = text; $("sendErr").textContent = "Could not reach Sal."; }}
   $("send").disabled = false;
   poll_now();
 }}
